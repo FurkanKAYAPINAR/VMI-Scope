@@ -74,3 +74,33 @@ pub fn tcp_state_name(code: u32) -> &'static str {
         _ => "Unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_state_names() {
+        assert_eq!(tcp_state_name(5), "Established");
+        assert_eq!(tcp_state_name(2), "Listen");
+        assert_eq!(tcp_state_name(100), "Bound");
+        assert_eq!(tcp_state_name(999), "Unknown");
+    }
+
+    #[test]
+    fn connection_key_is_stable_and_descriptive() {
+        let c = Connection {
+            proto: Protocol::Tcp,
+            local_addr: "0.0.0.0".into(),
+            local_port: 443,
+            remote_addr: "1.2.3.4".into(),
+            remote_port: 55000,
+            state: "Established".into(),
+            pid: 1234,
+            process: "svc.exe".into(),
+        };
+        assert_eq!(c.key(), c.clone().key());
+        assert!(c.key().contains("443"));
+        assert!(c.key().contains("TCP"));
+    }
+}

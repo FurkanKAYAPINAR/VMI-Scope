@@ -128,3 +128,49 @@ pub fn assess(consumer_type: &str, query: &str, action: &str) -> (Risk, Vec<Stri
     }
     (risk, reasons)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_quoted_extracts_the_key_value() {
+        assert_eq!(
+            first_quoted(r#"\\.\root\subscription:__EventFilter.Name="SCM Filter""#),
+            "SCM Filter"
+        );
+        assert_eq!(first_quoted("no quotes here"), "");
+        assert_eq!(first_quoted(r#"Class.Name="first""second""#), "first");
+    }
+
+    #[test]
+    fn commandline_consumer_with_encoded_payload_is_high() {
+        let (risk, reasons) = assess(
+            "CommandLineEventConsumer",
+            "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process'",
+            "powershell.exe -enc SQBFAFgA",
+        );
+        assert_eq!(risk, Risk::High);
+        assert!(reasons.iter().any(|r| r.contains("CommandLine")));
+    }
+
+    #[test]
+    fn benign_scm_subscription_is_low() {
+        let (risk, _) = assess(
+            "NTEventLogEventConsumer",
+            "select * from MSFT_SCMEventLogEvent",
+            "",
+        );
+        assert_eq!(risk, Risk::Low);
+    }
+
+    #[test]
+    fn intrinsic_trigger_is_at_least_medium() {
+        let (risk, _) = assess(
+            "LogFileEventConsumer",
+            "SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA 'Win32_Service'",
+            "C:\\log.txt",
+        );
+        assert!(risk >= Risk::Medium);
+    }
+}

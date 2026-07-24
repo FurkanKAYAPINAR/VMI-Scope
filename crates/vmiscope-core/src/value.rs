@@ -62,3 +62,44 @@ pub fn variant_to_u32(v: &Variant) -> u32 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u32_from_numbers_and_strings() {
+        assert_eq!(variant_to_u32(&Variant::UI4(42)), 42);
+        assert_eq!(variant_to_u32(&Variant::UI2(7)), 7);
+        assert_eq!(variant_to_u32(&Variant::String("123".into())), 123);
+        assert_eq!(variant_to_u32(&Variant::String("nope".into())), 0);
+        assert_eq!(variant_to_u32(&Variant::Null), 0);
+    }
+
+    #[test]
+    fn string_rendering() {
+        assert_eq!(variant_to_string(&Variant::String("hi".into())), "hi");
+        assert_eq!(variant_to_string(&Variant::Bool(true)), "true");
+        assert_eq!(variant_to_string(&Variant::Empty), "");
+        assert_eq!(
+            variant_to_string(&Variant::Array(vec![Variant::UI4(1), Variant::UI4(2)])),
+            "{1, 2}"
+        );
+    }
+
+    #[test]
+    fn string_vec_flattens_arrays() {
+        assert_eq!(
+            variant_to_string_vec(&Variant::Array(vec![
+                Variant::String("a".into()),
+                Variant::String("b".into())
+            ])),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            variant_to_string_vec(&Variant::String("solo".into())),
+            vec!["solo".to_string()]
+        );
+        assert!(variant_to_string_vec(&Variant::Null).is_empty());
+    }
+}

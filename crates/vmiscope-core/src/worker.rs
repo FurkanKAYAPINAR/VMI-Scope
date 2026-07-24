@@ -759,3 +759,27 @@ fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
     providers.sort_by(|a, b| a.provider.to_lowercase().cmp(&b.provider.to_lowercase()));
     Ok(providers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_table_unions_columns_and_aligns_sparse_rows() {
+        let mut r1 = HashMap::new();
+        r1.insert("A".to_string(), Variant::UI4(1));
+        r1.insert("B".to_string(), Variant::String("x".into()));
+        let mut r2 = HashMap::new();
+        r2.insert("A".to_string(), Variant::UI4(2)); // no "B"
+
+        let table = to_table(vec![r1, r2]);
+        assert_eq!(table.columns, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(table.rows.len(), 2);
+        // Every row is aligned to the column count, sparse cells blanked.
+        for row in &table.rows {
+            assert_eq!(row.len(), 2);
+        }
+        let b_col = table.columns.iter().position(|c| c == "B").unwrap();
+        assert!(table.rows.iter().any(|r| r[b_col].is_empty()));
+    }
+}

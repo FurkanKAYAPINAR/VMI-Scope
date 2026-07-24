@@ -17,16 +17,19 @@ filling a real gap in the Rust ecosystem (the `wmi` crate is optimized for
 
 ## Features
 
-Two tabs: **Explorer** (browse WMI) and **Network** (live connection monitor).
+Four tabs: **Explorer** (browse WMI), **Network** (live connections),
+**Persistence** (WMI event-subscription hunter), and **Providers**.
+Every table sorts — click a column header (ascending → descending → off).
 
 ### Explorer
 - **Namespace tree** — lazily enumerated from `root` down (`__NAMESPACE`).
 - **Class browser** — every class in the selected namespace (1400+ in
   `root\CIMV2`), with live filtering.
 - **Instance viewer** — click a class to auto-generate `SELECT * FROM <Class>`
-  and see the instances in a virtualized table (smooth with thousands of rows).
+  and see the instances in a virtualized, sortable table.
 - **WQL editor** — run arbitrary queries (Ctrl+Enter), against any namespace.
 - **Row detail** — click any row to see every property as a `name → value` grid.
+- **Script generation** — PowerShell / VBScript for the current query.
 
 ### Network (live)
 - **Real-time connection table** sourced from WMI — every TCP connection and UDP
@@ -39,6 +42,19 @@ Two tabs: **Explorer** (browse WMI) and **Network** (live connection monitor).
   it stays in place and **fades out over ~6s** instead of vanishing, so you can
   see what just happened.
 - **Filter** by process, IP, port, or state.
+
+### Persistence (WMI event-subscription hunter)
+- Enumerates `root\subscription` — `__EventFilter`, every `__EventConsumer`
+  subclass, and `__FilterToConsumerBinding` — and **correlates each binding** to
+  its trigger (WQL query) and action (command line / script / target).
+- **Risk scoring** (Low / Medium / High) flags what looks like fileless
+  persistence — CommandLine/ActiveScript consumers, encoded payloads, intrinsic
+  event triggers (MITRE ATT&CK **T1546.003**).
+
+### Providers
+- Lists WMI providers (`Msft_Providers`) and the **process hosting each** —
+  provider, namespace, host PID, host process name, hosting group. Handy for
+  chasing a runaway `wmiprvse.exe`.
 
 ### Everywhere
 - **Never blocks** — all WMI work runs on a background thread; the UI stays at
@@ -98,9 +114,13 @@ feature set, then go past it with security tooling. Status:
 **Done**
 - [x] Browse namespaces / classes / instances in one view
 - [x] Run WQL queries + auto-generate `SELECT *` for a selected class
-- [x] Filter classes and instances
+- [x] Filter classes and instances; **sortable** tables everywhere
 - [x] Virtualized result grid + per-row detail
 - [x] **Live network monitor** (process / IP / port / state, with fade-on-close)
+- [x] **Script generation** — PowerShell + VBScript for the current query
+- [x] **Event-subscription hunter** — `root\subscription` persistence scan with
+      risk scoring (MITRE ATT&CK T1546.003)
+- [x] **WMI provider process info** (`Msft_Providers` → host process)
 
 **Next (WMI Explorer parity)**
 - [ ] **Reflective schema view** — property types, qualifiers (descriptions,
@@ -109,18 +129,13 @@ feature set, then go past it with security tooling. Status:
 - [ ] **Method execution** — dynamic parameter form + `ExecMethod`
       (e.g. `Win32_Process.Create`).
 - [ ] **MOF view** for the selected class/instance.
-- [ ] **Script generation** — PowerShell + VBScript for the current query/class.
 - [ ] **Global search** across class / method / property names.
 - [ ] **Alternate credentials + remote host** connections.
 - [ ] **Async vs sync** enumeration toggle; class/instance **caching**.
-- [ ] **WMI provider process info**.
 
 **Beyond parity (security)**
-- [ ] **Event-subscription hunter** — enumerate `root\subscription`
-      (`__EventFilter` / `__EventConsumer` / `__FilterToConsumerBinding`) to
-      surface WMI persistence — a favourite fileless technique.
 - [ ] **Live event monitor** — async notification queries.
-- [ ] Flag suspicious connections/persistence inline.
+- [ ] Flag suspicious connections inline.
 
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would
 > need an ETW/`iphlpapi` source and is tracked separately.

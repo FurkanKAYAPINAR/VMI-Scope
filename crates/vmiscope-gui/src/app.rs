@@ -215,6 +215,8 @@ pub struct VmiScopeApp {
     next_id: u64,
     pending: HashMap<u64, PendingKind>,
     active_tab: Tab,
+    /// Cached class list per namespace (avoids re-enumerating on revisit).
+    class_cache: HashMap<String, Vec<String>>,
 
     // --- network tab ---
     net_conns: HashMap<String, TrackedConn>,
@@ -273,6 +275,7 @@ impl VmiScopeApp {
             next_id: 0,
             pending: HashMap::new(),
             active_tab: Tab::Explorer,
+            class_cache: HashMap::new(),
             net_conns: HashMap::new(),
             net_last_refresh: 0.0,
             net_inflight: false,
@@ -336,9 +339,15 @@ impl VmiScopeApp {
     }
 
     fn request_classes(&mut self, namespace: String) {
+        self.classes_ns = namespace.clone();
+        // Serve from cache instantly when we've already enumerated this namespace.
+        if let Some(cached) = self.class_cache.get(&namespace) {
+            self.classes = cached.clone();
+            self.classes_loading = false;
+            return;
+        }
         let id = self.alloc_id();
         self.classes_loading = true;
-        self.classes_ns = namespace.clone();
         self.classes.clear();
         self.pending.insert(id, PendingKind::Classes);
         self.worker.send(Request::ListClasses { id, namespace });
@@ -435,9 +444,10 @@ impl VmiScopeApp {
                     self.pending.remove(&id);
                     // Only apply if it still matches the namespace we care about.
                     if namespace == self.classes_ns {
-                        self.classes = classes;
+                        self.classes = classes.clone();
                         self.classes_loading = false;
                     }
+                    self.class_cache.insert(namespace, classes);
                 }
                 Response::QueryResult {
                     id, wql, result, ..

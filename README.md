@@ -1,10 +1,24 @@
-# VMI-Scope
+<h1 align="center">VMI-Scope</h1>
 
-[![CI](https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/ci.yml/badge.svg)](https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6)
+<p align="center">
+  A fast, <strong>security-focused WMI explorer</strong> for Windows, written in Rust.
+</p>
 
-A fast, **security-focused WMI explorer** written in Rust.
+<p align="center">
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/ci.yml"><img src="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/codeql.yml"><img src="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/codeql.yml/badge.svg" alt="CodeQL" /></a>
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/dependabot/dependabot-updates"><img src="https://github.com/FurkanKAYAPINAR/VMI-Scope/actions/workflows/dependabot/dependabot-updates/badge.svg" alt="Dependabot Updates" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white" alt="Platform: Windows" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/releases/latest"><img src="https://img.shields.io/github/v/release/FurkanKAYAPINAR/VMI-Scope?color=success" alt="Release" /></a>
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/stargazers"><img src="https://img.shields.io/github/stars/FurkanKAYAPINAR/VMI-Scope?style=flat&logo=github" alt="Stars" /></a>
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/discussions"><img src="https://img.shields.io/github/discussions/FurkanKAYAPINAR/VMI-Scope" alt="GitHub Discussions" /></a>
+  <a href="https://github.com/FurkanKAYAPINAR/VMI-Scope/issues"><img src="https://img.shields.io/github/issues/FurkanKAYAPINAR/VMI-Scope" alt="Issues" /></a>
+  <img src="https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust&logoColor=white" alt="Rust" />
+</p>
 
 VMI-Scope browses the Windows Management Instrumentation tree the way a class
 browser browses code: expand namespaces, list classes, inspect instances, and

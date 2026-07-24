@@ -13,9 +13,10 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    diff_subscriptions, param_kind, ClassSchema, Connection, MethodArg, MethodOutcome,
-    MethodTarget, ParamKind, Protocol, ProviderInfo, QueryResult, Request, Response, Risk,
-    SearchHit, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
+    diff_subscriptions, param_kind, ClassSchema, Connection, EventMonitor, MethodArg,
+    MethodOutcome, MethodTarget, MonitorMsg, ParamKind, Protocol, ProviderInfo, QueryResult,
+    Request, Response, Risk, SearchHit, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
+    DEFAULT_EVENT_QUERY,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -34,6 +35,7 @@ enum Tab {
     Network,
     Persistence,
     Providers,
+    Events,
 }
 
 /// A connection tracked across snapshots so it can fade out after it closes.
@@ -298,6 +300,12 @@ pub struct VmiScopeApp {
     providers_loading: bool,
     providers_sort: Option<(usize, bool)>,
 
+    // --- events tab (live monitor) ---
+    monitor: Option<EventMonitor>,
+    monitor_wql: String,
+    monitor_error: Option<String>,
+    events_log: Vec<Vec<(String, String)>>,
+
     // --- namespace tree ---
     /// namespace path -> its loaded child paths (absent = not loaded yet).
     ns_children: HashMap<String, Vec<String>>,
@@ -379,6 +387,10 @@ impl VmiScopeApp {
             providers: None,
             providers_loading: false,
             providers_sort: None,
+            monitor: None,
+            monitor_wql: DEFAULT_EVENT_QUERY.to_string(),
+            monitor_error: None,
+            events_log: Vec::new(),
             ns_children: HashMap::new(),
             ns_expanded: HashSet::new(),
             ns_loading: HashSet::new(),
@@ -2363,6 +2375,77 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // UI: live event monitor
+    // ------------------------------------------------------------------
+
+    fn ui_events(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Live WMI events");
+            if self.monitor.is_some() {
+                if ui.button("\u{23f9} Stop").clicked() {
+                    self.monitor = None;
+                }
+                ui.colored_label(Color32::from_rgb(120, 210, 140), "\u{25cf} monitoring");
+            } else if ui.button("\u{25b6} Start").clicked() {
+                self.monitor_error = None;
+                self.monitor = Some(EventMonitor::start(
+                    self.active_ns.clone(),
+                    self.monitor_wql.clone(),
+                ));
+            }
+            if ui.button("clear").clicked() {
+                self.events_log.clear();
+            }
+            ui.weak(format!("{} events", self.events_log.len()));
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut self.monitor_wql)
+                .desired_width(f32::INFINITY)
+                .code_editor(),
+        );
+        if let Some(e) = &self.monitor_error {
+            ui.colored_label(Color32::from_rgb(240, 120, 120), e);
+        }
+        ui.weak("A WMI notification query (WITHIN n). Default watches process creation.");
+        ui.separator();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.events_log.is_empty() {
+                    ui.weak("No events yet \u{2014} click Start.");
+                }
+                for ev in &self.events_log {
+                    let find = |suffix: &str| {
+                        ev.iter()
+                            .find(|(k, _)| k.ends_with(suffix))
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("")
+                    };
+                    let name = find(".Name");
+                    let summary = if name.is_empty() {
+                        ev.iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join("   ")
+                    } else {
+                        format!(
+                            "{name}   pid {}   {}",
+                            find(".ProcessId"),
+                            find(".CommandLine")
+                        )
+                    };
+                    let all = ev
+                        .iter()
+                        .map(|(k, v)| format!("{k} = {v}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.label(summary).on_hover_text(all);
+                }
+            });
+    }
+
+    // ------------------------------------------------------------------
     // UI: connection bar (remote host, current user / SSO)
     // ------------------------------------------------------------------
 
@@ -2433,6 +2516,20 @@ impl eframe::App for VmiScopeApp {
         let now = ui.input(|i| i.time);
         self.handle_responses(now);
 
+        // Drain the live event monitor (if running).
+        if self.monitor.is_some() {
+            let msgs = self.monitor.as_ref().unwrap().poll();
+            for msg in msgs {
+                match msg {
+                    MonitorMsg::Event(pairs) => {
+                        self.events_log.insert(0, pairs);
+                        self.events_log.truncate(500);
+                    }
+                    MonitorMsg::Error(e) => self.monitor_error = Some(e),
+                }
+            }
+        }
+
         // Drive the live network refresh from the frame clock.
         if self.active_tab == Tab::Network
             && !self.net_paused
@@ -2469,6 +2566,7 @@ impl eframe::App for VmiScopeApp {
                     "\u{1f6e1} Persistence",
                 );
                 ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
+                ui.selectable_value(&mut self.active_tab, Tab::Events, "\u{1f4e1} Events");
             });
             ui.separator();
             self.ui_connection_bar(ui);
@@ -2532,6 +2630,11 @@ impl eframe::App for VmiScopeApp {
                     self.ui_providers(ui);
                 });
             }
+            Tab::Events => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_events(ui);
+                });
+            }
         }
 
         // MOF viewer and the method-invocation confirmation float above the tabs.
@@ -2544,6 +2647,10 @@ impl eframe::App for VmiScopeApp {
         }
         if self.active_tab == Tab::Network && !self.net_paused {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
+        // Keep events flowing in while the monitor runs.
+        if self.monitor.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }
 }

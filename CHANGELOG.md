@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Live event monitor** (Events tab): run a WMI notification query and watch
+  events stream in — default watches process creation
+  (`__InstanceCreationEvent WITHIN 2 ... Win32_Process`). Runs on its own thread
+  so it never blocks the UI; drills into the embedded `TargetInstance`.
+- **Snapshot & diff** for the Persistence hunt: save a baseline and diff the
+  current scan against it (added / changed / removed subscriptions).
+- **HTML report** for the persistence scan — a self-contained, styled artifact
+  (risk colours + MITRE ATT&CK T1546.003).
+
 ## [0.3.0] - 2026-07-25
 
 ### Added

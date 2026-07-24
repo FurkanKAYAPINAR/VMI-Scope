@@ -31,8 +31,9 @@ filling a real gap in the Rust ecosystem (the `wmi` crate is optimized for
 
 ## Features
 
-Four tabs: **Explorer** (browse WMI), **Network** (live connections),
-**Persistence** (WMI event-subscription hunter), and **Providers**.
+Five tabs: **Explorer** (browse WMI), **Network** (live connections),
+**Persistence** (WMI event-subscription hunter, with snapshot/diff + HTML/CSV/JSON
+export), **Providers**, and **Events** (live WMI notification monitor).
 Every table sorts — click a column header (ascending → descending → off).
 Point the **Host** field in the top bar at a remote machine (current-user SSO)
 and every tab reflects it.
@@ -153,15 +154,16 @@ feature set, then go past it with security tooling. Status:
 - [x] **Class-list caching** (async is inherent via the background worker).
 - [x] **Remote host** connection (current-user SSO).
 - [x] **Export** query results & persistence report to CSV / JSON.
+- [x] **HTML report** for the persistence scan (analyst-ready, ATT&CK-tagged).
+- [x] **Snapshot & diff** of the persistence scan (baseline hunting).
+- [x] **Live event monitor** — WMI notification queries (Events tab).
 - [x] **Unit tests** + CI (`cargo test`, CodeQL, Dependabot).
 
 **Next**
 - [ ] **Alternate credentials** for remote hosts (needs a raw-DCOM
       `COAUTHIDENTITY` layer — the `wmi` crate's credentialed path runs queries
-      as the local user).
-- [ ] **Snapshot & diff** of Persistence/Providers over time (baseline hunting).
-- [ ] **HTML report** for the persistence scan (analyst-ready artifact).
-- [ ] **Live event monitor** — async notification queries.
+      as the local user, and it can't be verified without a remote test host).
+- [ ] Snapshot & diff for **Providers**; baseline of known-good subscriptions.
 - [ ] Mockable `WmiBackend` trait → publish `vmiscope-core` to crates.io.
 - [ ] Flag suspicious connections inline.
 

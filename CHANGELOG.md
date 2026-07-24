@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Global search** (Explorer left panel): build a name index for the current
+  namespace, then search across **class, property, and (optionally) method
+  names**. Clicking a hit jumps to the class — a property hit runs
+  `SELECT <prop> FROM <class>`, a method hit opens the Actions panel on it.
 - **Method execution** (Explorer → ⚙ Actions): invoke any WMI method with a
   dynamic, type-aware parameter form. Static methods (e.g. `Win32_Process.Create`)
   and instance methods (pick a target from a loaded instance list) are both

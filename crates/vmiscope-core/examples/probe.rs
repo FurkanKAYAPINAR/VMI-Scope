@@ -41,6 +41,11 @@ fn main() {
         namespace: "root\\cimv2".into(),
         class: "Win32_Service".into(),
     });
+    worker.send(Request::BuildSearchIndex {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        include_methods: false,
+    });
     // Read-only method: enumerate HKLM\SOFTWARE subkeys via StdRegProv.
     worker.send(Request::InvokeMethod {
         id: id(),
@@ -66,7 +71,7 @@ fn main() {
     // Give the worker time and drain replies.
     let mut received = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 9 && std::time::Instant::now() < deadline {
+    while received < 10 && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -178,6 +183,13 @@ fn main() {
                     for line in mof.lines().take(6) {
                         println!("  {line}");
                     }
+                }
+                Response::SearchIndex { index, .. } => {
+                    let props: usize = index.properties.values().map(|v| v.len()).sum();
+                    println!(
+                        "\n== search index: {} classes, {props} property names ==",
+                        index.classes.len()
+                    );
                 }
                 Response::Instances { class, targets, .. } => {
                     println!("\n== instances of {class} ({}) ==", targets.len());

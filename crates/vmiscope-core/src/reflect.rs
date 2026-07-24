@@ -267,6 +267,32 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
     Ok(schema)
 }
 
+/// Enumerate just the method names of a class object (for the search index).
+pub fn enum_method_names(obj: &IWbemClassObject) -> Vec<String> {
+    let mut names = Vec::new();
+    unsafe {
+        if obj.BeginMethodEnumeration(0).is_ok() {
+            for _ in 0..4096 {
+                let mut name = windows::core::BSTR::new();
+                let mut in_sig: Option<IWbemClassObject> = None;
+                let mut out_sig: Option<IWbemClassObject> = None;
+                if obj
+                    .NextMethod(0, &mut name, &mut in_sig, &mut out_sig)
+                    .is_err()
+                {
+                    break;
+                }
+                if name.is_empty() {
+                    break;
+                }
+                names.push(name.to_string());
+            }
+            let _ = obj.EndMethodEnumeration();
+        }
+    }
+    names
+}
+
 /// Return the MOF (Managed Object Format) text of a class or instance.
 ///
 /// `object_path` is a class name (`Win32_Process`) or an instance path

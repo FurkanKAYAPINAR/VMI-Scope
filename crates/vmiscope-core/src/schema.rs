@@ -50,3 +50,23 @@ pub struct ParamSchema {
     pub id: i32,
     pub optional: bool,
 }
+
+/// A searchable index of a namespace: class names, and each class's property
+/// (and optionally method) names. Built on demand for the global search box.
+#[derive(Debug, Clone, Default)]
+pub struct SearchIndex {
+    pub namespace: String,
+    pub classes: Vec<String>,
+    pub properties: std::collections::HashMap<String, Vec<String>>,
+    pub methods: std::collections::HashMap<String, Vec<String>>,
+    pub has_methods: bool,
+}
+
+/// One global-search hit.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub class: String,
+    /// `None` for a class hit; `Some(name)` for a property/method hit.
+    pub member: Option<String>,
+    pub is_method: bool,
+}

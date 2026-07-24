@@ -14,8 +14,8 @@ use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
     param_kind, ClassSchema, Connection, MethodArg, MethodOutcome, MethodTarget, ParamKind,
-    Protocol, ProviderInfo, QueryResult, Request, Response, Risk, Subscription, SubscriptionReport,
-    WmiWorker,
+    Protocol, ProviderInfo, QueryResult, Request, Response, Risk, SearchHit, SearchIndex,
+    Subscription, SubscriptionReport, WmiWorker,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -57,6 +57,7 @@ enum PendingKind {
     Mof,
     Instances,
     Invoke,
+    Search,
 }
 
 /// A dangerous-looking method name gets an extra warning in the confirm modal.
@@ -311,6 +312,11 @@ pub struct VmiScopeApp {
     act_invoking: bool,
     act_outcome: Option<(String, MethodOutcome)>,
     confirm_open: bool,
+    // --- global search ---
+    search_index: Option<SearchIndex>,
+    search_loading: bool,
+    search_text: String,
+    search_methods: bool,
     latest_query_id: u64,
     query_loading: bool,
     result: Option<QueryResult>,
@@ -376,6 +382,10 @@ impl VmiScopeApp {
             act_invoking: false,
             act_outcome: None,
             confirm_open: false,
+            search_index: None,
+            search_loading: false,
+            search_text: String::new(),
+            search_methods: false,
             latest_query_id: 0,
             query_loading: false,
             result: None,
@@ -469,6 +479,17 @@ impl VmiScopeApp {
             id,
             namespace: self.active_ns.clone(),
             class,
+        });
+    }
+
+    fn request_search_index(&mut self, include_methods: bool) {
+        let id = self.alloc_id();
+        self.search_loading = true;
+        self.pending.insert(id, PendingKind::Search);
+        self.worker.send(Request::BuildSearchIndex {
+            id,
+            namespace: self.active_ns.clone(),
+            include_methods,
         });
     }
 
@@ -690,6 +711,11 @@ impl VmiScopeApp {
                     self.act_invoking = false;
                     self.act_outcome = Some((method, outcome));
                 }
+                Response::SearchIndex { id, index } => {
+                    self.pending.remove(&id);
+                    self.search_loading = false;
+                    self.search_index = Some(index);
+                }
                 Response::Error {
                     id,
                     context,
@@ -728,6 +754,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Invoke) => {
                             self.act_invoking = false;
+                        }
+                        Some(PendingKind::Search) => {
+                            self.search_loading = false;
                         }
                         None => {}
                     }
@@ -1992,6 +2021,146 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // Global search
+    // ------------------------------------------------------------------
+
+    fn compute_hits(&self, q: &str) -> Vec<SearchHit> {
+        let Some(idx) = self.search_index.as_ref() else {
+            return Vec::new();
+        };
+        let mut hits = Vec::new();
+        for c in &idx.classes {
+            if c.to_lowercase().contains(q) {
+                hits.push(SearchHit {
+                    class: c.clone(),
+                    member: None,
+                    is_method: false,
+                });
+            }
+        }
+        for (class, props) in &idx.properties {
+            for p in props {
+                if p.to_lowercase().contains(q) {
+                    hits.push(SearchHit {
+                        class: class.clone(),
+                        member: Some(p.clone()),
+                        is_method: false,
+                    });
+                }
+            }
+        }
+        if idx.has_methods {
+            for (class, methods) in &idx.methods {
+                for m in methods {
+                    if m.to_lowercase().contains(q) {
+                        hits.push(SearchHit {
+                            class: class.clone(),
+                            member: Some(m.clone()),
+                            is_method: true,
+                        });
+                    }
+                }
+            }
+        }
+        // Stable order (HashMap iteration is not deterministic).
+        hits.sort_by(|a, b| {
+            a.class
+                .to_lowercase()
+                .cmp(&b.class.to_lowercase())
+                .then(a.member.cmp(&b.member))
+        });
+        hits.truncate(300);
+        hits
+    }
+
+    fn apply_search_hit(&mut self, h: SearchHit) {
+        self.central_view = CentralView::Instances;
+        match h.member {
+            None => self.select_class(h.class),
+            Some(m) if h.is_method => {
+                self.selected_class = Some(h.class.clone());
+                self.query_text = format!("SELECT * FROM {}", h.class);
+                self.run_query();
+                self.actions_open = true;
+                self.act_method = Some(m);
+                self.act_args.clear();
+                self.act_bools.clear();
+                self.act_outcome = None;
+                self.request_schema(h.class);
+            }
+            Some(m) => {
+                self.selected_class = Some(h.class.clone());
+                self.query_text = format!("SELECT {m} FROM {}", h.class);
+                self.run_query();
+            }
+        }
+    }
+
+    fn ui_search(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("\u{1f50d} Global search")
+            .id_salt("global-search")
+            .show(ui, |ui| {
+                let mut build = false;
+                ui.horizontal(|ui| {
+                    if ui.button("Build index").clicked() {
+                        build = true;
+                    }
+                    ui.checkbox(&mut self.search_methods, "methods");
+                    if self.search_loading {
+                        ui.spinner();
+                    }
+                });
+                if build {
+                    self.request_search_index(self.search_methods);
+                }
+                let indexed = self.search_index.as_ref().map(|i| i.classes.len());
+                match indexed {
+                    None => {
+                        ui.weak("build the index to search class / property / method names");
+                        return;
+                    }
+                    Some(n) => {
+                        ui.weak(format!("{n} classes indexed"));
+                    }
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_text)
+                        .hint_text("search names")
+                        .desired_width(f32::INFINITY),
+                );
+                let q = self.search_text.trim().to_lowercase();
+                if q.len() < 2 {
+                    ui.weak("type at least 2 characters");
+                    return;
+                }
+                let hits = self.compute_hits(&q);
+                let mut clicked: Option<SearchHit> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("search-results")
+                    .max_height(240.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if hits.is_empty() {
+                            ui.weak("no matches");
+                        }
+                        for h in &hits {
+                            let label = match &h.member {
+                                None => format!("\u{1f5c2} {}", h.class),
+                                Some(m) if h.is_method => format!("{} :: {}()", h.class, m),
+                                Some(m) => format!("{} :: {}", h.class, m),
+                            };
+                            if ui.selectable_label(false, label).clicked() {
+                                clicked = Some(h.clone());
+                            }
+                        }
+                    });
+                if let Some(h) = clicked {
+                    self.apply_search_hit(h);
+                }
+            });
+    }
+
+    // ------------------------------------------------------------------
     // UI: status bar
     // ------------------------------------------------------------------
 
@@ -2071,7 +2240,9 @@ impl eframe::App for VmiScopeApp {
                     .size_range(egui::Rangef::new(200.0, 520.0))
                     .show(ui, |ui| {
                         self.ui_namespace_tree(ui);
-                        ui.add_space(8.0);
+                        ui.add_space(6.0);
+                        self.ui_search(ui);
+                        ui.add_space(6.0);
                         self.ui_class_list(ui);
                     });
 

@@ -15,7 +15,7 @@ use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
 use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
-use crate::schema::ClassSchema;
+use crate::schema::{ClassSchema, SearchIndex};
 use crate::value::{variant_to_string, variant_to_u32};
 
 /// A unit of work for the WMI thread. `id` lets the UI correlate the reply
@@ -65,6 +65,12 @@ pub enum Request {
         method: String,
         is_static: bool,
         args: Vec<MethodArg>,
+    },
+    /// Build a class/property(/method) name index for global search.
+    BuildSearchIndex {
+        id: u64,
+        namespace: String,
+        include_methods: bool,
     },
     /// Stop the worker thread.
     Shutdown,
@@ -130,6 +136,10 @@ pub enum Response {
         class: String,
         method: String,
         outcome: MethodOutcome,
+    },
+    SearchIndex {
+        id: u64,
+        index: SearchIndex,
     },
     Error {
         id: u64,
@@ -367,6 +377,22 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: format!("Invoke {class}.{method}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::BuildSearchIndex {
+                id,
+                namespace,
+                include_methods,
+            } => {
+                let resp = match build_search_index(&namespace, include_methods) {
+                    Ok(index) => Response::SearchIndex { id, index },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("Build search index for {namespace}"),
                         message: e.to_string(),
                     },
                 };
@@ -622,6 +648,35 @@ fn process_names() -> anyhow::Result<HashMap<u32, String>> {
         }
     }
     Ok(map)
+}
+
+/// Build a class/property(/method) name index for a namespace (for search).
+fn build_search_index(namespace: &str, include_methods: bool) -> anyhow::Result<SearchIndex> {
+    let conn = connect(namespace)?;
+    let mut index = SearchIndex {
+        namespace: namespace.to_string(),
+        has_methods: include_methods,
+        ..Default::default()
+    };
+    for item in conn.exec_query("SELECT * FROM meta_class")? {
+        let Ok(obj) = item else { continue };
+        let class = obj.class().unwrap_or_default();
+        if class.is_empty() {
+            continue;
+        }
+        index
+            .properties
+            .insert(class.clone(), obj.list_properties().unwrap_or_default());
+        if include_methods {
+            let methods = crate::reflect::enum_method_names(&obj.inner);
+            if !methods.is_empty() {
+                index.methods.insert(class.clone(), methods);
+            }
+        }
+        index.classes.push(class);
+    }
+    index.classes.sort_unstable();
+    Ok(index)
 }
 
 /// List WMI providers (`Msft_Providers`) and the processes hosting them.

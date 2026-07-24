@@ -18,5 +18,5 @@ pub use events::{Risk, Subscription, SubscriptionReport};
 pub use method::{param_kind, MethodArg, MethodOutcome, MethodTarget, ParamKind};
 pub use network::{Connection, NetworkSnapshot, Protocol};
 pub use providers::ProviderInfo;
-pub use schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema};
+pub use schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema, SearchHit, SearchIndex};
 pub use worker::{QueryResult, Request, Response, WmiWorker};

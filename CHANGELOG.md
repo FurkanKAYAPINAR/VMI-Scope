@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-24
+
 ### Added
 - **Remote host connection** (top bar): point every tab at a remote machine by
   hostname/IP, connecting as the **current user (SSO)**. All views — Explorer,
@@ -53,4 +55,5 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/commits/main
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/releases/tag/v0.2.0

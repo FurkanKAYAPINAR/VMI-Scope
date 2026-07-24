@@ -13,20 +13,28 @@ explorers, the core is a reusable Rust crate built on the reflective WMI/COM API
 filling a real gap in the Rust ecosystem (the `wmi` crate is optimized for
 *typed* queries; VMI-Scope does *generic* reflection).
 
-> Status: **v0.1 — Milestone 1 (working explorer).** See the [Roadmap](#roadmap).
+> Status: **v0.2 — feature-complete explorer + security tooling.** See the [Roadmap](#roadmap).
 
 ## Features
 
 Four tabs: **Explorer** (browse WMI), **Network** (live connections),
 **Persistence** (WMI event-subscription hunter), and **Providers**.
 Every table sorts — click a column header (ascending → descending → off).
+Point the **Host** field in the top bar at a remote machine (current-user SSO)
+and every tab reflects it.
 
 ### Explorer
 - **Namespace tree** — lazily enumerated from `root` down (`__NAMESPACE`).
 - **Class browser** — every class in the selected namespace (1400+ in
-  `root\CIMV2`), with live filtering.
+  `root\CIMV2`), with live filtering + **caching** on revisit.
 - **Instance viewer** — click a class to auto-generate `SELECT * FROM <Class>`
   and see the instances in a virtualized, sortable table.
+- **Schema view** — properties (CIM types, key/read/write, `ValueMap` enums) and
+  method signatures for any class, even zero-instance ones.
+- **Method execution** — invoke any method with a type-aware parameter form,
+  behind a confirmation gate.
+- **MOF view** — the MOF text of any class/instance.
+- **Global search** — across class / property / method names.
 - **WQL editor** — run arbitrary queries (Ctrl+Enter), against any namespace.
 - **Row detail** — click any row to see every property as a `name → value` grid.
 - **Script generation** — PowerShell / VBScript for the current query.
@@ -121,20 +129,23 @@ feature set, then go past it with security tooling. Status:
 - [x] **Event-subscription hunter** — `root\subscription` persistence scan with
       risk scoring (MITRE ATT&CK T1546.003)
 - [x] **WMI provider process info** (`Msft_Providers` → host process)
+- [x] **Reflective schema view** — property types, qualifiers (descriptions,
+      `ValueMap` enums), and method signatures for any class, even zero-instance
+      ones (raw `IWbemClassObject` reflection).
+- [x] **Method execution** — dynamic, type-aware parameter form + confirm gate
+      (`Win32_Process.Create`, `StdRegProv`, …).
+- [x] **MOF view** for the selected class/instance.
+- [x] **Global search** across class / property / method names.
+- [x] **Class-list caching** (async is inherent via the background worker).
+- [x] **Remote host** connection (current-user SSO).
 
-**Next (WMI Explorer parity)**
-- [ ] **Reflective schema view** — property types, qualifiers (descriptions,
-      `ValueMap` enums), and method signatures for any class, even with zero
-      instances (via `IWbemClassWrapper` + `GetQualifierSet`).
-- [ ] **Method execution** — dynamic parameter form + `ExecMethod`
-      (e.g. `Win32_Process.Create`).
-- [ ] **MOF view** for the selected class/instance.
-- [ ] **Global search** across class / method / property names.
-- [ ] **Alternate credentials + remote host** connections.
-- [ ] **Async vs sync** enumeration toggle; class/instance **caching**.
-
-**Beyond parity (security)**
+**Next**
+- [ ] **Alternate credentials** for remote hosts (needs a raw-DCOM
+      `COAUTHIDENTITY` layer — the `wmi` crate's credentialed path runs queries
+      as the local user).
 - [ ] **Live event monitor** — async notification queries.
+- [ ] **Snapshot & diff** of Persistence/Providers over time (baseline hunting).
+- [ ] **Export** results/reports to CSV / JSON / HTML.
 - [ ] Flag suspicious connections inline.
 
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would

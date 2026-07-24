@@ -13,8 +13,8 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    Connection, Protocol, QueryResult, Request, Response, Risk, Subscription, SubscriptionReport,
-    WmiWorker,
+    Connection, Protocol, ProviderInfo, QueryResult, Request, Response, Risk, Subscription,
+    SubscriptionReport, WmiWorker,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -32,6 +32,7 @@ enum Tab {
     Explorer,
     Network,
     Persistence,
+    Providers,
 }
 
 /// A connection tracked across snapshots so it can fade out after it closes.
@@ -50,6 +51,7 @@ enum PendingKind {
     Query,
     Network,
     Events,
+    Providers,
 }
 
 /// Colour for a subscription risk level.
@@ -162,6 +164,18 @@ fn sub_col_value(s: &Subscription, col: usize) -> String {
     }
 }
 
+/// The display/sort string for a providers table column.
+fn prov_col_value(p: &ProviderInfo, col: usize) -> String {
+    match col {
+        0 => p.provider.clone(),
+        1 => p.namespace.clone(),
+        2 => p.host_pid.to_string(),
+        3 => p.host_process.clone(),
+        4 => p.hosting_group.clone(),
+        _ => String::new(),
+    }
+}
+
 /// Compare two cells numerically when both parse as numbers, else case-insensitively.
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<f64>(), b.parse::<f64>()) {
@@ -216,6 +230,11 @@ pub struct VmiScopeApp {
     events_loading: bool,
     events_sort: Option<(usize, bool)>,
 
+    // --- providers tab ---
+    providers: Option<Vec<ProviderInfo>>,
+    providers_loading: bool,
+    providers_sort: Option<(usize, bool)>,
+
     // --- namespace tree ---
     /// namespace path -> its loaded child paths (absent = not loaded yet).
     ns_children: HashMap<String, Vec<String>>,
@@ -263,6 +282,9 @@ impl VmiScopeApp {
             events_report: None,
             events_loading: false,
             events_sort: None,
+            providers: None,
+            providers_loading: false,
+            providers_sort: None,
             ns_children: HashMap::new(),
             ns_expanded: HashSet::new(),
             ns_loading: HashSet::new(),
@@ -335,6 +357,13 @@ impl VmiScopeApp {
         self.events_loading = true;
         self.pending.insert(id, PendingKind::Events);
         self.worker.send(Request::ListEventSubscriptions { id });
+    }
+
+    fn request_providers(&mut self) {
+        let id = self.alloc_id();
+        self.providers_loading = true;
+        self.pending.insert(id, PendingKind::Providers);
+        self.worker.send(Request::ListProviders { id });
     }
 
     fn run_query(&mut self) {
@@ -460,6 +489,11 @@ impl VmiScopeApp {
                     self.events_loading = false;
                     self.events_report = Some(report);
                 }
+                Response::Providers { id, providers } => {
+                    self.pending.remove(&id);
+                    self.providers_loading = false;
+                    self.providers = Some(providers);
+                }
                 Response::Error {
                     id,
                     context,
@@ -483,6 +517,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Events) => {
                             self.events_loading = false;
+                        }
+                        Some(PendingKind::Providers) => {
+                            self.providers_loading = false;
                         }
                         None => {}
                     }
@@ -1081,6 +1118,108 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // UI: WMI providers → host processes
+    // ------------------------------------------------------------------
+
+    fn ui_providers(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("WMI providers");
+            if self.providers_loading {
+                ui.spinner();
+            }
+            if ui.button("\u{21bb} Refresh").clicked() {
+                self.request_providers();
+            }
+            if let Some(p) = self.providers.as_ref() {
+                ui.weak(format!("({})", p.len()));
+            }
+            ui.weak("Msft_Providers — which process hosts each provider");
+        });
+        ui.separator();
+
+        let sort = self.providers_sort;
+        let mut header_clicked: Option<usize> = None;
+
+        if let Some(providers) = self.providers.as_ref() {
+            if providers.is_empty() {
+                ui.weak("No providers returned.");
+            } else {
+                let mut order: Vec<usize> = (0..providers.len()).collect();
+                if let Some((ci, asc)) = sort {
+                    order.sort_by(|&a, &b| {
+                        let o = smart_cmp(
+                            &prov_col_value(&providers[a], ci),
+                            &prov_col_value(&providers[b], ci),
+                        );
+                        if asc {
+                            o
+                        } else {
+                            o.reverse()
+                        }
+                    });
+                }
+
+                let headers = [
+                    "Provider",
+                    "Namespace",
+                    "Host PID",
+                    "Host process",
+                    "Hosting group",
+                ];
+                let widths = [220.0, 160.0, 74.0, 170.0, 200.0];
+                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+
+                let mut table = TableBuilder::new(ui)
+                    .id_salt("providers-table")
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .min_scrolled_height(0.0);
+                for w in widths {
+                    table =
+                        table.column(Column::initial(w).at_least(48.0).clip(true).resizable(true));
+                }
+                table
+                    .header(22.0, |mut header| {
+                        for (ci, h) in headers.iter().enumerate() {
+                            header.col(|ui| {
+                                if sortable_header(ui, h, ci, sort) {
+                                    header_clicked = Some(ci);
+                                }
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(row_h, order.len(), |mut row| {
+                            let p = &providers[order[row.index()]];
+                            row.col(|ui| {
+                                ui.label(p.provider.as_str());
+                            });
+                            row.col(|ui| {
+                                ui.label(p.namespace.as_str());
+                            });
+                            row.col(|ui| {
+                                ui.label(p.host_pid.to_string());
+                            });
+                            row.col(|ui| {
+                                ui.label(p.host_process.as_str());
+                            });
+                            row.col(|ui| {
+                                ui.label(p.hosting_group.as_str());
+                            });
+                        });
+                    });
+            }
+        } else if !self.providers_loading {
+            ui.weak("Click Refresh to list WMI providers.");
+        }
+
+        if let Some(ci) = header_clicked {
+            toggle_sort(&mut self.providers_sort, ci);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // UI: status bar
     // ------------------------------------------------------------------
 
@@ -1125,6 +1264,12 @@ impl eframe::App for VmiScopeApp {
             self.request_events();
         }
 
+        // Load the provider list the first time its tab is opened.
+        if self.active_tab == Tab::Providers && self.providers.is_none() && !self.providers_loading
+        {
+            self.request_providers();
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1137,6 +1282,7 @@ impl eframe::App for VmiScopeApp {
                     Tab::Persistence,
                     "\u{1f6e1} Persistence",
                 );
+                ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
             });
             ui.add_space(4.0);
         });
@@ -1179,6 +1325,11 @@ impl eframe::App for VmiScopeApp {
             Tab::Persistence => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.ui_persistence(ui);
+                });
+            }
+            Tab::Providers => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_providers(ui);
                 });
             }
         }

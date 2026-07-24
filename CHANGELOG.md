@@ -7,6 +7,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Providers tab**: lists WMI providers (`Msft_Providers`) with the process
+  hosting each — provider, namespace, host PID, host process name, hosting
+  group. Sortable; useful for troubleshooting `wmiprvse.exe`.
 - **Persistence tab (WMI event-subscription hunter)**: enumerates
   `root\subscription` — `__EventFilter`, all `__EventConsumer` subclasses, and
   `__FilterToConsumerBinding` — correlates each binding to its trigger and

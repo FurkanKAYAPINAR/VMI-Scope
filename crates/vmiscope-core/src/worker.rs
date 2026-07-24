@@ -13,6 +13,7 @@ use wmi::{Variant, WMIConnection};
 
 use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
+use crate::providers::ProviderInfo;
 use crate::value::{variant_to_string, variant_to_u32};
 
 /// A unit of work for the WMI thread. `id` lets the UI correlate the reply
@@ -33,6 +34,8 @@ pub enum Request {
     NetworkSnapshot { id: u64 },
     /// Enumerate permanent WMI event subscriptions (persistence hunt).
     ListEventSubscriptions { id: u64 },
+    /// Enumerate WMI providers and their host processes.
+    ListProviders { id: u64 },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -71,6 +74,10 @@ pub enum Response {
     EventSubscriptions {
         id: u64,
         report: SubscriptionReport,
+    },
+    Providers {
+        id: u64,
+        providers: Vec<ProviderInfo>,
     },
     Error {
         id: u64,
@@ -199,6 +206,18 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: "Enumerate event subscriptions".into(),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::ListProviders { id } => {
+                let resp = match list_providers() {
+                    Ok(providers) => Response::Providers { id, providers },
+                    Err(e) => Response::Error {
+                        id,
+                        context: "Enumerate WMI providers".into(),
                         message: e.to_string(),
                     },
                 };
@@ -436,4 +455,59 @@ fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
     // Sort most-suspicious first so the interesting rows lead.
     subscriptions.sort_by(|a, b| b.risk.cmp(&a.risk));
     Ok(SubscriptionReport { subscriptions })
+}
+
+/// PID → process name, from `Win32_Process`.
+fn process_names() -> anyhow::Result<HashMap<u32, String>> {
+    let cimv2 = connect("root\\CIMV2")?;
+    let procs: Vec<HashMap<String, Variant>> =
+        cimv2.raw_query("SELECT ProcessId, Name FROM Win32_Process")?;
+    let mut map = HashMap::new();
+    for p in procs {
+        let pid = p.get("ProcessId").map(variant_to_u32).unwrap_or(0);
+        if pid != 0 {
+            map.insert(
+                pid,
+                p.get("Name").map(variant_to_string).unwrap_or_default(),
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// List WMI providers (`Msft_Providers`) and the processes hosting them.
+fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
+    let names = process_names().unwrap_or_default();
+    let conn = connect("root\\CIMV2")?;
+    let rows: Vec<HashMap<String, Variant>> = conn.raw_query(
+        "SELECT provider, Namespace, HostProcessIdentifier, HostingGroup FROM Msft_Providers",
+    )?;
+    let mut providers: Vec<ProviderInfo> = rows
+        .into_iter()
+        .map(|r| {
+            let host_pid = r
+                .get("HostProcessIdentifier")
+                .map(variant_to_u32)
+                .unwrap_or(0);
+            ProviderInfo {
+                provider: r
+                    .get("provider")
+                    .or_else(|| r.get("Provider"))
+                    .map(variant_to_string)
+                    .unwrap_or_default(),
+                namespace: r
+                    .get("Namespace")
+                    .map(variant_to_string)
+                    .unwrap_or_default(),
+                host_pid,
+                host_process: names.get(&host_pid).cloned().unwrap_or_default(),
+                hosting_group: r
+                    .get("HostingGroup")
+                    .map(variant_to_string)
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    providers.sort_by(|a, b| a.provider.to_lowercase().cmp(&b.provider.to_lowercase()));
+    Ok(providers)
 }

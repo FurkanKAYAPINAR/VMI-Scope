@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Remote host connection** (top bar): point every tab at a remote machine by
+  hostname/IP, connecting as the **current user (SSO)**. All views — Explorer,
+  Network, Persistence, Providers — transparently reflect the remote host.
+  (Alternate credentials need a raw-DCOM layer and are tracked separately.)
 - **Global search** (Explorer left panel): build a name index for the current
   namespace, then search across **class, property, and (optionally) method
   names**. Clicking a hit jumps to the class — a property hit runs

@@ -5,6 +5,7 @@
 //! through channels: it pushes [`Request`]s and drains [`Response`]s each
 //! frame without ever blocking on WMI.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -72,6 +73,9 @@ pub enum Request {
         namespace: String,
         include_methods: bool,
     },
+    /// Point all subsequent connections at `host` (as the current user), or
+    /// back to the local machine with `None`.
+    SetHost { id: u64, host: Option<String> },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -140,6 +144,10 @@ pub enum Response {
     SearchIndex {
         id: u64,
         index: SearchIndex,
+    },
+    HostConnected {
+        id: u64,
+        host: Option<String>,
     },
     Error {
         id: u64,
@@ -398,14 +406,50 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                 };
                 let _ = tx.send(resp);
             }
+
+            Request::SetHost { id, host } => {
+                HOST.with(|h| *h.borrow_mut() = host.clone());
+                // Verify the target is reachable with a trivial query.
+                let probe = connect("root\\CIMV2").and_then(|c| {
+                    c.raw_query::<HashMap<String, Variant>>("SELECT Name FROM Win32_ComputerSystem")
+                        .map_err(anyhow::Error::from)
+                });
+                let resp = match probe {
+                    Ok(_) => Response::HostConnected { id, host },
+                    Err(e) => {
+                        // Revert to local so the app stays usable.
+                        HOST.with(|h| *h.borrow_mut() = None);
+                        Response::Error {
+                            id,
+                            context: "Connect to host".into(),
+                            message: e.to_string(),
+                        }
+                    }
+                };
+                let _ = tx.send(resp);
+            }
         }
     }
 }
 
-/// Connect to a namespace. Kept per-request for simplicity; connections are
-/// cheap relative to the user-driven cadence of an explorer.
+thread_local! {
+    /// The remote host all connections target, or `None` for the local machine.
+    /// Thread-local because it lives entirely on the (single) worker thread.
+    static HOST: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Connect to a namespace on the current target host. When a host is set the
+/// connection is made as the *current user* (SSO) — see [`Request::SetHost`].
+/// Kept per-request for simplicity; connections are cheap relative to the
+/// user-driven cadence of an explorer.
 fn connect(namespace: &str) -> anyhow::Result<WMIConnection> {
-    Ok(WMIConnection::with_namespace_path(namespace)?)
+    let host = HOST.with(|h| h.borrow().clone());
+    match host {
+        Some(server) => Ok(WMIConnection::with_credentials_and_namespace(
+            &server, namespace, None, None, None,
+        )?),
+        None => Ok(WMIConnection::with_namespace_path(namespace)?),
+    }
 }
 
 fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {

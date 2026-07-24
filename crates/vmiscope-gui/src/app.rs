@@ -58,6 +58,7 @@ enum PendingKind {
     Instances,
     Invoke,
     Search,
+    Connect,
 }
 
 /// A dangerous-looking method name gets an extra warning in the confirm modal.
@@ -97,6 +98,15 @@ fn risk_color(risk: Risk) -> Color32 {
 enum CentralView {
     Instances,
     Schema,
+}
+
+/// Connection status shown in the top bar.
+#[derive(Clone, PartialEq, Eq)]
+enum ConnStatus {
+    Local,
+    Connecting,
+    Remote(String),
+    Failed(String),
 }
 
 /// Target language for the script generator.
@@ -253,6 +263,9 @@ pub struct VmiScopeApp {
     active_tab: Tab,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
     class_cache: HashMap<String, Vec<String>>,
+    // --- connection ---
+    conn_host: String,
+    conn_status: ConnStatus,
 
     // --- network tab ---
     net_conns: HashMap<String, TrackedConn>,
@@ -339,6 +352,8 @@ impl VmiScopeApp {
             pending: HashMap::new(),
             active_tab: Tab::Explorer,
             class_cache: HashMap::new(),
+            conn_host: String::new(),
+            conn_status: ConnStatus::Local,
             net_conns: HashMap::new(),
             net_last_refresh: 0.0,
             net_inflight: false,
@@ -491,6 +506,38 @@ impl VmiScopeApp {
             namespace: self.active_ns.clone(),
             include_methods,
         });
+    }
+
+    fn apply_host(&mut self, host: Option<String>) {
+        let id = self.alloc_id();
+        self.conn_status = ConnStatus::Connecting;
+        self.pending.insert(id, PendingKind::Connect);
+        self.worker.send(Request::SetHost { id, host });
+    }
+
+    /// Wipe host-scoped state and re-seed the tree/query for a new target.
+    fn reset_and_reseed(&mut self) {
+        self.ns_children.clear();
+        self.ns_expanded.clear();
+        self.ns_loading.clear();
+        self.class_cache.clear();
+        self.classes.clear();
+        self.classes_ns.clear();
+        self.selected_class = None;
+        self.result = None;
+        self.selected_row = None;
+        self.schema = None;
+        self.schema_class.clear();
+        self.search_index = None;
+        self.net_conns.clear();
+        self.providers = None;
+        self.events_report = None;
+        self.act_instances = None;
+        self.active_ns = DEFAULT_NAMESPACE.to_string();
+        self.ns_expanded.insert(ROOT_NAMESPACE.to_string());
+        self.request_namespaces(ROOT_NAMESPACE.to_string());
+        self.request_classes(DEFAULT_NAMESPACE.to_string());
+        self.run_query();
     }
 
     fn request_instances(&mut self, class: String) {
@@ -716,6 +763,14 @@ impl VmiScopeApp {
                     self.search_loading = false;
                     self.search_index = Some(index);
                 }
+                Response::HostConnected { id, host } => {
+                    self.pending.remove(&id);
+                    self.conn_status = match &host {
+                        Some(h) => ConnStatus::Remote(h.clone()),
+                        None => ConnStatus::Local,
+                    };
+                    self.reset_and_reseed();
+                }
                 Response::Error {
                     id,
                     context,
@@ -757,6 +812,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Search) => {
                             self.search_loading = false;
+                        }
+                        Some(PendingKind::Connect) => {
+                            self.conn_status = ConnStatus::Failed(message.clone());
                         }
                         None => {}
                     }
@@ -2161,6 +2219,49 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // UI: connection bar (remote host, current user / SSO)
+    // ------------------------------------------------------------------
+
+    fn ui_connection_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.conn_host)
+                    .hint_text("local (blank) or remote hostname / IP")
+                    .desired_width(200.0),
+            );
+            let go = ui.button("\u{1f50c} Connect").clicked()
+                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if go {
+                let h = self.conn_host.trim().trim_start_matches('\\').to_string();
+                self.apply_host(if h.is_empty() { None } else { Some(h) });
+            }
+            ui.separator();
+            match &self.conn_status {
+                ConnStatus::Local => {
+                    ui.weak("\u{25cf} local machine");
+                }
+                ConnStatus::Connecting => {
+                    ui.spinner();
+                    ui.weak("connecting\u{2026}");
+                }
+                ConnStatus::Remote(h) => {
+                    ui.colored_label(
+                        Color32::from_rgb(120, 210, 140),
+                        format!("\u{25cf} {h} (current user)"),
+                    );
+                }
+                ConnStatus::Failed(e) => {
+                    ui.colored_label(
+                        Color32::from_rgb(240, 120, 120),
+                        format!("\u{2716} {}", e.lines().next().unwrap_or("failed")),
+                    );
+                }
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // UI: status bar
     // ------------------------------------------------------------------
 
@@ -2225,6 +2326,8 @@ impl eframe::App for VmiScopeApp {
                 );
                 ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
             });
+            ui.separator();
+            self.ui_connection_bar(ui);
             ui.add_space(4.0);
         });
 

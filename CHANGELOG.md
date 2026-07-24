@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Persistence tab (WMI event-subscription hunter)**: enumerates
+  `root\subscription` — `__EventFilter`, all `__EventConsumer` subclasses, and
+  `__FilterToConsumerBinding` — correlates each binding to its trigger and
+  action, and scores it Low/Medium/High for how much it looks like fileless
+  persistence (MITRE ATT&CK T1546.003). Sortable, colour-coded, with the filter
+  query and action on hover.
 - **Explorer tab**: lazy namespace tree, class browser with live filtering,
   WQL editor (Ctrl+Enter), auto-generated `SELECT *` for a selected class,
   virtualized result grid, and a per-row detail panel.

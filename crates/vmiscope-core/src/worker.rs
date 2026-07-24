@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 
 use wmi::{Variant, WMIConnection};
 
+use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::value::{variant_to_string, variant_to_u32};
 
@@ -30,6 +31,8 @@ pub enum Request {
     },
     /// Take a snapshot of the live TCP/UDP connection table.
     NetworkSnapshot { id: u64 },
+    /// Enumerate permanent WMI event subscriptions (persistence hunt).
+    ListEventSubscriptions { id: u64 },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -64,6 +67,10 @@ pub enum Response {
     Network {
         id: u64,
         snapshot: NetworkSnapshot,
+    },
+    EventSubscriptions {
+        id: u64,
+        report: SubscriptionReport,
     },
     Error {
         id: u64,
@@ -180,6 +187,18 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: "Network snapshot".into(),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::ListEventSubscriptions { id } => {
+                let resp = match list_event_subscriptions() {
+                    Ok(report) => Response::EventSubscriptions { id, report },
+                    Err(e) => Response::Error {
+                        id,
+                        context: "Enumerate event subscriptions".into(),
                         message: e.to_string(),
                     },
                 };
@@ -339,4 +358,82 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
     }
 
     Ok(NetworkSnapshot { connections })
+}
+
+/// Enumerate permanent WMI event subscriptions in `root\subscription` and score
+/// each filter→consumer binding for how much it looks like persistence.
+fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
+    let conn = connect("root\\subscription")?;
+
+    // Filters: Name -> (query, language, event namespace).
+    let mut filters: HashMap<String, String> = HashMap::new();
+    if let Ok(rows) =
+        conn.raw_query::<HashMap<String, Variant>>("SELECT Name, Query FROM __EventFilter")
+    {
+        for r in rows {
+            let name = r.get("Name").map(variant_to_string).unwrap_or_default();
+            let query = r.get("Query").map(variant_to_string).unwrap_or_default();
+            filters.insert(name, query);
+        }
+    }
+
+    // Consumers keyed by Name -> (concrete class, best-effort action string).
+    // `__EventConsumer` is abstract; querying it returns every subclass
+    // instance. The concrete class is a system property, so we read it through
+    // the reflective wrapper rather than the (system-property-stripping) map.
+    let mut consumers: HashMap<String, (String, String)> = HashMap::new();
+    for item in conn.exec_query("SELECT * FROM __EventConsumer")? {
+        let Ok(obj) = item else { continue };
+        let class = obj.class().unwrap_or_default();
+        let get = |p: &str| {
+            obj.get_property(p)
+                .ok()
+                .map(|v| variant_to_string(&v))
+                .unwrap_or_default()
+        };
+        let name = get("Name");
+        // First non-empty of the code-bearing fields, across consumer types.
+        let action = [
+            "CommandLineTemplate",
+            "ExecutablePath",
+            "ScriptFileName",
+            "ScriptText",
+        ]
+        .into_iter()
+        .map(&get)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+        consumers.insert(name, (class, action));
+    }
+
+    // Bindings tie a filter to a consumer; flatten + score each.
+    let mut subscriptions = Vec::new();
+    if let Ok(rows) = conn.raw_query::<HashMap<String, Variant>>(
+        "SELECT Filter, Consumer FROM __FilterToConsumerBinding",
+    ) {
+        for r in rows {
+            let filter_name =
+                first_quoted(&r.get("Filter").map(variant_to_string).unwrap_or_default());
+            let consumer_name =
+                first_quoted(&r.get("Consumer").map(variant_to_string).unwrap_or_default());
+            let filter_query = filters.get(&filter_name).cloned().unwrap_or_default();
+            let (consumer_type, action) =
+                consumers.get(&consumer_name).cloned().unwrap_or_default();
+            let (risk, reasons) = assess(&consumer_type, &filter_query, &action);
+            subscriptions.push(Subscription {
+                filter_name,
+                filter_query,
+                consumer_type,
+                consumer_name,
+                action,
+                risk,
+                reasons,
+                bound: true,
+            });
+        }
+    }
+
+    // Sort most-suspicious first so the interesting rows lead.
+    subscriptions.sort_by(|a, b| b.risk.cmp(&a.risk));
+    Ok(SubscriptionReport { subscriptions })
 }

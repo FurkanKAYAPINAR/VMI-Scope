@@ -25,11 +25,12 @@ fn main() {
         wql: "SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem".into(),
     });
     worker.send(Request::NetworkSnapshot { id: id() });
+    worker.send(Request::ListEventSubscriptions { id: id() });
 
     // Give the worker time and drain replies.
     let mut received = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 4 && std::time::Instant::now() < deadline {
+    while received < 5 && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -85,6 +86,23 @@ fn main() {
                             c.state,
                             c.pid,
                             c.process
+                        );
+                    }
+                }
+                Response::EventSubscriptions { report, .. } => {
+                    println!(
+                        "\n== event subscriptions ({} bound) ==",
+                        report.subscriptions.len()
+                    );
+                    for s in &report.subscriptions {
+                        println!(
+                            "  [{}] {} -> {} ({})  action={:?}  why={:?}",
+                            s.risk.as_str(),
+                            s.filter_name,
+                            s.consumer_name,
+                            s.consumer_type,
+                            s.action,
+                            s.reasons
                         );
                     }
                 }

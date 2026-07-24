@@ -12,7 +12,10 @@ use eframe::egui;
 use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
-use vmiscope_core::{Connection, Protocol, QueryResult, Request, Response, WmiWorker};
+use vmiscope_core::{
+    Connection, Protocol, QueryResult, Request, Response, Risk, Subscription, SubscriptionReport,
+    WmiWorker,
+};
 
 const ROOT_NAMESPACE: &str = "root";
 const DEFAULT_NAMESPACE: &str = "root\\CIMV2";
@@ -23,11 +26,12 @@ const NET_REFRESH_SECS: f64 = 1.5;
 /// How long a closed connection lingers (fading) before it disappears.
 const NET_FADE_SECS: f64 = 6.0;
 
-/// The two top-level tools.
+/// The top-level tools.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Explorer,
     Network,
+    Persistence,
 }
 
 /// A connection tracked across snapshots so it can fade out after it closes.
@@ -45,6 +49,16 @@ enum PendingKind {
     Classes,
     Query,
     Network,
+    Events,
+}
+
+/// Colour for a subscription risk level.
+fn risk_color(risk: Risk) -> Color32 {
+    match risk {
+        Risk::High => Color32::from_rgb(240, 100, 100),
+        Risk::Medium => Color32::from_rgb(225, 185, 90),
+        Risk::Low => Color32::from_rgb(150, 165, 150),
+    }
 }
 
 /// Target language for the script generator.
@@ -123,6 +137,31 @@ fn net_col_value(c: &Connection, col: usize) -> String {
     }
 }
 
+/// The display/sort string for a persistence table column. Column 0 (risk) maps
+/// to a numeric severity so sorting orders by danger, not alphabetically.
+fn sub_col_value(s: &Subscription, col: usize) -> String {
+    match col {
+        0 => match s.risk {
+            Risk::High => "3",
+            Risk::Medium => "2",
+            Risk::Low => "1",
+        }
+        .to_string(),
+        1 => s.consumer_type.clone(),
+        2 => s.consumer_name.clone(),
+        3 => s.filter_name.clone(),
+        4 => {
+            if s.action.is_empty() {
+                s.filter_query.clone()
+            } else {
+                s.action.clone()
+            }
+        }
+        5 => s.reasons.join("; "),
+        _ => String::new(),
+    }
+}
+
 /// Compare two cells numerically when both parse as numbers, else case-insensitively.
 fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<f64>(), b.parse::<f64>()) {
@@ -172,6 +211,11 @@ pub struct VmiScopeApp {
     /// (column index, ascending). `None` = default (grouped by process).
     net_sort: Option<(usize, bool)>,
 
+    // --- persistence tab ---
+    events_report: Option<SubscriptionReport>,
+    events_loading: bool,
+    events_sort: Option<(usize, bool)>,
+
     // --- namespace tree ---
     /// namespace path -> its loaded child paths (absent = not loaded yet).
     ns_children: HashMap<String, Vec<String>>,
@@ -216,6 +260,9 @@ impl VmiScopeApp {
             net_filter: String::new(),
             net_paused: false,
             net_sort: None,
+            events_report: None,
+            events_loading: false,
+            events_sort: None,
             ns_children: HashMap::new(),
             ns_expanded: HashSet::new(),
             ns_loading: HashSet::new(),
@@ -281,6 +328,13 @@ impl VmiScopeApp {
         self.net_last_refresh = now;
         self.pending.insert(id, PendingKind::Network);
         self.worker.send(Request::NetworkSnapshot { id });
+    }
+
+    fn request_events(&mut self) {
+        let id = self.alloc_id();
+        self.events_loading = true;
+        self.pending.insert(id, PendingKind::Events);
+        self.worker.send(Request::ListEventSubscriptions { id });
     }
 
     fn run_query(&mut self) {
@@ -401,6 +455,11 @@ impl VmiScopeApp {
                     self.net_conns
                         .retain(|_, tc| tc.alive || (now - tc.last_seen) < NET_FADE_SECS);
                 }
+                Response::EventSubscriptions { id, report } => {
+                    self.pending.remove(&id);
+                    self.events_loading = false;
+                    self.events_report = Some(report);
+                }
                 Response::Error {
                     id,
                     context,
@@ -421,6 +480,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Network) => {
                             self.net_inflight = false;
+                        }
+                        Some(PendingKind::Events) => {
+                            self.events_loading = false;
                         }
                         None => {}
                     }
@@ -886,6 +948,139 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // UI: persistence (WMI event-subscription hunter)
+    // ------------------------------------------------------------------
+
+    fn ui_persistence(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("WMI event subscriptions");
+            if self.events_loading {
+                ui.spinner();
+            }
+            if ui.button("\u{21bb} Refresh").clicked() {
+                self.request_events();
+            }
+            ui.weak("root\\subscription — permanent subscriptions (persistence)");
+        });
+
+        if let Some(report) = self.events_report.as_ref() {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    risk_color(Risk::High),
+                    format!("\u{25cf} {} high", report.count(Risk::High)),
+                );
+                ui.colored_label(
+                    risk_color(Risk::Medium),
+                    format!("\u{25cf} {} medium", report.count(Risk::Medium)),
+                );
+                ui.colored_label(
+                    risk_color(Risk::Low),
+                    format!("\u{25cf} {} low", report.count(Risk::Low)),
+                );
+            });
+        }
+        ui.separator();
+
+        let sort = self.events_sort;
+        let mut header_clicked: Option<usize> = None;
+
+        if let Some(report) = self.events_report.as_ref() {
+            if report.subscriptions.is_empty() {
+                ui.weak("No permanent event subscriptions found.");
+            } else {
+                let mut order: Vec<usize> = (0..report.subscriptions.len()).collect();
+                if let Some((ci, asc)) = sort {
+                    order.sort_by(|&a, &b| {
+                        let o = smart_cmp(
+                            &sub_col_value(&report.subscriptions[a], ci),
+                            &sub_col_value(&report.subscriptions[b], ci),
+                        );
+                        if asc {
+                            o
+                        } else {
+                            o.reverse()
+                        }
+                    });
+                }
+
+                let headers = [
+                    "Risk",
+                    "Consumer type",
+                    "Consumer",
+                    "Filter",
+                    "Action / query",
+                    "Why",
+                ];
+                let widths = [64.0, 168.0, 150.0, 150.0, 260.0, 220.0];
+                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+
+                let mut table = TableBuilder::new(ui)
+                    .id_salt("events-table")
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .min_scrolled_height(0.0);
+                for w in widths {
+                    table =
+                        table.column(Column::initial(w).at_least(48.0).clip(true).resizable(true));
+                }
+                table
+                    .header(22.0, |mut header| {
+                        for (ci, h) in headers.iter().enumerate() {
+                            header.col(|ui| {
+                                if sortable_header(ui, h, ci, sort) {
+                                    header_clicked = Some(ci);
+                                }
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(row_h, order.len(), |mut row| {
+                            let s = &report.subscriptions[order[row.index()]];
+                            let color = risk_color(s.risk);
+                            row.col(|ui| {
+                                ui.label(
+                                    egui::RichText::new(s.risk.as_str()).color(color).strong(),
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(s.consumer_type.as_str());
+                            });
+                            row.col(|ui| {
+                                ui.label(s.consumer_name.as_str());
+                            });
+                            row.col(|ui| {
+                                ui.label(s.filter_name.as_str());
+                            });
+                            row.col(|ui| {
+                                let text = if s.action.is_empty() {
+                                    s.filter_query.as_str()
+                                } else {
+                                    s.action.as_str()
+                                };
+                                ui.label(text).on_hover_text(format!(
+                                    "filter query:\n{}\n\naction:\n{}",
+                                    s.filter_query, s.action
+                                ));
+                            });
+                            row.col(|ui| {
+                                let why = s.reasons.join("; ");
+                                ui.label(egui::RichText::new(why.as_str()).color(color))
+                                    .on_hover_text(why);
+                            });
+                        });
+                    });
+            }
+        } else if !self.events_loading {
+            ui.weak("Click Refresh to scan for WMI persistence.");
+        }
+
+        if let Some(ci) = header_clicked {
+            toggle_sort(&mut self.events_sort, ci);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // UI: status bar
     // ------------------------------------------------------------------
 
@@ -922,6 +1117,14 @@ impl eframe::App for VmiScopeApp {
             self.request_network(now);
         }
 
+        // Load the persistence scan the first time its tab is opened.
+        if self.active_tab == Tab::Persistence
+            && self.events_report.is_none()
+            && !self.events_loading
+        {
+            self.request_events();
+        }
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -929,6 +1132,11 @@ impl eframe::App for VmiScopeApp {
                 ui.separator();
                 ui.selectable_value(&mut self.active_tab, Tab::Explorer, "\u{1f5c2} Explorer");
                 ui.selectable_value(&mut self.active_tab, Tab::Network, "\u{1f5a7} Network");
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    Tab::Persistence,
+                    "\u{1f6e1} Persistence",
+                );
             });
             ui.add_space(4.0);
         });
@@ -966,6 +1174,11 @@ impl eframe::App for VmiScopeApp {
             Tab::Network => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.ui_network(ui, now);
+                });
+            }
+            Tab::Persistence => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_persistence(ui);
                 });
             }
         }

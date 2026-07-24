@@ -5,9 +5,11 @@
 //!  - [`worker`]: a background thread that owns the COM apartment and answers
 //!    [`Request`]s with [`Response`]s over channels, so the UI never blocks.
 
+pub mod events;
 pub mod network;
 pub mod value;
 pub mod worker;
 
+pub use events::{Risk, Subscription, SubscriptionReport};
 pub use network::{Connection, NetworkSnapshot, Protocol};
 pub use worker::{QueryResult, Request, Response, WmiWorker};

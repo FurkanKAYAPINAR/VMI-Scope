@@ -13,9 +13,9 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    param_kind, ClassSchema, Connection, MethodArg, MethodOutcome, MethodTarget, ParamKind,
-    Protocol, ProviderInfo, QueryResult, Request, Response, Risk, SearchHit, SearchIndex,
-    Subscription, SubscriptionReport, WmiWorker,
+    diff_subscriptions, param_kind, ClassSchema, Connection, MethodArg, MethodOutcome,
+    MethodTarget, ParamKind, Protocol, ProviderInfo, QueryResult, Request, Response, Risk,
+    SearchHit, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -290,6 +290,8 @@ pub struct VmiScopeApp {
     events_report: Option<SubscriptionReport>,
     events_loading: bool,
     events_sort: Option<(usize, bool)>,
+    /// Loaded baseline snapshot for diffing (subscriptions from a saved file).
+    events_baseline: Option<Vec<Subscription>>,
 
     // --- providers tab ---
     providers: Option<Vec<ProviderInfo>>,
@@ -373,6 +375,7 @@ impl VmiScopeApp {
             events_report: None,
             events_loading: false,
             events_sort: None,
+            events_baseline: None,
             providers: None,
             providers_loading: false,
             providers_sort: None,
@@ -1874,7 +1877,25 @@ impl VmiScopeApp {
     // UI: persistence (WMI event-subscription hunter)
     // ------------------------------------------------------------------
 
+    fn load_baseline_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| {
+                    vmiscope_core::export::subscriptions_from_json(&t).map_err(|e| e.to_string())
+                }) {
+                Ok(subs) => self.events_baseline = Some(subs),
+                Err(e) => self.error = Some(format!("Load baseline: {e}")),
+            }
+        }
+    }
+
     fn ui_persistence(&mut self, ui: &mut egui::Ui) {
+        let mut load_baseline = false;
+        let mut clear_baseline = false;
         ui.horizontal(|ui| {
             ui.strong("WMI event subscriptions");
             if self.events_loading {
@@ -1897,10 +1918,42 @@ impl VmiScopeApp {
                             &vmiscope_core::export::subscriptions_to_json(report),
                         );
                     }
+                    if ui.button("\u{2b73} HTML").clicked() {
+                        save_file(
+                            "wmi_persistence.html",
+                            &vmiscope_core::export::subscriptions_to_html(report),
+                        );
+                    }
+                    ui.separator();
+                    if ui
+                        .button("\u{1f4be} Snapshot")
+                        .on_hover_text("Save a baseline")
+                        .clicked()
+                    {
+                        save_file(
+                            "wmi_persistence_snapshot.json",
+                            &vmiscope_core::export::subscriptions_to_json(report),
+                        );
+                    }
                 }
             }
-            ui.weak("root\\subscription \u{2014} persistence");
+            if ui
+                .button("\u{1f4c2} Baseline")
+                .on_hover_text("Load a snapshot to diff against")
+                .clicked()
+            {
+                load_baseline = true;
+            }
+            if self.events_baseline.is_some() && ui.button("\u{2716} clear").clicked() {
+                clear_baseline = true;
+            }
         });
+        if load_baseline {
+            self.load_baseline_dialog();
+        }
+        if clear_baseline {
+            self.events_baseline = None;
+        }
 
         if let Some(report) = self.events_report.as_ref() {
             ui.horizontal(|ui| {
@@ -1917,6 +1970,54 @@ impl VmiScopeApp {
                     format!("\u{25cf} {} low", report.count(Risk::Low)),
                 );
             });
+        }
+
+        // Diff against a loaded baseline (snapshot hunting).
+        if let (Some(base), Some(report)) =
+            (self.events_baseline.as_ref(), self.events_report.as_ref())
+        {
+            let d = diff_subscriptions(base, &report.subscriptions);
+            ui.horizontal(|ui| {
+                ui.strong("vs baseline:");
+                ui.colored_label(
+                    Color32::from_rgb(240, 100, 100),
+                    format!("+{} new", d.added.len()),
+                );
+                ui.colored_label(
+                    Color32::from_rgb(225, 185, 90),
+                    format!("~{} changed", d.changed.len()),
+                );
+                ui.weak(format!("-{} removed", d.removed.len()));
+                ui.weak(format!("\u{00b7} {} unchanged", d.unchanged));
+            });
+            if !d.is_empty() {
+                egui::CollapsingHeader::new("Diff details")
+                    .id_salt("persist-diff")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let sections = [
+                            ("New", &d.added, Color32::from_rgb(240, 100, 100)),
+                            ("Changed", &d.changed, Color32::from_rgb(225, 185, 90)),
+                            (
+                                "Removed (was in baseline)",
+                                &d.removed,
+                                Color32::from_gray(150),
+                            ),
+                        ];
+                        for (title, list, color) in sections {
+                            if list.is_empty() {
+                                continue;
+                            }
+                            ui.colored_label(color, format!("{title} ({})", list.len()));
+                            for s in list {
+                                ui.label(format!(
+                                    "    {} \u{2192} {} ({})   {}",
+                                    s.filter_name, s.consumer_name, s.consumer_type, s.action
+                                ));
+                            }
+                        }
+                    });
+            }
         }
         ui.separator();
 

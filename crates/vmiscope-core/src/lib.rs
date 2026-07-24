@@ -5,6 +5,7 @@
 //!  - [`worker`]: a background thread that owns the COM apartment and answers
 //!    [`Request`]s with [`Response`]s over channels, so the UI never blocks.
 
+pub mod diff;
 pub mod events;
 pub mod export;
 pub mod method;
@@ -15,6 +16,7 @@ pub mod schema;
 pub mod value;
 pub mod worker;
 
+pub use diff::{diff_subscriptions, SubscriptionDiff};
 pub use events::{Risk, Subscription, SubscriptionReport};
 pub use method::{param_kind, MethodArg, MethodOutcome, MethodTarget, ParamKind};
 pub use network::{Connection, NetworkSnapshot, Protocol};

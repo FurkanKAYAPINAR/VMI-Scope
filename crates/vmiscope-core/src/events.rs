@@ -8,10 +8,10 @@
 //! runs code on a system event is one of the most common *fileless*
 //! persistence techniques (MITRE ATT&CK T1546.003).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How suspicious a subscription looks, from a defender's point of view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Risk {
     Low,
     Medium,
@@ -29,7 +29,7 @@ impl Risk {
 }
 
 /// A filter→consumer binding, flattened with its trigger and action and scored.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub filter_name: String,
     pub filter_query: String,
@@ -44,7 +44,7 @@ pub struct Subscription {
 }
 
 /// The whole `root\subscription` picture.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionReport {
     pub subscriptions: Vec<Subscription>,
 }

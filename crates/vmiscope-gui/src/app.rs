@@ -13,8 +13,9 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    ClassSchema, Connection, Protocol, ProviderInfo, QueryResult, Request, Response, Risk,
-    Subscription, SubscriptionReport, WmiWorker,
+    param_kind, ClassSchema, Connection, MethodArg, MethodOutcome, MethodTarget, ParamKind,
+    Protocol, ProviderInfo, QueryResult, Request, Response, Risk, Subscription, SubscriptionReport,
+    WmiWorker,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -54,6 +55,31 @@ enum PendingKind {
     Providers,
     Schema,
     Mof,
+    Instances,
+    Invoke,
+}
+
+/// A dangerous-looking method name gets an extra warning in the confirm modal.
+fn is_dangerous_method(method: &str) -> bool {
+    let m = method.to_lowercase();
+    [
+        "create",
+        "delete",
+        "terminate",
+        "reboot",
+        "shutdown",
+        "format",
+        "change",
+        "rename",
+        "uninstall",
+        "setpowerstate",
+        "stopservice",
+        "kill",
+        "write",
+        "set",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
 }
 
 /// Colour for a subscription risk level.
@@ -274,6 +300,17 @@ pub struct VmiScopeApp {
     mof_object_path: String,
     mof_text: Option<String>,
     mof_loading: bool,
+    // --- Actions (method execution) panel ---
+    actions_open: bool,
+    act_method: Option<String>,
+    act_args: HashMap<String, String>,
+    act_bools: HashMap<String, bool>,
+    act_target: String,
+    act_instances: Option<Vec<MethodTarget>>,
+    act_instances_loading: bool,
+    act_invoking: bool,
+    act_outcome: Option<(String, MethodOutcome)>,
+    confirm_open: bool,
     latest_query_id: u64,
     query_loading: bool,
     result: Option<QueryResult>,
@@ -329,6 +366,16 @@ impl VmiScopeApp {
             mof_object_path: String::new(),
             mof_text: None,
             mof_loading: false,
+            actions_open: false,
+            act_method: None,
+            act_args: HashMap::new(),
+            act_bools: HashMap::new(),
+            act_target: String::new(),
+            act_instances: None,
+            act_instances_loading: false,
+            act_invoking: false,
+            act_outcome: None,
+            confirm_open: false,
             latest_query_id: 0,
             query_loading: false,
             result: None,
@@ -422,6 +469,40 @@ impl VmiScopeApp {
             id,
             namespace: self.active_ns.clone(),
             class,
+        });
+    }
+
+    fn request_instances(&mut self, class: String) {
+        let id = self.alloc_id();
+        self.act_instances_loading = true;
+        self.pending.insert(id, PendingKind::Instances);
+        self.worker.send(Request::ListInstances {
+            id,
+            namespace: self.active_ns.clone(),
+            class,
+        });
+    }
+
+    fn request_invoke(
+        &mut self,
+        class: String,
+        object_path: String,
+        method: String,
+        is_static: bool,
+        args: Vec<MethodArg>,
+    ) {
+        let id = self.alloc_id();
+        self.act_invoking = true;
+        self.act_outcome = None;
+        self.pending.insert(id, PendingKind::Invoke);
+        self.worker.send(Request::InvokeMethod {
+            id,
+            namespace: self.active_ns.clone(),
+            class,
+            object_path,
+            method,
+            is_static,
+            args,
         });
     }
 
@@ -594,6 +675,21 @@ impl VmiScopeApp {
                         self.mof_loading = false;
                     }
                 }
+                Response::Instances { id, targets, .. } => {
+                    self.pending.remove(&id);
+                    self.act_instances_loading = false;
+                    self.act_instances = Some(targets);
+                }
+                Response::MethodDone {
+                    id,
+                    method,
+                    outcome,
+                    ..
+                } => {
+                    self.pending.remove(&id);
+                    self.act_invoking = false;
+                    self.act_outcome = Some((method, outcome));
+                }
                 Response::Error {
                     id,
                     context,
@@ -626,6 +722,12 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Mof) => {
                             self.mof_loading = false;
+                        }
+                        Some(PendingKind::Instances) => {
+                            self.act_instances_loading = false;
+                        }
+                        Some(PendingKind::Invoke) => {
+                            self.act_invoking = false;
                         }
                         None => {}
                     }
@@ -753,6 +855,7 @@ impl VmiScopeApp {
         // View switch for the selected class.
         let prev_view = self.central_view;
         let mut mof_click: Option<String> = None;
+        let mut open_actions_for: Option<String> = None;
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.central_view,
@@ -772,12 +875,29 @@ impl VmiScopeApp {
                     .on_hover_text("Show MOF text")
                     .clicked()
                 {
-                    mof_click = Some(c);
+                    mof_click = Some(c.clone());
+                }
+                let was_open = self.actions_open;
+                if ui
+                    .selectable_label(self.actions_open, "\u{2699} Actions")
+                    .on_hover_text("Invoke methods (mutating)")
+                    .clicked()
+                {
+                    self.actions_open = !self.actions_open;
+                }
+                if self.actions_open && !was_open {
+                    open_actions_for = Some(c);
                 }
             }
         });
         if let Some(c) = mof_click {
             self.request_mof(c.clone(), c);
+        }
+        if let Some(c) = open_actions_for {
+            self.act_method = None;
+            self.act_outcome = None;
+            self.act_instances = None;
+            self.request_schema(c);
         }
         // Fetch schema the moment the user flips to the Schema view.
         if self.central_view == CentralView::Schema && prev_view != CentralView::Schema {
@@ -1105,6 +1225,331 @@ impl VmiScopeApp {
                 }
             });
         self.mof_open = open;
+    }
+
+    // ------------------------------------------------------------------
+    // UI: Actions (method execution)
+    // ------------------------------------------------------------------
+
+    fn ui_actions(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("\u{2699} Actions");
+            if self.act_invoking {
+                ui.spinner();
+            }
+        });
+        ui.weak("invoke WMI methods \u{2014} may change system state");
+        ui.separator();
+
+        let Some(class) = self.selected_class.clone() else {
+            ui.weak("Select a class first.");
+            return;
+        };
+
+        // Method signatures come from the reflected schema.
+        if self.schema_class != class || self.schema.is_none() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("loading class methods\u{2026}");
+            });
+            return;
+        }
+
+        // Owned method metadata so the schema borrow is released for the widgets.
+        struct MInfo {
+            name: String,
+            is_static: bool,
+            inputs: Vec<(String, String)>,
+        }
+        let methods: Vec<MInfo> = self
+            .schema
+            .as_ref()
+            .unwrap()
+            .methods
+            .iter()
+            .map(|m| MInfo {
+                name: m.name.clone(),
+                is_static: m.is_static,
+                inputs: m
+                    .in_params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.cim_type.clone()))
+                    .collect(),
+            })
+            .collect();
+        if methods.is_empty() {
+            ui.weak("This class has no methods.");
+            return;
+        }
+
+        // Method picker.
+        let current = self.act_method.clone().unwrap_or_default();
+        egui::ComboBox::from_id_salt("act-method")
+            .width(f32::INFINITY)
+            .selected_text(if current.is_empty() {
+                "\u{2014} pick a method \u{2014}".to_string()
+            } else {
+                current.clone()
+            })
+            .show_ui(ui, |ui| {
+                for m in &methods {
+                    let tag = if m.is_static { "  [static]" } else { "" };
+                    if ui
+                        .selectable_label(
+                            self.act_method.as_deref() == Some(m.name.as_str()),
+                            format!("{}{tag}", m.name),
+                        )
+                        .clicked()
+                    {
+                        self.act_method = Some(m.name.clone());
+                        self.act_args.clear();
+                        self.act_bools.clear();
+                        self.act_outcome = None;
+                    }
+                }
+            });
+
+        let Some(mname) = self.act_method.clone() else {
+            return;
+        };
+        let Some(minfo) = methods.iter().find(|m| m.name == mname) else {
+            return;
+        };
+        ui.separator();
+
+        // Target (non-static methods need an instance).
+        if minfo.is_static {
+            ui.weak("target: static (class-level)");
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("target:");
+                if ui.button("Load instances").clicked() {
+                    self.request_instances(class.clone());
+                }
+                if self.act_instances_loading {
+                    ui.spinner();
+                }
+            });
+            if let Some(insts) = self.act_instances.clone() {
+                let sel = self.act_target.clone();
+                let text = if sel.is_empty() {
+                    "\u{2014} pick instance \u{2014}".to_string()
+                } else {
+                    insts
+                        .iter()
+                        .find(|t| t.path == sel)
+                        .map(|t| t.label.clone())
+                        .unwrap_or(sel)
+                };
+                egui::ComboBox::from_id_salt("act-target")
+                    .width(f32::INFINITY)
+                    .selected_text(text)
+                    .show_ui(ui, |ui| {
+                        for t in &insts {
+                            if ui
+                                .selectable_label(self.act_target == t.path, &t.label)
+                                .clicked()
+                            {
+                                self.act_target = t.path.clone();
+                            }
+                        }
+                    });
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.act_target)
+                    .hint_text("or paste an object path")
+                    .desired_width(f32::INFINITY),
+            );
+        }
+
+        // Inputs.
+        if !minfo.inputs.is_empty() {
+            ui.separator();
+            ui.weak("inputs:");
+        }
+        for (pname, ctype) in &minfo.inputs {
+            let kind = param_kind(ctype);
+            match kind {
+                ParamKind::Bool => {
+                    let b = self.act_bools.entry(pname.clone()).or_insert(false);
+                    ui.checkbox(b, format!("{pname}  ({ctype})"));
+                }
+                ParamKind::Other => {
+                    ui.weak(format!("{pname} ({ctype}) \u{2014} unsupported"));
+                }
+                _ => {
+                    ui.label(format!("{pname}  ({ctype})"));
+                    let v = self.act_args.entry(pname.clone()).or_default();
+                    ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY));
+                }
+            }
+        }
+
+        ui.separator();
+        let can_invoke =
+            !self.act_invoking && (minfo.is_static || !self.act_target.trim().is_empty());
+        ui.add_enabled_ui(can_invoke, |ui| {
+            let btn = egui::Button::new(
+                egui::RichText::new(format!("\u{26a0} Invoke {class}.{mname}"))
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(150, 60, 60));
+            if ui.add(btn).clicked() {
+                self.confirm_open = true;
+            }
+        });
+
+        // Result.
+        if let Some((m, outcome)) = self.act_outcome.clone() {
+            ui.separator();
+            ui.strong(format!("Result of {m}"));
+            if let Some(rv) = &outcome.return_value {
+                let color = if rv == "0" {
+                    Color32::from_rgb(120, 210, 140)
+                } else {
+                    Color32::from_rgb(230, 180, 90)
+                };
+                ui.colored_label(color, format!("ReturnValue = {rv}"));
+            }
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("act-out")
+                        .num_columns(2)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (k, v) in &outcome.outputs {
+                                ui.strong(k);
+                                let short: String = v.chars().take(200).collect();
+                                ui.label(short);
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+    }
+
+    fn ui_confirm_window(&mut self, ctx: &egui::Context) {
+        if !self.confirm_open {
+            return;
+        }
+        let class = self.selected_class.clone().unwrap_or_default();
+        let method = self.act_method.clone().unwrap_or_default();
+        if class.is_empty() || method.is_empty() {
+            self.confirm_open = false;
+            return;
+        }
+
+        // Reconstruct the argument list from the current inputs + schema signature.
+        let (is_static, inputs): (bool, Vec<(String, String)>) = self
+            .schema
+            .as_ref()
+            .and_then(|s| s.methods.iter().find(|m| m.name == method))
+            .map(|m| {
+                (
+                    m.is_static,
+                    m.in_params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.cim_type.clone()))
+                        .collect(),
+                )
+            })
+            .unwrap_or((true, Vec::new()));
+        let target = self.act_target.clone();
+        let ns = self.active_ns.clone();
+        let mut args: Vec<MethodArg> = Vec::new();
+        for (pname, ctype) in &inputs {
+            let kind = param_kind(ctype);
+            let value = match kind {
+                ParamKind::Bool => self
+                    .act_bools
+                    .get(pname)
+                    .copied()
+                    .unwrap_or(false)
+                    .to_string(),
+                _ => self.act_args.get(pname).cloned().unwrap_or_default(),
+            };
+            args.push(MethodArg {
+                name: pname.clone(),
+                kind,
+                value,
+            });
+        }
+
+        let mut open = true;
+        let mut do_invoke = false;
+        let mut cancel = false;
+        egui::Window::new("Confirm invocation")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.colored_label(
+                    Color32::from_rgb(240, 120, 120),
+                    "\u{26a0} This invokes a WMI method and may change system state.",
+                );
+                if is_dangerous_method(&method) {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 80, 80),
+                        format!("\u{201c}{method}\u{201d} looks destructive \u{2014} double-check the target."),
+                    );
+                }
+                ui.separator();
+                egui::Grid::new("confirm-grid").num_columns(2).show(ui, |ui| {
+                    ui.strong("Namespace");
+                    ui.label(&ns);
+                    ui.end_row();
+                    ui.strong("Class");
+                    ui.label(&class);
+                    ui.end_row();
+                    ui.strong("Method");
+                    ui.label(&method);
+                    ui.end_row();
+                    ui.strong("Target");
+                    ui.label(if is_static {
+                        "(static)"
+                    } else if target.is_empty() {
+                        "(none)"
+                    } else {
+                        target.as_str()
+                    });
+                    ui.end_row();
+                });
+                if !args.is_empty() {
+                    ui.separator();
+                    ui.strong("Arguments");
+                    for a in &args {
+                        let shown = if a.value.trim().is_empty() {
+                            "(provider default)".to_string()
+                        } else {
+                            a.value.clone()
+                        };
+                        ui.label(format!("  {} = {shown}", a.name));
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    let go = egui::Button::new(
+                        egui::RichText::new("Yes, invoke").color(Color32::WHITE),
+                    )
+                    .fill(Color32::from_rgb(150, 60, 60));
+                    if ui.add(go).clicked() {
+                        do_invoke = true;
+                    }
+                });
+            });
+
+        if cancel || !open {
+            self.confirm_open = false;
+        }
+        if do_invoke {
+            self.confirm_open = false;
+            self.request_invoke(class, target, method, is_static, args);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1630,6 +2075,16 @@ impl eframe::App for VmiScopeApp {
                         self.ui_class_list(ui);
                     });
 
+                if self.actions_open {
+                    egui::Panel::right("actions")
+                        .resizable(true)
+                        .default_size(360.0)
+                        .size_range(egui::Rangef::new(260.0, 620.0))
+                        .show(ui, |ui| {
+                            self.ui_actions(ui);
+                        });
+                }
+
                 if self.selected_row.is_some() {
                     egui::Panel::right("detail")
                         .resizable(true)
@@ -1661,8 +2116,9 @@ impl eframe::App for VmiScopeApp {
             }
         }
 
-        // MOF viewer floats above whatever tab is active.
+        // MOF viewer and the method-invocation confirmation float above the tabs.
         self.ui_mof_window(ui.ctx());
+        self.ui_confirm_window(ui.ctx());
 
         // Repaint while work is in flight, and continuously on the live tab.
         if !self.pending.is_empty() {

@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use wmi::{Variant, WMIConnection};
 
 use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
+use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
 use crate::schema::ClassSchema;
@@ -48,6 +49,22 @@ pub enum Request {
         id: u64,
         namespace: String,
         object_path: String,
+    },
+    /// List instances of a class as method-invocation targets.
+    ListInstances {
+        id: u64,
+        namespace: String,
+        class: String,
+    },
+    /// Invoke a WMI method (mutating; gated by the GUI).
+    InvokeMethod {
+        id: u64,
+        namespace: String,
+        class: String,
+        object_path: String,
+        method: String,
+        is_static: bool,
+        args: Vec<MethodArg>,
     },
     /// Stop the worker thread.
     Shutdown,
@@ -102,6 +119,17 @@ pub enum Response {
         id: u64,
         object_path: String,
         mof: String,
+    },
+    Instances {
+        id: u64,
+        class: String,
+        targets: Vec<MethodTarget>,
+    },
+    MethodDone {
+        id: u64,
+        class: String,
+        method: String,
+        outcome: MethodOutcome,
     },
     Error {
         id: u64,
@@ -287,6 +315,58 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: format!("MOF of {object_path}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::ListInstances {
+                id,
+                namespace,
+                class,
+            } => {
+                let resp = match connect(&namespace)
+                    .and_then(|c| crate::method::list_instances(&c, &class))
+                {
+                    Ok(targets) => Response::Instances { id, class, targets },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("List instances of {class}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::InvokeMethod {
+                id,
+                namespace,
+                class,
+                object_path,
+                method,
+                is_static,
+                args,
+            } => {
+                let resp = match connect(&namespace).and_then(|c| {
+                    crate::method::invoke_method(
+                        &c,
+                        &class,
+                        &object_path,
+                        &method,
+                        is_static,
+                        &args,
+                    )
+                }) {
+                    Ok(outcome) => Response::MethodDone {
+                        id,
+                        class,
+                        method,
+                        outcome,
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("Invoke {class}.{method}"),
                         message: e.to_string(),
                     },
                 };

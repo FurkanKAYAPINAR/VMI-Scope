@@ -36,11 +36,37 @@ fn main() {
         namespace: "root\\cimv2".into(),
         object_path: "Win32_Process".into(),
     });
+    worker.send(Request::ListInstances {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        class: "Win32_Service".into(),
+    });
+    // Read-only method: enumerate HKLM\SOFTWARE subkeys via StdRegProv.
+    worker.send(Request::InvokeMethod {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        class: "StdRegProv".into(),
+        object_path: String::new(),
+        method: "EnumKey".into(),
+        is_static: true,
+        args: vec![
+            vmiscope_core::MethodArg {
+                name: "hDefKey".into(),
+                kind: vmiscope_core::ParamKind::Uint,
+                value: "2147483650".into(),
+            },
+            vmiscope_core::MethodArg {
+                name: "sSubKeyName".into(),
+                kind: vmiscope_core::ParamKind::Str,
+                value: "SOFTWARE".into(),
+            },
+        ],
+    });
 
     // Give the worker time and drain replies.
     let mut received = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 7 && std::time::Instant::now() < deadline {
+    while received < 9 && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -151,6 +177,27 @@ fn main() {
                     println!("\n== MOF: {object_path} ({} chars) ==", mof.len());
                     for line in mof.lines().take(6) {
                         println!("  {line}");
+                    }
+                }
+                Response::Instances { class, targets, .. } => {
+                    println!("\n== instances of {class} ({}) ==", targets.len());
+                    for t in targets.iter().take(4) {
+                        println!("  {} -> {}", t.label, t.path);
+                    }
+                }
+                Response::MethodDone {
+                    class,
+                    method,
+                    outcome,
+                    ..
+                } => {
+                    println!(
+                        "\n== invoke {class}.{method} -> ReturnValue={:?} ==",
+                        outcome.return_value
+                    );
+                    for (k, v) in outcome.outputs.iter().take(3) {
+                        let short: String = v.chars().take(80).collect();
+                        println!("  {k} = {short}");
                     }
                 }
                 Response::Error {

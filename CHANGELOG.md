@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Method execution** (Explorer → ⚙ Actions): invoke any WMI method with a
+  dynamic, type-aware parameter form. Static methods (e.g. `Win32_Process.Create`)
+  and instance methods (pick a target from a loaded instance list) are both
+  supported. **Every invocation is gated behind an explicit confirmation modal**
+  that restates the target and arguments, with an extra warning for
+  destructive-looking method names. Introspection reflects the raw
+  `IWbemClassObject`; execution uses the `wmi` crate's `exec_method`.
 - **MOF viewer** — a `📄 MOF` button shows the MOF (Managed Object Format) text
   of the selected class/instance in a floating, copyable window
   (`IWbemClassObject::GetObjectText`).

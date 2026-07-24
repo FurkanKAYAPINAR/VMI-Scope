@@ -6,6 +6,7 @@
 //!    [`Request`]s with [`Response`]s over channels, so the UI never blocks.
 
 pub mod events;
+pub mod method;
 pub mod network;
 pub mod providers;
 pub mod reflect;
@@ -14,6 +15,7 @@ pub mod value;
 pub mod worker;
 
 pub use events::{Risk, Subscription, SubscriptionReport};
+pub use method::{param_kind, MethodArg, MethodOutcome, MethodTarget, ParamKind};
 pub use network::{Connection, NetworkSnapshot, Protocol};
 pub use providers::ProviderInfo;
 pub use schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema};

@@ -13,8 +13,8 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    Connection, Protocol, ProviderInfo, QueryResult, Request, Response, Risk, Subscription,
-    SubscriptionReport, WmiWorker,
+    ClassSchema, Connection, Protocol, ProviderInfo, QueryResult, Request, Response, Risk,
+    Subscription, SubscriptionReport, WmiWorker,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -52,6 +52,7 @@ enum PendingKind {
     Network,
     Events,
     Providers,
+    Schema,
 }
 
 /// Colour for a subscription risk level.
@@ -61,6 +62,13 @@ fn risk_color(risk: Risk) -> Color32 {
         Risk::Medium => Color32::from_rgb(225, 185, 90),
         Risk::Low => Color32::from_rgb(150, 165, 150),
     }
+}
+
+/// Which view the Explorer central panel shows for the selected class.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CentralView {
+    Instances,
+    Schema,
 }
 
 /// Target language for the script generator.
@@ -254,6 +262,11 @@ pub struct VmiScopeApp {
     // --- query + results ---
     query_text: String,
     script_lang: ScriptLang,
+    central_view: CentralView,
+    schema: Option<ClassSchema>,
+    schema_class: String,
+    schema_loading: bool,
+    schema_filter: String,
     latest_query_id: u64,
     query_loading: bool,
     result: Option<QueryResult>,
@@ -299,6 +312,11 @@ impl VmiScopeApp {
             selected_class: None,
             query_text: DEFAULT_QUERY.to_string(),
             script_lang: ScriptLang::PowerShell,
+            central_view: CentralView::Instances,
+            schema: None,
+            schema_class: String::new(),
+            schema_loading: false,
+            schema_filter: String::new(),
             latest_query_id: 0,
             query_loading: false,
             result: None,
@@ -375,6 +393,26 @@ impl VmiScopeApp {
         self.worker.send(Request::ListProviders { id });
     }
 
+    fn request_schema(&mut self, class: String) {
+        if class.is_empty() {
+            return;
+        }
+        // Already have (or are fetching) this class's schema.
+        if self.schema_class == class && (self.schema.is_some() || self.schema_loading) {
+            return;
+        }
+        let id = self.alloc_id();
+        self.schema_class = class.clone();
+        self.schema = None;
+        self.schema_loading = true;
+        self.pending.insert(id, PendingKind::Schema);
+        self.worker.send(Request::ClassSchema {
+            id,
+            namespace: self.active_ns.clone(),
+            class,
+        });
+    }
+
     fn run_query(&mut self) {
         let wql = self.query_text.trim().to_string();
         if wql.is_empty() {
@@ -402,6 +440,8 @@ impl VmiScopeApp {
         }
         self.active_ns = namespace.clone();
         self.selected_class = None;
+        self.schema = None;
+        self.schema_class.clear();
         self.request_classes(namespace);
     }
 
@@ -416,8 +456,11 @@ impl VmiScopeApp {
 
     fn select_class(&mut self, class: String) {
         self.query_text = format!("SELECT * FROM {class}");
-        self.selected_class = Some(class);
+        self.selected_class = Some(class.clone());
         self.run_query();
+        if self.central_view == CentralView::Schema {
+            self.request_schema(class);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -504,6 +547,15 @@ impl VmiScopeApp {
                     self.providers_loading = false;
                     self.providers = Some(providers);
                 }
+                Response::Schema {
+                    id, class, schema, ..
+                } => {
+                    self.pending.remove(&id);
+                    if class == self.schema_class {
+                        self.schema = Some(schema);
+                        self.schema_loading = false;
+                    }
+                }
                 Response::Error {
                     id,
                     context,
@@ -530,6 +582,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Providers) => {
                             self.providers_loading = false;
+                        }
+                        Some(PendingKind::Schema) => {
+                            self.schema_loading = false;
                         }
                         None => {}
                     }
@@ -654,6 +709,37 @@ impl VmiScopeApp {
     // ------------------------------------------------------------------
 
     fn ui_central(&mut self, ui: &mut egui::Ui) {
+        // View switch for the selected class.
+        let prev_view = self.central_view;
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.central_view,
+                CentralView::Instances,
+                "\u{1f4c4} Instances",
+            );
+            ui.selectable_value(
+                &mut self.central_view,
+                CentralView::Schema,
+                "\u{1f9ec} Schema",
+            );
+            if let Some(c) = &self.selected_class {
+                ui.separator();
+                ui.weak(c);
+            }
+        });
+        // Fetch schema the moment the user flips to the Schema view.
+        if self.central_view == CentralView::Schema && prev_view != CentralView::Schema {
+            if let Some(c) = self.selected_class.clone() {
+                self.request_schema(c);
+            }
+        }
+        ui.separator();
+
+        if self.central_view == CentralView::Schema {
+            self.ui_schema(ui);
+            return;
+        }
+
         // Query bar.
         ui.horizontal(|ui| {
             ui.strong("WQL");
@@ -788,6 +874,149 @@ impl VmiScopeApp {
                     );
                 });
         });
+    }
+
+    // ------------------------------------------------------------------
+    // UI: reflective class schema
+    // ------------------------------------------------------------------
+
+    fn ui_schema(&mut self, ui: &mut egui::Ui) {
+        if self.selected_class.is_none() {
+            ui.weak("Select a class to view its schema.");
+            return;
+        }
+        if self.schema.is_none() {
+            if self.schema_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("reflecting schema\u{2026}");
+                });
+            } else {
+                ui.weak("No schema available for this class.");
+            }
+            return;
+        }
+
+        // Header (scoped immutable borrow so the filter box can borrow mutably next).
+        {
+            let s = self.schema.as_ref().unwrap();
+            ui.horizontal(|ui| {
+                ui.heading(s.class.as_str());
+                if s.is_abstract {
+                    ui.weak("[abstract]");
+                }
+                if let Some(sup) = &s.super_class {
+                    ui.weak(format!(": {sup}"));
+                }
+                ui.weak(format!(
+                    "\u{00b7} {} props \u{00b7} {} methods",
+                    s.properties.len(),
+                    s.methods.len()
+                ));
+            });
+            if let Some(d) = &s.description {
+                ui.label(d);
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label("\u{1f50d}");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.schema_filter)
+                    .hint_text("filter properties / methods")
+                    .desired_width(240.0),
+            );
+        });
+        ui.separator();
+
+        let filter = self.schema_filter.to_lowercase();
+        let schema = self.schema.as_ref().unwrap();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.strong("Properties");
+                egui::Grid::new("schema-props")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([14.0, 3.0])
+                    .show(ui, |ui| {
+                        ui.strong("Name");
+                        ui.strong("Type");
+                        ui.strong("Flags");
+                        ui.strong("Description");
+                        ui.end_row();
+                        for p in schema.properties.iter().filter(|p| {
+                            filter.is_empty()
+                                || p.name.to_lowercase().contains(&filter)
+                                || p.cim_type.to_lowercase().contains(&filter)
+                        }) {
+                            let label = if p.is_key {
+                                format!("\u{1f511} {}", p.name)
+                            } else {
+                                p.name.clone()
+                            };
+                            let resp = ui.label(label);
+                            if !p.value_map.is_empty() {
+                                let vm = p
+                                    .value_map
+                                    .iter()
+                                    .map(|(c, l)| format!("{c} = {l}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                resp.on_hover_text(format!("ValueMap:\n{vm}"));
+                            }
+                            ui.label(p.cim_type.as_str());
+                            let flags = format!(
+                                "{}{}{}",
+                                if p.is_read { "R" } else { "" },
+                                if p.is_write { "W" } else { "" },
+                                if p.is_key { "K" } else { "" }
+                            );
+                            ui.label(flags);
+                            ui.label(
+                                p.units
+                                    .as_deref()
+                                    .map(|u| format!("[{u}] "))
+                                    .unwrap_or_default()
+                                    + p.description.as_deref().unwrap_or_default(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.strong("Methods");
+                let methods: Vec<_> = schema
+                    .methods
+                    .iter()
+                    .filter(|m| filter.is_empty() || m.name.to_lowercase().contains(&filter))
+                    .collect();
+                if methods.is_empty() {
+                    ui.weak("(none)");
+                }
+                for m in methods {
+                    let tag = if m.is_static { "  [static]" } else { "" };
+                    egui::CollapsingHeader::new(format!("{}(){tag}", m.name))
+                        .id_salt(m.name.as_str())
+                        .show(ui, |ui| {
+                            if let Some(d) = &m.description {
+                                ui.label(d);
+                            }
+                            if !m.in_params.is_empty() {
+                                ui.weak("in:");
+                                for p in &m.in_params {
+                                    let opt = if p.optional { "  (optional)" } else { "" };
+                                    ui.label(format!("    {} : {}{opt}", p.name, p.cim_type));
+                                }
+                            }
+                            if !m.out_params.is_empty() {
+                                ui.weak("out:");
+                                for p in &m.out_params {
+                                    ui.label(format!("    {} : {}", p.name, p.cim_type));
+                                }
+                            }
+                        });
+                }
+            });
     }
 
     // ------------------------------------------------------------------

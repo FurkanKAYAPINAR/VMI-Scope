@@ -26,11 +26,16 @@ fn main() {
     });
     worker.send(Request::NetworkSnapshot { id: id() });
     worker.send(Request::ListEventSubscriptions { id: id() });
+    worker.send(Request::ClassSchema {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        class: "Win32_Process".into(),
+    });
 
     // Give the worker time and drain replies.
     let mut received = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 5 && std::time::Instant::now() < deadline {
+    while received < 6 && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -106,11 +111,41 @@ fn main() {
                         );
                     }
                 }
+                Response::Schema { class, schema, .. } => {
+                    println!(
+                        "\n== schema: {class} ({} props, {} methods){} ==",
+                        schema.properties.len(),
+                        schema.methods.len(),
+                        schema
+                            .super_class
+                            .map(|s| format!(" : {s}"))
+                            .unwrap_or_default()
+                    );
+                    for p in schema.properties.iter().take(6) {
+                        let flags = format!(
+                            "{}{}{}",
+                            if p.is_key { "K" } else { "" },
+                            if p.is_read { "R" } else { "" },
+                            if p.is_write { "W" } else { "" }
+                        );
+                        println!("  {:<22} {:<10} {}", p.name, p.cim_type, flags);
+                    }
+                    for m in schema.methods.iter().take(6) {
+                        println!(
+                            "  method {}({} in, {} out){}",
+                            m.name,
+                            m.in_params.len(),
+                            m.out_params.len(),
+                            if m.is_static { " [static]" } else { "" }
+                        );
+                    }
+                }
                 Response::Error {
                     context, message, ..
                 } => {
                     eprintln!("\n!! ERROR [{context}]: {message}");
                 }
+                _ => {}
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

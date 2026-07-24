@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Reflective class schema view** (Explorer → Schema toggle): for any class —
+  even zero-instance ones — shows every property with its CIM type, key/read/
+  write flags, units, description, and `ValueMap` enum (on hover), plus each
+  method's in/out parameter signatures. Built by reflecting over the raw
+  `IWbemClassObject` (`GetPropertyQualifierSet`, `BeginMethodEnumeration`) via
+  the `windows` crate.
+- **Class-list caching** — revisiting a namespace no longer re-enumerates.
 - **Providers tab**: lists WMI providers (`Msft_Providers`) with the process
   hosting each — provider, namespace, host PID, host process name, hosting
   group. Sortable; useful for troubleshooting `wmiprvse.exe`.

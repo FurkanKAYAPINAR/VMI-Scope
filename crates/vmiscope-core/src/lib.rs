@@ -8,10 +8,13 @@
 pub mod events;
 pub mod network;
 pub mod providers;
+pub mod reflect;
+pub mod schema;
 pub mod value;
 pub mod worker;
 
 pub use events::{Risk, Subscription, SubscriptionReport};
 pub use network::{Connection, NetworkSnapshot, Protocol};
 pub use providers::ProviderInfo;
+pub use schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema};
 pub use worker::{QueryResult, Request, Response, WmiWorker};

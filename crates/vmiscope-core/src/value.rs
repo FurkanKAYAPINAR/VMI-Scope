@@ -34,6 +34,16 @@ pub fn variant_to_string(v: &Variant) -> String {
     }
 }
 
+/// Render a variant as a list of strings — arrays element-wise, scalars as a
+/// one-element list, empty/null as an empty list. Used for `ValueMap`/`Values`.
+pub fn variant_to_string_vec(v: &Variant) -> Vec<String> {
+    match v {
+        Variant::Array(items) => items.iter().map(variant_to_string).collect(),
+        Variant::Empty | Variant::Null => Vec::new(),
+        other => vec![variant_to_string(other)],
+    }
+}
+
 /// Best-effort conversion of a WMI variant into a `u32` (ports, PIDs, enum
 /// codes). Non-numeric or missing values yield `0`.
 pub fn variant_to_u32(v: &Variant) -> u32 {

@@ -14,6 +14,7 @@ use wmi::{Variant, WMIConnection};
 use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
+use crate::schema::ClassSchema;
 use crate::value::{variant_to_string, variant_to_u32};
 
 /// A unit of work for the WMI thread. `id` lets the UI correlate the reply
@@ -36,6 +37,12 @@ pub enum Request {
     ListEventSubscriptions { id: u64 },
     /// Enumerate WMI providers and their host processes.
     ListProviders { id: u64 },
+    /// Reflect the full schema (properties, qualifiers, methods) of a class.
+    ClassSchema {
+        id: u64,
+        namespace: String,
+        class: String,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -78,6 +85,12 @@ pub enum Response {
     Providers {
         id: u64,
         providers: Vec<ProviderInfo>,
+    },
+    Schema {
+        id: u64,
+        namespace: String,
+        class: String,
+        schema: ClassSchema,
     },
     Error {
         id: u64,
@@ -218,6 +231,29 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: "Enumerate WMI providers".into(),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::ClassSchema {
+                id,
+                namespace,
+                class,
+            } => {
+                let resp = match connect(&namespace)
+                    .and_then(|c| crate::reflect::read_class_schema(&c, &class))
+                {
+                    Ok(schema) => Response::Schema {
+                        id,
+                        namespace,
+                        class,
+                        schema,
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("Reflect schema of {class}"),
                         message: e.to_string(),
                     },
                 };

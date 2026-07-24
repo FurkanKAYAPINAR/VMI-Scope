@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/vmiscope-core", "crates/vmiscope-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/FurkanKAYAPINAR/VMI-Scope"
+description = "VMI-Scope — a fast, security-focused WMI explorer written in Rust"
+
+[workspace.dependencies]
+anyhow = "1"
+
+# Faster incremental builds during development; smaller/optimized release binary.
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

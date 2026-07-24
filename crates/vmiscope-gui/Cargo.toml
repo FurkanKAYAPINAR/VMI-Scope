@@ -1,0 +1,17 @@
+[package]
+name = "vmiscope-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VMI-Scope — egui desktop front-end"
+
+[[bin]]
+name = "vmiscope"
+path = "src/main.rs"
+
+[dependencies]
+vmiscope-core = { path = "../vmiscope-core" }
+anyhow.workspace = true
+eframe = "0.35.0"
+egui = "0.35.0"
+egui_extras = "0.35.0"

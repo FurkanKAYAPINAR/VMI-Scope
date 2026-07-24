@@ -1,0 +1,9 @@
+# Normalize line endings: store text as LF in the repository.
+* text=auto
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.lock  text eol=lf
+LICENSE text eol=lf

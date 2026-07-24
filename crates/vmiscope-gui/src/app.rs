@@ -84,6 +84,16 @@ fn is_dangerous_method(method: &str) -> bool {
     .any(|k| m.contains(k))
 }
 
+/// Open a native "Save as" dialog and write `contents` to the chosen path.
+fn save_file(default_name: &str, contents: &str) {
+    if let Some(path) = rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .save_file()
+    {
+        let _ = std::fs::write(path, contents);
+    }
+}
+
 /// Colour for a subscription risk level.
 fn risk_color(risk: Risk) -> Color32 {
     match risk {
@@ -1025,6 +1035,23 @@ impl VmiScopeApp {
                     result.rows.len(),
                     result.columns.len()
                 ));
+                if !result.rows.is_empty() {
+                    ui.separator();
+                    if ui
+                        .button("\u{2b73} CSV")
+                        .on_hover_text("Export results as CSV")
+                        .clicked()
+                    {
+                        save_file("query.csv", &vmiscope_core::export::query_to_csv(result));
+                    }
+                    if ui
+                        .button("\u{2b73} JSON")
+                        .on_hover_text("Export results as JSON")
+                        .clicked()
+                    {
+                        save_file("query.json", &vmiscope_core::export::query_to_json(result));
+                    }
+                }
             }
         });
 
@@ -1856,7 +1883,23 @@ impl VmiScopeApp {
             if ui.button("\u{21bb} Refresh").clicked() {
                 self.request_events();
             }
-            ui.weak("root\\subscription — permanent subscriptions (persistence)");
+            if let Some(report) = self.events_report.as_ref() {
+                if !report.subscriptions.is_empty() {
+                    if ui.button("\u{2b73} CSV").clicked() {
+                        save_file(
+                            "wmi_persistence.csv",
+                            &vmiscope_core::export::subscriptions_to_csv(report),
+                        );
+                    }
+                    if ui.button("\u{2b73} JSON").clicked() {
+                        save_file(
+                            "wmi_persistence.json",
+                            &vmiscope_core::export::subscriptions_to_json(report),
+                        );
+                    }
+                }
+            }
+            ui.weak("root\\subscription \u{2014} persistence");
         });
 
         if let Some(report) = self.events_report.as_ref() {

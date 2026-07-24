@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Export** — save query results and the persistence report to **CSV** or
+  **JSON** via a native save dialog.
+- **Unit tests** for the core scoring/parsing logic (risk assessment, path
+  parsing, variant conversions, CIM-type classification, table alignment);
+  `cargo test` now runs in CI.
+- **CodeQL** code-scanning workflow and **Dependabot** dependency updates
+  (cargo + GitHub Actions); GitHub Discussions enabled.
+
+### Changed
+- Professionalized the README header (centered badge layout).
+
 ## [0.2.0] - 2026-07-24
 
 ### Added

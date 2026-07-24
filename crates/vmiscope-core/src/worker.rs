@@ -82,7 +82,7 @@ pub enum Request {
 
 /// A tabular query result: `columns` is the ordered union of property names,
 /// `rows` are already stringified and aligned to `columns`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,

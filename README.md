@@ -152,14 +152,17 @@ feature set, then go past it with security tooling. Status:
 - [x] **Global search** across class / property / method names.
 - [x] **Class-list caching** (async is inherent via the background worker).
 - [x] **Remote host** connection (current-user SSO).
+- [x] **Export** query results & persistence report to CSV / JSON.
+- [x] **Unit tests** + CI (`cargo test`, CodeQL, Dependabot).
 
 **Next**
 - [ ] **Alternate credentials** for remote hosts (needs a raw-DCOM
       `COAUTHIDENTITY` layer — the `wmi` crate's credentialed path runs queries
       as the local user).
-- [ ] **Live event monitor** — async notification queries.
 - [ ] **Snapshot & diff** of Persistence/Providers over time (baseline hunting).
-- [ ] **Export** results/reports to CSV / JSON / HTML.
+- [ ] **HTML report** for the persistence scan (analyst-ready artifact).
+- [ ] **Live event monitor** — async notification queries.
+- [ ] Mockable `WmiBackend` trait → publish `vmiscope-core` to crates.io.
 - [ ] Flag suspicious connections inline.
 
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would

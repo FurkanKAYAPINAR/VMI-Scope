@@ -6,6 +6,7 @@
 //!    [`Request`]s with [`Response`]s over channels, so the UI never blocks.
 
 pub mod events;
+pub mod export;
 pub mod method;
 pub mod network;
 pub mod providers;

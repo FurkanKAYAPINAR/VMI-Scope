@@ -6,7 +6,7 @@
 //! troubleshooting a hung/leaking `wmiprvse.exe` or spotting an odd provider.
 
 /// One provider and the process currently hosting it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ProviderInfo {
     pub provider: String,
     pub namespace: String,

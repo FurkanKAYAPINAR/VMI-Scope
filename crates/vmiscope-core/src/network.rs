@@ -4,8 +4,10 @@
 //! `MSFT_NetUDPEndpoint` in `root\StandardCimv2`, joined to process names via
 //! `Win32_Process`. See [`crate::worker`] for the query implementation.
 
+use serde::Serialize;
+
 /// Transport protocol of an endpoint/connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -21,7 +23,7 @@ impl Protocol {
 }
 
 /// A single connection (TCP) or endpoint (UDP).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Connection {
     pub proto: Protocol,
     pub local_addr: String,

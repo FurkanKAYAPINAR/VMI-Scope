@@ -53,6 +53,7 @@ enum PendingKind {
     Events,
     Providers,
     Schema,
+    Mof,
 }
 
 /// Colour for a subscription risk level.
@@ -267,6 +268,12 @@ pub struct VmiScopeApp {
     schema_class: String,
     schema_loading: bool,
     schema_filter: String,
+    // --- MOF viewer (floating window) ---
+    mof_open: bool,
+    mof_title: String,
+    mof_object_path: String,
+    mof_text: Option<String>,
+    mof_loading: bool,
     latest_query_id: u64,
     query_loading: bool,
     result: Option<QueryResult>,
@@ -317,6 +324,11 @@ impl VmiScopeApp {
             schema_class: String::new(),
             schema_loading: false,
             schema_filter: String::new(),
+            mof_open: false,
+            mof_title: String::new(),
+            mof_object_path: String::new(),
+            mof_text: None,
+            mof_loading: false,
             latest_query_id: 0,
             query_loading: false,
             result: None,
@@ -410,6 +422,21 @@ impl VmiScopeApp {
             id,
             namespace: self.active_ns.clone(),
             class,
+        });
+    }
+
+    fn request_mof(&mut self, object_path: String, title: String) {
+        let id = self.alloc_id();
+        self.mof_open = true;
+        self.mof_loading = true;
+        self.mof_title = title;
+        self.mof_object_path = object_path.clone();
+        self.mof_text = None;
+        self.pending.insert(id, PendingKind::Mof);
+        self.worker.send(Request::ClassMof {
+            id,
+            namespace: self.active_ns.clone(),
+            object_path,
         });
     }
 
@@ -556,6 +583,17 @@ impl VmiScopeApp {
                         self.schema_loading = false;
                     }
                 }
+                Response::Mof {
+                    id,
+                    object_path,
+                    mof,
+                } => {
+                    self.pending.remove(&id);
+                    if object_path == self.mof_object_path {
+                        self.mof_text = Some(mof);
+                        self.mof_loading = false;
+                    }
+                }
                 Response::Error {
                     id,
                     context,
@@ -585,6 +623,9 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Schema) => {
                             self.schema_loading = false;
+                        }
+                        Some(PendingKind::Mof) => {
+                            self.mof_loading = false;
                         }
                         None => {}
                     }
@@ -711,6 +752,7 @@ impl VmiScopeApp {
     fn ui_central(&mut self, ui: &mut egui::Ui) {
         // View switch for the selected class.
         let prev_view = self.central_view;
+        let mut mof_click: Option<String> = None;
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.central_view,
@@ -722,11 +764,21 @@ impl VmiScopeApp {
                 CentralView::Schema,
                 "\u{1f9ec} Schema",
             );
-            if let Some(c) = &self.selected_class {
+            if let Some(c) = self.selected_class.clone() {
                 ui.separator();
-                ui.weak(c);
+                ui.weak(&c);
+                if ui
+                    .button("\u{1f4c4} MOF")
+                    .on_hover_text("Show MOF text")
+                    .clicked()
+                {
+                    mof_click = Some(c);
+                }
             }
         });
+        if let Some(c) = mof_click {
+            self.request_mof(c.clone(), c);
+        }
         // Fetch schema the moment the user flips to the Schema view.
         if self.central_view == CentralView::Schema && prev_view != CentralView::Schema {
             if let Some(c) = self.selected_class.clone() {
@@ -1017,6 +1069,42 @@ impl VmiScopeApp {
                         });
                 }
             });
+    }
+
+    // ------------------------------------------------------------------
+    // UI: MOF viewer (floating window)
+    // ------------------------------------------------------------------
+
+    fn ui_mof_window(&mut self, ctx: &egui::Context) {
+        if !self.mof_open {
+            return;
+        }
+        let mut open = self.mof_open;
+        egui::Window::new(format!("MOF \u{2014} {}", self.mof_title))
+            .open(&mut open)
+            .default_size([560.0, 460.0])
+            .show(ctx, |ui| {
+                if self.mof_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("loading MOF\u{2026}");
+                    });
+                }
+                if let Some(text) = self.mof_text.clone() {
+                    if ui.button("\u{1f4cb} Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text.as_str()).monospace())
+                                    .selectable(true),
+                            );
+                        });
+                }
+            });
+        self.mof_open = open;
     }
 
     // ------------------------------------------------------------------
@@ -1572,6 +1660,9 @@ impl eframe::App for VmiScopeApp {
                 });
             }
         }
+
+        // MOF viewer floats above whatever tab is active.
+        self.ui_mof_window(ui.ctx());
 
         // Repaint while work is in flight, and continuously on the live tab.
         if !self.pending.is_empty() {

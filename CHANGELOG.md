@@ -7,6 +7,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **MOF viewer** — a `📄 MOF` button shows the MOF (Managed Object Format) text
+  of the selected class/instance in a floating, copyable window
+  (`IWbemClassObject::GetObjectText`).
 - **Reflective class schema view** (Explorer → Schema toggle): for any class —
   even zero-instance ones — shows every property with its CIM type, key/read/
   write flags, units, description, and `ValueMap` enum (on hover), plus each

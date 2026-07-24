@@ -31,11 +31,16 @@ fn main() {
         namespace: "root\\cimv2".into(),
         class: "Win32_Process".into(),
     });
+    worker.send(Request::ClassMof {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        object_path: "Win32_Process".into(),
+    });
 
     // Give the worker time and drain replies.
     let mut received = 0;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 6 && std::time::Instant::now() < deadline {
+    while received < 7 && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -138,6 +143,14 @@ fn main() {
                             m.out_params.len(),
                             if m.is_static { " [static]" } else { "" }
                         );
+                    }
+                }
+                Response::Mof {
+                    object_path, mof, ..
+                } => {
+                    println!("\n== MOF: {object_path} ({} chars) ==", mof.len());
+                    for line in mof.lines().take(6) {
+                        println!("  {line}");
                     }
                 }
                 Response::Error {

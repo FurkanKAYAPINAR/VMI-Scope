@@ -266,3 +266,13 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
 
     Ok(schema)
 }
+
+/// Return the MOF (Managed Object Format) text of a class or instance.
+///
+/// `object_path` is a class name (`Win32_Process`) or an instance path
+/// (`Win32_Process.Handle="1234"`). Uses `IWbemClassObject::GetObjectText`.
+pub fn class_mof(conn: &WMIConnection, object_path: &str) -> Result<String> {
+    let wrapper = conn.get_object(object_path)?;
+    let text = unsafe { wrapper.inner.GetObjectText(0)? };
+    Ok(text.to_string())
+}

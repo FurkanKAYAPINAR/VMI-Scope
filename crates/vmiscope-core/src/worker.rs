@@ -43,6 +43,12 @@ pub enum Request {
         namespace: String,
         class: String,
     },
+    /// Fetch the MOF text of a class or instance.
+    ClassMof {
+        id: u64,
+        namespace: String,
+        object_path: String,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -91,6 +97,11 @@ pub enum Response {
         namespace: String,
         class: String,
         schema: ClassSchema,
+    },
+    Mof {
+        id: u64,
+        object_path: String,
+        mof: String,
     },
     Error {
         id: u64,
@@ -254,6 +265,28 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                     Err(e) => Response::Error {
                         id,
                         context: format!("Reflect schema of {class}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::ClassMof {
+                id,
+                namespace,
+                object_path,
+            } => {
+                let resp = match connect(&namespace)
+                    .and_then(|c| crate::reflect::class_mof(&c, &object_path))
+                {
+                    Ok(mof) => Response::Mof {
+                        id,
+                        object_path,
+                        mof,
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("MOF of {object_path}"),
                         message: e.to_string(),
                     },
                 };

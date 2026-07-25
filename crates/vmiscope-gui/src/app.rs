@@ -13,7 +13,7 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use vmiscope_core::{
-    diff_subscriptions, param_kind, ClassSchema, Connection, EventMonitor, MethodArg,
+    diff_subscriptions, param_kind, ClassSchema, Connection, Credential, EventMonitor, MethodArg,
     MethodOutcome, MethodTarget, MonitorMsg, ParamKind, Protocol, ProviderInfo, QueryResult,
     Request, Response, Risk, SearchHit, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
     DEFAULT_EVENT_QUERY,
@@ -278,6 +278,10 @@ pub struct VmiScopeApp {
     // --- connection ---
     conn_host: String,
     conn_status: ConnStatus,
+    conn_use_creds: bool,
+    conn_user: String,
+    conn_pass: String,
+    conn_domain: String,
 
     // --- network tab ---
     net_conns: HashMap<String, TrackedConn>,
@@ -374,6 +378,10 @@ impl VmiScopeApp {
             class_cache: HashMap::new(),
             conn_host: String::new(),
             conn_status: ConnStatus::Local,
+            conn_use_creds: false,
+            conn_user: String::new(),
+            conn_pass: String::new(),
+            conn_domain: String::new(),
             net_conns: HashMap::new(),
             net_last_refresh: 0.0,
             net_inflight: false,
@@ -533,11 +541,11 @@ impl VmiScopeApp {
         });
     }
 
-    fn apply_host(&mut self, host: Option<String>) {
+    fn apply_host(&mut self, host: Option<String>, cred: Option<Credential>) {
         let id = self.alloc_id();
         self.conn_status = ConnStatus::Connecting;
         self.pending.insert(id, PendingKind::Connect);
-        self.worker.send(Request::SetHost { id, host });
+        self.worker.send(Request::SetHost { id, host, cred });
     }
 
     /// Wipe host-scoped state and re-seed the tree/query for a new target.
@@ -2455,13 +2463,51 @@ impl VmiScopeApp {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.conn_host)
                     .hint_text("local (blank) or remote hostname / IP")
-                    .desired_width(200.0),
+                    .desired_width(160.0),
             );
+            ui.checkbox(&mut self.conn_use_creds, "alt creds")
+                .on_hover_text(
+                    "Alternate credentials for a remote host (raw DCOM).\n\u{26a0} Experimental — \
+                 unverified against a live remote host. Browse/query/network/providers only.",
+                );
+            if self.conn_use_creds {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.conn_user)
+                        .hint_text("user")
+                        .desired_width(90.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.conn_pass)
+                        .password(true)
+                        .hint_text("password")
+                        .desired_width(90.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.conn_domain)
+                        .hint_text("domain")
+                        .desired_width(80.0),
+                );
+            }
             let go = ui.button("\u{1f50c} Connect").clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
                 let h = self.conn_host.trim().trim_start_matches('\\').to_string();
-                self.apply_host(if h.is_empty() { None } else { Some(h) });
+                let host = if h.is_empty() { None } else { Some(h) };
+                let cred = if self.conn_use_creds && !self.conn_user.trim().is_empty() {
+                    let d = self.conn_domain.trim();
+                    Some(Credential {
+                        user: self.conn_user.trim().to_string(),
+                        password: self.conn_pass.clone(),
+                        domain: if d.is_empty() {
+                            None
+                        } else {
+                            Some(d.to_string())
+                        },
+                    })
+                } else {
+                    None
+                };
+                self.apply_host(host, cred);
             }
             ui.separator();
             match &self.conn_status {
@@ -2473,9 +2519,14 @@ impl VmiScopeApp {
                     ui.weak("connecting\u{2026}");
                 }
                 ConnStatus::Remote(h) => {
+                    let mode = if self.conn_use_creds {
+                        "alt creds"
+                    } else {
+                        "current user"
+                    };
                     ui.colored_label(
                         Color32::from_rgb(120, 210, 140),
-                        format!("\u{25cf} {h} (current user)"),
+                        format!("\u{25cf} {h} ({mode})"),
                     );
                 }
                 ConnStatus::Failed(e) => {

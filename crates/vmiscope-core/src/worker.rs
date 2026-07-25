@@ -16,6 +16,7 @@ use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
 use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
+use crate::remote::{Credential, RemoteConn};
 use crate::schema::{ClassSchema, SearchIndex};
 use crate::value::{variant_to_string, variant_to_u32};
 
@@ -73,9 +74,14 @@ pub enum Request {
         namespace: String,
         include_methods: bool,
     },
-    /// Point all subsequent connections at `host` (as the current user), or
-    /// back to the local machine with `None`.
-    SetHost { id: u64, host: Option<String> },
+    /// Point all subsequent connections at `host`, back to the local machine
+    /// with `None`. With `cred`, authenticate using alternate credentials
+    /// (raw DCOM); without, connect as the current user (SSO).
+    SetHost {
+        id: u64,
+        host: Option<String>,
+        cred: Option<Credential>,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -226,7 +232,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
             }
 
             Request::ListClasses { id, namespace } => {
-                let resp = match list_classes(&namespace) {
+                let resp = match q_class_names(&namespace) {
                     Ok(classes) => Response::Classes {
                         id,
                         namespace,
@@ -407,18 +413,20 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                 let _ = tx.send(resp);
             }
 
-            Request::SetHost { id, host } => {
+            Request::SetHost { id, host, cred } => {
                 HOST.with(|h| *h.borrow_mut() = host.clone());
-                // Verify the target is reachable with a trivial query.
-                let probe = connect("root\\CIMV2").and_then(|c| {
-                    c.raw_query::<HashMap<String, Variant>>("SELECT Name FROM Win32_ComputerSystem")
-                        .map_err(anyhow::Error::from)
-                });
+                CRED.with(|c| *c.borrow_mut() = cred.clone());
+                REMOTE.with(|m| m.borrow_mut().clear());
+                // Verify the target is reachable (this also exercises the
+                // credential path — bogus creds fail here).
+                let probe = q_maps("root\\CIMV2", "SELECT Name FROM Win32_ComputerSystem");
                 let resp = match probe {
                     Ok(_) => Response::HostConnected { id, host },
                     Err(e) => {
                         // Revert to local so the app stays usable.
                         HOST.with(|h| *h.borrow_mut() = None);
+                        CRED.with(|c| *c.borrow_mut() = None);
+                        REMOTE.with(|m| m.borrow_mut().clear());
                         Response::Error {
                             id,
                             context: "Connect to host".into(),
@@ -436,6 +444,10 @@ thread_local! {
     /// The remote host all connections target, or `None` for the local machine.
     /// Thread-local because it lives entirely on the (single) worker thread.
     static HOST: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Alternate credentials for the remote host, if any (else current-user SSO).
+    static CRED: RefCell<Option<Credential>> = const { RefCell::new(None) };
+    /// Per-namespace raw-DCOM connections, used only in alternate-credential mode.
+    static REMOTE: RefCell<HashMap<String, RemoteConn>> = RefCell::new(HashMap::new());
 }
 
 /// Connect to a namespace on the current target host. When a host is set the
@@ -452,9 +464,55 @@ fn connect(namespace: &str) -> anyhow::Result<WMIConnection> {
     }
 }
 
+/// Are we in alternate-credential mode (raw DCOM), or local/SSO (`wmi` crate)?
+fn is_alt_cred() -> bool {
+    CRED.with(|c| c.borrow().is_some())
+}
+
+/// Run a closure against the cached raw-DCOM connection for `namespace`.
+fn with_remote<T>(
+    namespace: &str,
+    f: impl FnOnce(&RemoteConn) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    REMOTE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(namespace) {
+            let host = HOST
+                .with(|h| h.borrow().clone())
+                .ok_or_else(|| anyhow::anyhow!("alternate credentials require a host"))?;
+            let cred = CRED
+                .with(|c| c.borrow().clone())
+                .ok_or_else(|| anyhow::anyhow!("no credentials set"))?;
+            cache.insert(
+                namespace.to_string(),
+                RemoteConn::connect(&host, namespace, &cred)?,
+            );
+        }
+        f(cache.get(namespace).unwrap())
+    })
+}
+
+/// Run a WQL query, returning raw property maps. Dispatches local/SSO
+/// (`wmi` crate) vs alternate-credential (raw DCOM).
+fn q_maps(namespace: &str, wql: &str) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
+    if is_alt_cred() {
+        with_remote(namespace, |r| r.exec_maps(wql))
+    } else {
+        Ok(connect(namespace)?.raw_query(wql)?)
+    }
+}
+
+/// Enumerate class names, dispatching local/SSO vs alternate-credential.
+fn q_class_names(namespace: &str) -> anyhow::Result<Vec<String>> {
+    if is_alt_cred() {
+        with_remote(namespace, |r| r.list_class_names())
+    } else {
+        list_classes_local(namespace)
+    }
+}
+
 fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {
-    let conn = connect(namespace)?;
-    let rows: Vec<HashMap<String, Variant>> = conn.raw_query("SELECT Name FROM __NAMESPACE")?;
+    let rows = q_maps(namespace, "SELECT Name FROM __NAMESPACE")?;
     let mut names: Vec<String> = rows
         .into_iter()
         .filter_map(|mut r| r.remove("Name"))
@@ -467,7 +525,7 @@ fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-fn list_classes(namespace: &str) -> anyhow::Result<Vec<String>> {
+fn list_classes_local(namespace: &str) -> anyhow::Result<Vec<String>> {
     let conn = connect(namespace)?;
     // `meta_class` enumerates class *definitions*. The generic `HashMap` path
     // hides WMI system properties (`WBEM_FLAG_NONSYSTEM_ONLY`), so we drop to
@@ -488,9 +546,7 @@ fn list_classes(namespace: &str) -> anyhow::Result<Vec<String>> {
 }
 
 fn run_query(namespace: &str, wql: &str) -> anyhow::Result<QueryResult> {
-    let conn = connect(namespace)?;
-    let rows: Vec<HashMap<String, Variant>> = conn.raw_query(wql)?;
-    Ok(to_table(rows))
+    Ok(to_table(q_maps(namespace, wql)?))
 }
 
 /// Flatten a list of property maps into a column-aligned table. Columns are
@@ -543,11 +599,11 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
     }
     let name_of = |pid: u32| pid_name.get(&pid).cloned().unwrap_or_default();
 
-    let net = connect("root\\StandardCimv2")?;
     let mut connections = Vec::new();
 
     // TCP connections.
-    if let Ok(rows) = net.raw_query::<HashMap<String, Variant>>(
+    if let Ok(rows) = q_maps(
+        "root\\StandardCimv2",
         "SELECT LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess \
          FROM MSFT_NetTCPConnection",
     ) {
@@ -574,7 +630,8 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
     }
 
     // UDP endpoints (connectionless: no remote/state).
-    if let Ok(rows) = net.raw_query::<HashMap<String, Variant>>(
+    if let Ok(rows) = q_maps(
+        "root\\StandardCimv2",
         "SELECT LocalAddress,LocalPort,OwningProcess FROM MSFT_NetUDPEndpoint",
     ) {
         for r in rows {
@@ -601,13 +658,12 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
 /// Enumerate permanent WMI event subscriptions in `root\subscription` and score
 /// each filter→consumer binding for how much it looks like persistence.
 fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
-    let conn = connect("root\\subscription")?;
-
     // Filters: Name -> (query, language, event namespace).
     let mut filters: HashMap<String, String> = HashMap::new();
-    if let Ok(rows) =
-        conn.raw_query::<HashMap<String, Variant>>("SELECT Name, Query FROM __EventFilter")
-    {
+    if let Ok(rows) = q_maps(
+        "root\\subscription",
+        "SELECT Name, Query FROM __EventFilter",
+    ) {
         for r in rows {
             let name = r.get("Name").map(variant_to_string).unwrap_or_default();
             let query = r.get("Query").map(variant_to_string).unwrap_or_default();
@@ -618,35 +674,41 @@ fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
     // Consumers keyed by Name -> (concrete class, best-effort action string).
     // `__EventConsumer` is abstract; querying it returns every subclass
     // instance. The concrete class is a system property, so we read it through
-    // the reflective wrapper rather than the (system-property-stripping) map.
+    // the reflective wrapper. This reflective path is local/SSO only — over
+    // alternate credentials, consumer type/action stay blank (filters + bindings
+    // still resolve).
     let mut consumers: HashMap<String, (String, String)> = HashMap::new();
-    for item in conn.exec_query("SELECT * FROM __EventConsumer")? {
-        let Ok(obj) = item else { continue };
-        let class = obj.class().unwrap_or_default();
-        let get = |p: &str| {
-            obj.get_property(p)
-                .ok()
-                .map(|v| variant_to_string(&v))
-                .unwrap_or_default()
-        };
-        let name = get("Name");
-        // First non-empty of the code-bearing fields, across consumer types.
-        let action = [
-            "CommandLineTemplate",
-            "ExecutablePath",
-            "ScriptFileName",
-            "ScriptText",
-        ]
-        .into_iter()
-        .map(&get)
-        .find(|s| !s.is_empty())
-        .unwrap_or_default();
-        consumers.insert(name, (class, action));
+    if !is_alt_cred() {
+        let conn = connect("root\\subscription")?;
+        for item in conn.exec_query("SELECT * FROM __EventConsumer")? {
+            let Ok(obj) = item else { continue };
+            let class = obj.class().unwrap_or_default();
+            let get = |p: &str| {
+                obj.get_property(p)
+                    .ok()
+                    .map(|v| variant_to_string(&v))
+                    .unwrap_or_default()
+            };
+            let name = get("Name");
+            // First non-empty of the code-bearing fields, across consumer types.
+            let action = [
+                "CommandLineTemplate",
+                "ExecutablePath",
+                "ScriptFileName",
+                "ScriptText",
+            ]
+            .into_iter()
+            .map(&get)
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+            consumers.insert(name, (class, action));
+        }
     }
 
     // Bindings tie a filter to a consumer; flatten + score each.
     let mut subscriptions = Vec::new();
-    if let Ok(rows) = conn.raw_query::<HashMap<String, Variant>>(
+    if let Ok(rows) = q_maps(
+        "root\\subscription",
         "SELECT Filter, Consumer FROM __FilterToConsumerBinding",
     ) {
         for r in rows {
@@ -678,9 +740,7 @@ fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
 
 /// PID → process name, from `Win32_Process`.
 fn process_names() -> anyhow::Result<HashMap<u32, String>> {
-    let cimv2 = connect("root\\CIMV2")?;
-    let procs: Vec<HashMap<String, Variant>> =
-        cimv2.raw_query("SELECT ProcessId, Name FROM Win32_Process")?;
+    let procs = q_maps("root\\CIMV2", "SELECT ProcessId, Name FROM Win32_Process")?;
     let mut map = HashMap::new();
     for p in procs {
         let pid = p.get("ProcessId").map(variant_to_u32).unwrap_or(0);
@@ -726,8 +786,8 @@ fn build_search_index(namespace: &str, include_methods: bool) -> anyhow::Result<
 /// List WMI providers (`Msft_Providers`) and the processes hosting them.
 fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
     let names = process_names().unwrap_or_default();
-    let conn = connect("root\\CIMV2")?;
-    let rows: Vec<HashMap<String, Variant>> = conn.raw_query(
+    let rows = q_maps(
+        "root\\CIMV2",
         "SELECT provider, Namespace, HostProcessIdentifier, HostingGroup FROM Msft_Providers",
     )?;
     let mut providers: Vec<ProviderInfo> = rows

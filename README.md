@@ -158,13 +158,16 @@ feature set, then go past it with security tooling. Status:
 - [x] **Snapshot & diff** of the persistence scan (baseline hunting).
 - [x] **Live event monitor** — WMI notification queries (Events tab).
 - [x] **Unit tests** + CI (`cargo test`, CodeQL, Dependabot).
+- [x] **Alternate credentials** for remote hosts (raw-DCOM `COAUTHIDENTITY`) —
+      *experimental*: compile- and credential-plumbing-verified, but the remote
+      query path is unverified against a live remote host.
+- [x] **crates.io-ready** `vmiscope-core` (publish needs a token).
 
 **Next**
-- [ ] **Alternate credentials** for remote hosts (needs a raw-DCOM
-      `COAUTHIDENTITY` layer — the `wmi` crate's credentialed path runs queries
-      as the local user, and it can't be verified without a remote test host).
+- [ ] Verify alternate credentials against a real remote host; extend to
+      schema/methods/MOF over credentialed connections.
 - [ ] Snapshot & diff for **Providers**; baseline of known-good subscriptions.
-- [ ] Mockable `WmiBackend` trait → publish `vmiscope-core` to crates.io.
+- [ ] Mockable `WmiBackend` trait; publish `vmiscope-core` to crates.io.
 - [ ] Flag suspicious connections inline.
 
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would

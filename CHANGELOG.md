@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-25
+
+### Added
+- **Alternate credentials for remote hosts** (experimental): connect to a remote
+  machine with an explicit user / password / domain via raw DCOM
+  (`COAUTHIDENTITY` + re-blanketed enumerator proxies). Browse/query, Network,
+  and Providers route over the credentialed connection; Explorer schema/methods/
+  MOF and the persistence consumer enrichment stay current-user. **Compile- and
+  credential-plumbing-verified** (a bogus-cred local connect is correctly
+  rejected by WMI, proving credentials reach DCOM with no memory issue); the
+  remote *query* path is unverified against a live remote host, since WMI forbids
+  credentialed local connections and it cannot be tested on one machine.
+
+### Changed
+- `vmiscope-core` is now crates.io-publishable (metadata + crate README);
+  `cargo publish` just needs a token.
+
 ## [0.4.0] - 2026-07-25
 
 ### Added
@@ -81,7 +98,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/releases/tag/v0.2.0

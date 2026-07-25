@@ -3,7 +3,11 @@ name = "vmiscope-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core WMI access layer for VMI-Scope (background worker, reflective queries)"
+repository.workspace = true
+description = "Reflective WMI engine: browse namespaces/classes, run WQL, read class schemas (properties, qualifiers, methods), execute methods, and monitor events — the core behind VMI-Scope."
+readme = "README.md"
+keywords = ["wmi", "windows", "wbem", "wql", "security"]
+categories = ["os::windows-apis", "api-bindings"]
 
 [dependencies]
 anyhow.workspace = true

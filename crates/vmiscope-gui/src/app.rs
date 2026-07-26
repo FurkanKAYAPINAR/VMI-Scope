@@ -369,7 +369,7 @@ pub struct VmiScopeApp {
 
 impl VmiScopeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
 
         let mut app = Self {
             worker: WmiWorker::spawn(),
@@ -2422,6 +2422,17 @@ impl VmiScopeApp {
             if ui.button("clear").clicked() {
                 self.events_log.clear();
             }
+            if !self.events_log.is_empty()
+                && ui
+                    .button("\u{2b73} JSON")
+                    .on_hover_text("Export events")
+                    .clicked()
+            {
+                save_file(
+                    "wmi_events.json",
+                    &vmiscope_core::export::events_to_json(&self.events_log),
+                );
+            }
             ui.weak(format!("{} events", self.events_log.len()));
         });
         ui.add(
@@ -2636,6 +2647,9 @@ impl eframe::App for VmiScopeApp {
                 );
                 ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
                 ui.selectable_value(&mut self.active_tab, Tab::Events, "\u{1f4e1} Events");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::global_theme_preference_switch(ui);
+                });
             });
             ui.separator();
             self.ui_connection_bar(ui);

@@ -88,6 +88,20 @@ pub fn subscriptions_to_json(report: &SubscriptionReport) -> String {
     serde_json::to_string_pretty(&report.subscriptions).unwrap_or_default()
 }
 
+/// A captured event log (each event = `(field, value)` pairs) as a JSON array
+/// of objects.
+pub fn events_to_json(events: &[Vec<(String, String)>]) -> String {
+    let objs: Vec<serde_json::Map<String, serde_json::Value>> = events
+        .iter()
+        .map(|ev| {
+            ev.iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect()
+        })
+        .collect();
+    serde_json::to_string_pretty(&objs).unwrap_or_default()
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

@@ -174,7 +174,10 @@ pub struct VmiScopeApp {
 
 impl VmiScopeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        // Fonts first: `set_fonts` rebuilds the atlas, and installing the style
+        // against the old font set would size text against the wrong metrics.
+        crate::theme::fonts::install(&cc.egui_ctx);
+        crate::theme::install(&cc.egui_ctx, crate::theme::Theme::default());
 
         let mut app = Self {
             worker: WmiWorker::spawn(),
@@ -440,9 +443,8 @@ impl eframe::App for VmiScopeApp {
                 );
                 ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
                 ui.selectable_value(&mut self.active_tab, Tab::Events, "\u{1f4e1} Events");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::global_theme_preference_switch(ui);
-                });
+                // No light/dark switch: Nocturne is a dark design, and the
+                // light variant would be stock egui wearing our accent.
             });
             ui.separator();
             self.ui_connection_bar(ui);

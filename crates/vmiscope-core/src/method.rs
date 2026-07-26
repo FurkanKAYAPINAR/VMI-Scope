@@ -83,46 +83,6 @@ fn build_variant(arg: &MethodArg) -> Result<Variant> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_cim_types() {
-        assert_eq!(param_kind("string"), ParamKind::Str);
-        assert_eq!(param_kind("uint32"), ParamKind::Uint);
-        assert_eq!(param_kind("uint8"), ParamKind::Uint);
-        assert_eq!(param_kind("sint64"), ParamKind::Sint);
-        assert_eq!(param_kind("boolean"), ParamKind::Bool);
-        assert_eq!(param_kind("real64"), ParamKind::Real);
-        assert_eq!(param_kind("string[]"), ParamKind::Other);
-        assert_eq!(param_kind("object"), ParamKind::Other);
-        assert_eq!(param_kind("ref:Win32_Foo"), ParamKind::Other);
-    }
-
-    #[test]
-    fn build_variant_parses_scalars() {
-        let uint = MethodArg {
-            name: "n".into(),
-            kind: ParamKind::Uint,
-            value: "5".into(),
-        };
-        assert!(matches!(build_variant(&uint), Ok(Variant::UI8(5))));
-        let boolean = MethodArg {
-            name: "b".into(),
-            kind: ParamKind::Bool,
-            value: "true".into(),
-        };
-        assert!(matches!(build_variant(&boolean), Ok(Variant::Bool(true))));
-        let bad = MethodArg {
-            name: "n".into(),
-            kind: ParamKind::Uint,
-            value: "abc".into(),
-        };
-        assert!(build_variant(&bad).is_err());
-    }
-}
-
 /// List instances of `class` as invocation targets (capped for responsiveness).
 pub fn list_instances(conn: &WMIConnection, class: &str) -> Result<Vec<MethodTarget>> {
     let mut targets = Vec::new();
@@ -198,4 +158,44 @@ pub fn invoke_method(
         }
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_cim_types() {
+        assert_eq!(param_kind("string"), ParamKind::Str);
+        assert_eq!(param_kind("uint32"), ParamKind::Uint);
+        assert_eq!(param_kind("uint8"), ParamKind::Uint);
+        assert_eq!(param_kind("sint64"), ParamKind::Sint);
+        assert_eq!(param_kind("boolean"), ParamKind::Bool);
+        assert_eq!(param_kind("real64"), ParamKind::Real);
+        assert_eq!(param_kind("string[]"), ParamKind::Other);
+        assert_eq!(param_kind("object"), ParamKind::Other);
+        assert_eq!(param_kind("ref:Win32_Foo"), ParamKind::Other);
+    }
+
+    #[test]
+    fn build_variant_parses_scalars() {
+        let uint = MethodArg {
+            name: "n".into(),
+            kind: ParamKind::Uint,
+            value: "5".into(),
+        };
+        assert!(matches!(build_variant(&uint), Ok(Variant::UI8(5))));
+        let boolean = MethodArg {
+            name: "b".into(),
+            kind: ParamKind::Bool,
+            value: "true".into(),
+        };
+        assert!(matches!(build_variant(&boolean), Ok(Variant::Bool(true))));
+        let bad = MethodArg {
+            name: "n".into(),
+            kind: ParamKind::Uint,
+            value: "abc".into(),
+        };
+        assert!(build_variant(&bad).is_err());
+    }
 }

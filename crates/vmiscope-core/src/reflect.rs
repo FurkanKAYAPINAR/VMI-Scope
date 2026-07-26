@@ -168,7 +168,7 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
 
     // Properties.
     let mut prop_names = wrapper.list_properties().unwrap_or_default();
-    prop_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    prop_names.sort_by_key(|a| a.to_lowercase());
     for pname in prop_names {
         let mut ps = PropertySchema {
             name: pname.clone(),

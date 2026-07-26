@@ -19,6 +19,9 @@ impl VmiScopeApp {
             if self.monitor.is_some() {
                 if ui.button("\u{23f9} Stop").clicked() {
                     self.monitor = None;
+                    // The error belongs to the subscription being torn down;
+                    // leaving it up outlives the thing it describes.
+                    self.monitor_error = None;
                 }
                 ui.colored_label(Color32::from_rgb(120, 210, 140), "\u{25cf} monitoring");
             } else if ui.button("\u{25b6} Start").clicked() {

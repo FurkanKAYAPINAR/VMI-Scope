@@ -21,7 +21,15 @@ impl VmiScopeApp {
         }
 
         // Reconstruct the argument list from the current inputs + schema signature.
-        let (is_static, inputs): (bool, Vec<(String, String)>) = self
+        //
+        // If the schema is gone (a namespace switch landed between opening this
+        // dialog and confirming it, say) we cannot know whether the method is
+        // static or what it takes. Refusing is the only safe answer: guessing
+        // "static, no arguments" would send an instance method at the class path
+        // and drop every argument the user typed, which for something like
+        // Terminate is a silently different operation from the one they
+        // confirmed.
+        let Some((is_static, inputs)) = self
             .schema
             .as_ref()
             .and_then(|s| s.methods.iter().find(|m| m.name == method))
@@ -31,10 +39,17 @@ impl VmiScopeApp {
                     m.in_params
                         .iter()
                         .map(|p| (p.name.clone(), p.cim_type.clone()))
-                        .collect(),
+                        .collect::<Vec<(String, String)>>(),
                 )
             })
-            .unwrap_or((true, Vec::new()));
+        else {
+            self.confirm_open = false;
+            self.push_error(format!(
+                "{class}.{method}: the class schema is no longer loaded, so the call was not made. \
+                 Reselect the class and try again."
+            ));
+            return;
+        };
         let target = self.act_target.clone();
         let ns = self.active_ns.clone();
         let mut args: Vec<MethodArg> = Vec::new();

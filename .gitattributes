@@ -10,3 +10,11 @@ LICENSE text eol=lf
 
 # Shell hooks must stay LF or the shebang breaks on Windows.
 .githooks/** text eol=lf
+
+# Fonts are embedded with include_bytes! and their lengths are asserted in
+# theme::fonts. `text=auto` gets this right today only because git's heuristic
+# spots the NUL bytes -- pin it, because a mangled font would be a silent
+# corruption that only shows up as tofu at runtime.
+*.ttf binary
+*.otf binary
+*.png binary

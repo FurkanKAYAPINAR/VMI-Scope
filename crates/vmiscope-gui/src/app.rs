@@ -371,6 +371,8 @@ pub struct VmiScopeApp {
 
     // --- status ---
     error: Option<String>,
+    error_log: Vec<String>,
+    error_log_open: bool,
 }
 
 impl VmiScopeApp {
@@ -452,6 +454,8 @@ impl VmiScopeApp {
             selected_row: None,
             result_sort: None,
             error: None,
+            error_log: Vec::new(),
+            error_log_open: false,
         };
 
         // Load the root's children, expand it, focus CIMV2, and run a query so
@@ -470,6 +474,14 @@ impl VmiScopeApp {
     fn alloc_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Record an error: keep it as the latest, and accumulate into a bounded log
+    /// (so a burst of errors doesn't lose all but the last).
+    fn push_error(&mut self, msg: String) {
+        self.error_log.insert(0, msg.clone());
+        self.error_log.truncate(50);
+        self.error = Some(msg);
     }
 
     fn request_namespaces(&mut self, namespace: String) {
@@ -863,7 +875,7 @@ impl VmiScopeApp {
                         }
                         None => {}
                     }
-                    self.error = Some(format!("{context}\n{message}"));
+                    self.push_error(format!("{context}\n{message}"));
                 }
             }
         }
@@ -2011,7 +2023,7 @@ impl VmiScopeApp {
                     vmiscope_core::export::subscriptions_from_json(&t).map_err(|e| e.to_string())
                 }) {
                 Ok(subs) => self.events_baseline = Some(subs),
-                Err(e) => self.error = Some(format!("Load baseline: {e}")),
+                Err(e) => self.push_error(format!("Load baseline: {e}")),
             }
         }
     }
@@ -2670,7 +2682,48 @@ impl VmiScopeApp {
                     ui.weak(&self.result_wql);
                 }
             }
+            if !self.error_log.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(format!("Log ({})", self.error_log.len()))
+                        .clicked()
+                    {
+                        self.error_log_open = !self.error_log_open;
+                    }
+                });
+            }
         });
+    }
+
+    fn ui_error_log_window(&mut self, ctx: &egui::Context) {
+        if !self.error_log_open {
+            return;
+        }
+        let mut open = true;
+        let mut clear = false;
+        egui::Window::new(format!("Error log ({})", self.error_log.len()))
+            .open(&mut open)
+            .default_size([560.0, 300.0])
+            .show(ctx, |ui| {
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for e in &self.error_log {
+                            ui.label(egui::RichText::new(e).monospace());
+                            ui.separator();
+                        }
+                    });
+            });
+        if clear {
+            self.error_log.clear();
+        }
+        if !open || clear {
+            self.error_log_open = false;
+        }
     }
 }
 
@@ -2810,6 +2863,7 @@ impl eframe::App for VmiScopeApp {
         self.ui_mof_window(ui.ctx());
         self.ui_confirm_window(ui.ctx());
         self.ui_save_query_window(ui.ctx());
+        self.ui_error_log_window(ui.ctx());
 
         // Repaint while work is in flight, and continuously on the live tab.
         if !self.pending.is_empty() {

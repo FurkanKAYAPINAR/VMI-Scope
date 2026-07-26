@@ -3500,6 +3500,8 @@ dependencies = [
  "egui",
  "egui_extras",
  "rfd",
+ "serde",
+ "serde_json",
  "vmiscope-core",
 ]
 

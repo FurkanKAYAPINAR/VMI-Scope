@@ -12,6 +12,8 @@ use eframe::egui;
 use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
+use crate::config::Config;
+
 use vmiscope_core::{
     diff_subscriptions, param_kind, ClassSchema, Connection, Credential, EventMonitor, MethodArg,
     MethodOutcome, MethodTarget, MonitorMsg, ParamKind, Protocol, ProviderInfo, QueryResult,
@@ -273,6 +275,8 @@ pub struct VmiScopeApp {
     next_id: u64,
     pending: HashMap<u64, PendingKind>,
     active_tab: Tab,
+    /// Persisted query history + saved queries.
+    config: Config,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
     class_cache: HashMap<String, Vec<String>>,
     // --- connection ---
@@ -328,6 +332,8 @@ pub struct VmiScopeApp {
     // --- query + results ---
     query_text: String,
     script_lang: ScriptLang,
+    save_query_open: bool,
+    save_query_name: String,
     central_view: CentralView,
     schema: Option<ClassSchema>,
     schema_class: String,
@@ -376,6 +382,7 @@ impl VmiScopeApp {
             next_id: 0,
             pending: HashMap::new(),
             active_tab: Tab::Explorer,
+            config: Config::load(),
             class_cache: HashMap::new(),
             conn_host: String::new(),
             conn_status: ConnStatus::Local,
@@ -412,6 +419,8 @@ impl VmiScopeApp {
             selected_class: None,
             query_text: DEFAULT_QUERY.to_string(),
             script_lang: ScriptLang::PowerShell,
+            save_query_open: false,
+            save_query_name: String::new(),
             central_view: CentralView::Instances,
             schema: None,
             schema_class: String::new(),
@@ -629,6 +638,7 @@ impl VmiScopeApp {
         if wql.is_empty() {
             return;
         }
+        self.config.push_history(&wql);
         let id = self.alloc_id();
         self.latest_query_id = id;
         self.query_loading = true;
@@ -1077,6 +1087,39 @@ impl VmiScopeApp {
                         save_file("query.json", &vmiscope_core::export::query_to_json(result));
                     }
                 }
+            }
+        });
+
+        // Query history + saved queries.
+        ui.horizontal(|ui| {
+            let history = self.config.history.clone();
+            egui::ComboBox::from_id_salt("query-history")
+                .selected_text(format!("\u{23f1} History ({})", history.len()))
+                .show_ui(ui, |ui| {
+                    for q in &history {
+                        let short: String = q.chars().take(80).collect();
+                        if ui.selectable_label(false, short).clicked() {
+                            self.query_text = q.clone();
+                            self.run_query();
+                        }
+                    }
+                });
+            let saved = self.config.saved.clone();
+            if !saved.is_empty() {
+                egui::ComboBox::from_id_salt("saved-queries")
+                    .selected_text(format!("\u{2605} Saved ({})", saved.len()))
+                    .show_ui(ui, |ui| {
+                        for sq in &saved {
+                            if ui.selectable_label(false, &sq.name).clicked() {
+                                self.query_text = sq.wql.clone();
+                                self.run_query();
+                            }
+                        }
+                    });
+            }
+            if ui.button("\u{2605} Save\u{2026}").clicked() {
+                self.save_query_name.clear();
+                self.save_query_open = true;
             }
         });
 
@@ -1688,6 +1731,48 @@ impl VmiScopeApp {
         if do_invoke {
             self.confirm_open = false;
             self.request_invoke(class, target, method, is_static, args);
+        }
+    }
+
+    fn ui_save_query_window(&mut self, ctx: &egui::Context) {
+        if !self.save_query_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_save = false;
+        let mut cancel = false;
+        egui::Window::new("Save query")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Name:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.save_query_name).desired_width(240.0),
+                );
+                let can = !self.save_query_name.trim().is_empty();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can, egui::Button::new("Save")).clicked()
+                        || (can
+                            && resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    {
+                        do_save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if do_save {
+            self.config.save_query(
+                self.save_query_name.trim().to_string(),
+                self.active_ns.clone(),
+                self.query_text.clone(),
+            );
+            self.save_query_open = false;
+        } else if cancel || !open {
+            self.save_query_open = false;
         }
     }
 
@@ -2720,9 +2805,11 @@ impl eframe::App for VmiScopeApp {
             }
         }
 
-        // MOF viewer and the method-invocation confirmation float above the tabs.
+        // MOF viewer, method-invocation confirmation, and save-query dialog float
+        // above the tabs.
         self.ui_mof_window(ui.ctx());
         self.ui_confirm_window(ui.ctx());
+        self.ui_save_query_window(ui.ctx());
 
         // Repaint while work is in flight, and continuously on the live tab.
         if !self.pending.is_empty() {

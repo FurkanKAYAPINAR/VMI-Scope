@@ -7,6 +7,12 @@
 
 mod app;
 mod config;
+mod overlays;
+mod state;
+mod theme;
+mod util;
+mod views;
+mod widgets;
 
 use app::VmiScopeApp;
 

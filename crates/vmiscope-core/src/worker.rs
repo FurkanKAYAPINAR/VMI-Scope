@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 
 use wmi::{Variant, WMIConnection};
 
-use crate::events::{assess, first_quoted, Subscription, SubscriptionReport};
+use crate::events::{assess, first_quoted, Risk, Subscription, SubscriptionReport};
 use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
@@ -655,60 +655,76 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
     Ok(NetworkSnapshot { connections })
 }
 
-/// Enumerate permanent WMI event subscriptions in `root\subscription` and score
-/// each filter→consumer binding for how much it looks like persistence.
+/// Enumerate permanent WMI event subscriptions and score each for persistence.
+///
+/// Scans `root\subscription` (the primary home) **and** `root\default` (a classic
+/// hiding spot), walks each `__FilterToConsumerBinding`, and additionally
+/// surfaces **orphan** filters/consumers — objects staged without a binding, a
+/// known evasion against binding-only tools.
 fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
-    // Filters: Name -> (query, language, event namespace).
+    let mut subscriptions = Vec::new();
+    for ns in ["root\\subscription", "root\\default"] {
+        subscriptions.extend(scan_subscriptions_in(ns));
+    }
+    // Most-suspicious first.
+    subscriptions.sort_by(|a, b| b.risk.cmp(&a.risk));
+    Ok(SubscriptionReport { subscriptions })
+}
+
+fn scan_subscriptions_in(namespace: &str) -> Vec<Subscription> {
+    // Filters: Name -> query.
     let mut filters: HashMap<String, String> = HashMap::new();
-    if let Ok(rows) = q_maps(
-        "root\\subscription",
-        "SELECT Name, Query FROM __EventFilter",
-    ) {
+    if let Ok(rows) = q_maps(namespace, "SELECT Name, Query FROM __EventFilter") {
         for r in rows {
             let name = r.get("Name").map(variant_to_string).unwrap_or_default();
-            let query = r.get("Query").map(variant_to_string).unwrap_or_default();
-            filters.insert(name, query);
+            if !name.is_empty() {
+                let query = r.get("Query").map(variant_to_string).unwrap_or_default();
+                filters.insert(name, query);
+            }
         }
     }
 
-    // Consumers keyed by Name -> (concrete class, best-effort action string).
-    // `__EventConsumer` is abstract; querying it returns every subclass
-    // instance. The concrete class is a system property, so we read it through
-    // the reflective wrapper. This reflective path is local/SSO only — over
-    // alternate credentials, consumer type/action stay blank (filters + bindings
-    // still resolve).
+    // Consumers: Name -> (concrete class, best-effort action). Read via the
+    // reflective wrapper (the class is a system property). Local/SSO only.
     let mut consumers: HashMap<String, (String, String)> = HashMap::new();
     if !is_alt_cred() {
-        let conn = connect("root\\subscription")?;
-        for item in conn.exec_query("SELECT * FROM __EventConsumer")? {
-            let Ok(obj) = item else { continue };
-            let class = obj.class().unwrap_or_default();
-            let get = |p: &str| {
-                obj.get_property(p)
-                    .ok()
-                    .map(|v| variant_to_string(&v))
-                    .unwrap_or_default()
-            };
-            let name = get("Name");
-            // First non-empty of the code-bearing fields, across consumer types.
-            let action = [
-                "CommandLineTemplate",
-                "ExecutablePath",
-                "ScriptFileName",
-                "ScriptText",
-            ]
-            .into_iter()
-            .map(&get)
-            .find(|s| !s.is_empty())
-            .unwrap_or_default();
-            consumers.insert(name, (class, action));
+        if let Ok(conn) = connect(namespace) {
+            if let Ok(iter) = conn.exec_query("SELECT * FROM __EventConsumer") {
+                for item in iter.flatten() {
+                    let class = item.class().unwrap_or_default();
+                    let get = |p: &str| {
+                        item.get_property(p)
+                            .ok()
+                            .map(|v| variant_to_string(&v))
+                            .unwrap_or_default()
+                    };
+                    let name = get("Name");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let action = [
+                        "CommandLineTemplate",
+                        "ExecutablePath",
+                        "ScriptFileName",
+                        "ScriptText",
+                    ]
+                    .into_iter()
+                    .map(&get)
+                    .find(|s| !s.is_empty())
+                    .unwrap_or_default();
+                    consumers.insert(name, (class, action));
+                }
+            }
         }
     }
 
-    // Bindings tie a filter to a consumer; flatten + score each.
-    let mut subscriptions = Vec::new();
+    let mut subs = Vec::new();
+    let mut bound_filters = std::collections::HashSet::new();
+    let mut bound_consumers = std::collections::HashSet::new();
+
+    // Bindings.
     if let Ok(rows) = q_maps(
-        "root\\subscription",
+        namespace,
         "SELECT Filter, Consumer FROM __FilterToConsumerBinding",
     ) {
         for r in rows {
@@ -716,11 +732,13 @@ fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
                 first_quoted(&r.get("Filter").map(variant_to_string).unwrap_or_default());
             let consumer_name =
                 first_quoted(&r.get("Consumer").map(variant_to_string).unwrap_or_default());
+            bound_filters.insert(filter_name.clone());
+            bound_consumers.insert(consumer_name.clone());
             let filter_query = filters.get(&filter_name).cloned().unwrap_or_default();
             let (consumer_type, action) =
                 consumers.get(&consumer_name).cloned().unwrap_or_default();
             let (risk, reasons) = assess(&consumer_type, &filter_query, &action);
-            subscriptions.push(Subscription {
+            subs.push(Subscription {
                 filter_name,
                 filter_query,
                 consumer_type,
@@ -733,9 +751,41 @@ fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
         }
     }
 
-    // Sort most-suspicious first so the interesting rows lead.
-    subscriptions.sort_by(|a, b| b.risk.cmp(&a.risk));
-    Ok(SubscriptionReport { subscriptions })
+    // Orphan consumers — staged code with no binding (evasion signal).
+    for (name, (class, action)) in &consumers {
+        if !bound_consumers.contains(name) {
+            let (risk, mut reasons) = assess(class, "", action);
+            reasons.insert(0, "UNBOUND consumer (staged, no binding)".into());
+            subs.push(Subscription {
+                filter_name: String::new(),
+                filter_query: String::new(),
+                consumer_type: class.clone(),
+                consumer_name: name.clone(),
+                action: action.clone(),
+                risk: risk.max(Risk::Medium),
+                reasons,
+                bound: false,
+            });
+        }
+    }
+
+    // Orphan filters — present but unused.
+    for (name, query) in &filters {
+        if !bound_filters.contains(name) {
+            subs.push(Subscription {
+                filter_name: name.clone(),
+                filter_query: query.clone(),
+                consumer_type: String::new(),
+                consumer_name: String::new(),
+                action: String::new(),
+                risk: Risk::Low,
+                reasons: vec!["unbound filter (no binding)".into()],
+                bound: false,
+            });
+        }
+    }
+
+    subs
 }
 
 /// PID → process name, from `Win32_Process`.

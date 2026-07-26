@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Class reflection**: every class-level qualifier, the `__Derivation` ancestry
+  chain, and a `ClassKind` bit set (Dynamic / Association / Event / System /
+  Abstract / Singleton / Perf) are now read and exposed on `ClassSchema`, so the
+  Explorer can badge, filter and describe a class without a second round trip.
+- **Parameter direction**: a method's in- and out-signatures are merged into one
+  list, so a parameter appears once carrying `[in]`, `[out]` or `[in/out]`
+  instead of being silently duplicated.
+- **Design plan**: `docs/REDESIGN.md` — the full Nocturne redesign, phased, with
+  every egui 0.35 API checked against the pinned sources.
+- `check.ps1`, a local gate that runs CI plus the design-system invariants a
+  compiler cannot catch.
+
+### Changed
+- **Method invocation is more robust**: `is_static` now also covers a class with
+  no `Key` property or `Singleton = TRUE`, because WMI omits the `Static`
+  qualifier far more often than not (`Win32_OperatingSystem` carries it on none
+  of its five methods). An instance-path call WMI rejects is retried against the
+  class path.
+- `crates/vmiscope-gui/src/app.rs` split from 2,973 lines into 28 modules. Pure
+  code motion, verified item-by-item; no behaviour or pixel changed.
+
+### Fixed
+- **The confirmation gate could invoke a method it had not described.** If the
+  class schema was unavailable when the dialog was confirmed, it assumed the
+  method was static and took no arguments, then invoked it against the class
+  path with every typed argument dropped. For a method like `Terminate` that is
+  a different operation from the one the user agreed to. It now declines.
+- Stopping the event monitor left its error message on screen, reporting a
+  subscription that no longer existed.
+
 ## [0.6.0] - 2026-07-25
 
 ### Added

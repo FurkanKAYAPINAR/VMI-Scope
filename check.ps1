@@ -46,6 +46,10 @@ $gui = 'crates/vmiscope-gui/src'
 function Forbid($id, $pattern, $why, $paths, $allow = $null) {
     $hits = @(Select-String -Path $paths -Pattern $pattern -ErrorAction SilentlyContinue)
     if ($allow) { $hits = @($hits | Where-Object { $_.Path -notmatch $allow }) }
+    # Comment lines are prose, not code. These rules exist partly so the reason
+    # for each ban can be written down next to the workaround, and a gate that
+    # fires on its own explanation just teaches people not to explain.
+    $hits = @($hits | Where-Object { $_.Line.TrimStart() -notmatch '^(//|/\*|\*)' })
     $n = $hits.Count
 
     if ($n -eq 0) {
@@ -103,6 +107,43 @@ if ($allRs) {
     Forbid 'I6' 'SidePanel|TopBottomPanel|popup_below_widget|menu::bar|screen_rect\(\)|Color32::lerp' `
         'removed in egui 0.35' `
         $allRs
+
+    # I9 has two halves because a glyph can enter the source two ways, and the
+    # obvious grep only finds one of them. `default_fonts` is off, so anything
+    # outside the allow-list below resolves in neither embedded text font and
+    # renders as a blank box -- which nobody notices in a diff.
+    #
+    # Allow-list: typography that IS in Inter and JetBrains Mono (checked
+    # against their cmap tables), not iconography.
+    #   2014 em dash · 2026 ellipsis · 00B7 middle dot · 00D7 times
+    #   201C/201D curly quotes · 2192 arrow · 25CF/25CB status dots
+    $allowed = '2014|2026|00b7|00d7|201c|201d|2192|25cf|25cb'
+
+    Forbid 'I9a' ('\\u\{(?!(' + $allowed + ')\})[0-9a-f]{4,5}\}') `
+        'escaped glyph outside the typography allow-list; use theme::icons' `
+        $allRs 'theme[\\/]icons\.rs'
+
+    $rawHits = @()
+    foreach ($f in $allRs) {
+        if ($f -match 'theme[\\/]icons\.rs') { continue }
+        $n = 0
+        foreach ($line in [IO.File]::ReadAllLines($f)) {
+            $n++
+            foreach ($ch in $line.ToCharArray()) {
+                $cp = [int][char]$ch
+                if ($cp -gt 127 -and ('{0:x4}' -f $cp) -notmatch "^($allowed)$") {
+                    $rawHits += "    {0}:{1}: U+{2:X4} '{3}'" -f (Resolve-Path -Relative $f), $n, $cp, $ch
+                }
+            }
+        }
+    }
+    if ($rawHits) {
+        Write-Host '==> I9b FAILED -- raw glyph pasted into source, outside the allow-list' -ForegroundColor Red
+        $rawHits | Select-Object -Unique | ForEach-Object { Write-Host $_ }
+        $script:failed += 'I9b'
+    } else {
+        Write-Host '==> I9b ok' -ForegroundColor DarkGray
+    }
 }
 
 Write-Host ''

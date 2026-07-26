@@ -5,6 +5,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{CentralView, ScriptLang, VmiScopeApp};
+use crate::theme::icons;
 use crate::util::{generate_script, save_file, smart_cmp, toggle_sort};
 use crate::widgets::table::sortable_header;
 
@@ -22,18 +23,18 @@ impl VmiScopeApp {
             ui.selectable_value(
                 &mut self.central_view,
                 CentralView::Instances,
-                "\u{1f4c4} Instances",
+                format!("{} Instances", icons::FILE_TEXT),
             );
             ui.selectable_value(
                 &mut self.central_view,
                 CentralView::Schema,
-                "\u{1f9ec} Schema",
+                format!("{} Schema", icons::CUBE),
             );
             if let Some(c) = self.selected_class.clone() {
                 ui.separator();
                 ui.weak(&c);
                 if ui
-                    .button("\u{1f4c4} MOF")
+                    .button(format!("{} MOF", icons::FILE_TEXT))
                     .on_hover_text("Show MOF text")
                     .clicked()
                 {
@@ -41,7 +42,7 @@ impl VmiScopeApp {
                 }
                 let was_open = self.actions_open;
                 if ui
-                    .selectable_label(self.actions_open, "\u{2699} Actions")
+                    .selectable_label(self.actions_open, format!("{} Actions", icons::GEAR_SIX))
                     .on_hover_text("Invoke methods (mutating)")
                     .clicked()
                 {
@@ -91,7 +92,11 @@ impl VmiScopeApp {
                 .hint_text("SELECT * FROM Win32_Process"),
         );
         ui.horizontal(|ui| {
-            if ui.button("\u{25b6} Run  (Ctrl+Enter)").clicked() || run_shortcut {
+            if ui
+                .button(format!("{} Run  (Ctrl+Enter)", icons::PLAY))
+                .clicked()
+                || run_shortcut
+            {
                 self.run_query();
             }
             if let Some(result) = &self.result {
@@ -103,14 +108,14 @@ impl VmiScopeApp {
                 if !result.rows.is_empty() {
                     ui.separator();
                     if ui
-                        .button("\u{2b73} CSV")
+                        .button(format!("{} CSV", icons::DOWNLOAD_SIMPLE))
                         .on_hover_text("Export results as CSV")
                         .clicked()
                     {
                         save_file("query.csv", &vmiscope_core::export::query_to_csv(result));
                     }
                     if ui
-                        .button("\u{2b73} JSON")
+                        .button(format!("{} JSON", icons::DOWNLOAD_SIMPLE))
                         .on_hover_text("Export results as JSON")
                         .clicked()
                     {
@@ -124,7 +129,7 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             let history = self.config.history.clone();
             egui::ComboBox::from_id_salt("query-history")
-                .selected_text(format!("\u{23f1} History ({})", history.len()))
+                .selected_text(format!("{} History ({})", icons::TIMER, history.len()))
                 .show_ui(ui, |ui| {
                     for q in &history {
                         let short: String = q.chars().take(80).collect();
@@ -137,7 +142,7 @@ impl VmiScopeApp {
             let saved = self.config.saved.clone();
             if !saved.is_empty() {
                 egui::ComboBox::from_id_salt("saved-queries")
-                    .selected_text(format!("\u{2605} Saved ({})", saved.len()))
+                    .selected_text(format!("{} Saved ({})", icons::STAR, saved.len()))
                     .show_ui(ui, |ui| {
                         for sq in &saved {
                             if ui.selectable_label(false, &sq.name).clicked() {
@@ -147,7 +152,7 @@ impl VmiScopeApp {
                         }
                     });
             }
-            if ui.button("\u{2605} Save\u{2026}").clicked() {
+            if ui.button(format!("{} Save\u{2026}", icons::STAR)).clicked() {
                 self.save_query_name.clear();
                 self.save_query_open = true;
             }
@@ -235,14 +240,15 @@ impl VmiScopeApp {
 
     /// Collapsible PowerShell / VBScript generator for the current query.
     pub(crate) fn ui_script_gen(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("\u{1f4dc} Generate script (PowerShell / VBScript)", |ui| {
+        let script_header = format!("{} Generate script (PowerShell / VBScript)", icons::CODE);
+        ui.collapsing(script_header, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.script_lang, ScriptLang::PowerShell, "PowerShell");
                 ui.selectable_value(&mut self.script_lang, ScriptLang::VbScript, "VBScript");
             });
             let script = generate_script(self.script_lang, &self.active_ns, &self.query_text);
             ui.horizontal(|ui| {
-                if ui.button("\u{1f4cb} Copy").clicked() {
+                if ui.button(format!("{} Copy", icons::COPY)).clicked() {
                     ui.ctx().copy_text(script.clone());
                 }
                 ui.weak("PowerShell: paste & run \u{00b7} VBScript: cscript file.vbs");

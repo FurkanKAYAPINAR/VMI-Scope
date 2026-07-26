@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -12,7 +13,7 @@ impl VmiScopeApp {
     pub(crate) fn ui_detail(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("Row detail");
-            if ui.small_button("\u{2715}").on_hover_text("Close").clicked() {
+            if ui.small_button(icons::X).on_hover_text("Close").clicked() {
                 self.selected_row = None;
             }
         });

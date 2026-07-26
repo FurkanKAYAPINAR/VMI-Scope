@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -25,7 +26,7 @@ impl VmiScopeApp {
                     });
                 }
                 if let Some(text) = self.mof_text.clone() {
-                    if ui.button("\u{1f4cb} Copy").clicked() {
+                    if ui.button(format!("{} Copy", icons::COPY)).clicked() {
                         ui.ctx().copy_text(text.clone());
                     }
                     egui::ScrollArea::both()

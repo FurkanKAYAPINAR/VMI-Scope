@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -18,7 +19,7 @@ impl VmiScopeApp {
             ui.weak(format!("({})", self.classes.len()));
         });
         ui.horizontal(|ui| {
-            ui.label("\u{1f50d}");
+            ui.label(icons::MAGNIFYING_GLASS);
             ui.add(
                 egui::TextEdit::singleline(&mut self.class_filter)
                     .hint_text("filter classes")

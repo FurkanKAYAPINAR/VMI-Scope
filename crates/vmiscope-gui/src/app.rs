@@ -13,6 +13,7 @@ use egui::Color32;
 
 use crate::config::Config;
 use crate::state::ids::PendingKind;
+use crate::theme::icons;
 use crate::views::network::NET_REFRESH_SECS;
 
 use vmiscope_core::{
@@ -281,10 +282,11 @@ impl VmiScopeApp {
                     .desired_width(160.0),
             );
             ui.checkbox(&mut self.conn_use_creds, "alt creds")
-                .on_hover_text(
-                    "Alternate credentials for a remote host (raw DCOM).\n\u{26a0} Experimental — \
+                .on_hover_text(format!(
+                    "Alternate credentials for a remote host (raw DCOM).\n{} Experimental — \
                  unverified against a live remote host. Browse/query/network/providers only.",
-                );
+                    icons::WARNING,
+                ));
             if self.conn_use_creds {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.conn_user)
@@ -303,7 +305,9 @@ impl VmiScopeApp {
                         .desired_width(80.0),
                 );
             }
-            let go = ui.button("\u{1f50c} Connect").clicked()
+            let go = ui
+                .button(format!("{} Connect", icons::PLUGS_CONNECTED))
+                .clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
                 let h = self.conn_host.trim().trim_start_matches('\\').to_string();
@@ -347,7 +351,7 @@ impl VmiScopeApp {
                 ConnStatus::Failed(e) => {
                     ui.colored_label(
                         Color32::from_rgb(240, 120, 120),
-                        format!("\u{2716} {}", e.lines().next().unwrap_or("failed")),
+                        format!("{} {}", icons::X, e.lines().next().unwrap_or("failed")),
                     );
                 }
             }
@@ -361,7 +365,10 @@ impl VmiScopeApp {
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::from_rgb(240, 90, 90), "\u{26a0} error");
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 90, 90),
+                    format!("{} error", icons::WARNING),
+                );
                 ui.weak("\u{2014}");
                 ui.label(err.replace('\n', "  \u{2014}  "));
             } else {
@@ -434,15 +441,31 @@ impl eframe::App for VmiScopeApp {
             ui.horizontal(|ui| {
                 ui.heading("VMI-Scope");
                 ui.separator();
-                ui.selectable_value(&mut self.active_tab, Tab::Explorer, "\u{1f5c2} Explorer");
-                ui.selectable_value(&mut self.active_tab, Tab::Network, "\u{1f5a7} Network");
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    Tab::Explorer,
+                    format!("{} Explorer", icons::TREE_STRUCTURE),
+                );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    Tab::Network,
+                    format!("{} Network", icons::GLOBE_HEMISPHERE_WEST),
+                );
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Persistence,
-                    "\u{1f6e1} Persistence",
+                    format!("{} Persistence", icons::SHIELD_WARNING),
                 );
-                ui.selectable_value(&mut self.active_tab, Tab::Providers, "\u{1f9e9} Providers");
-                ui.selectable_value(&mut self.active_tab, Tab::Events, "\u{1f4e1} Events");
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    Tab::Providers,
+                    format!("{} Providers", icons::PLUGS_CONNECTED),
+                );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    Tab::Events,
+                    format!("{} Events", icons::BROADCAST),
+                );
                 // No light/dark switch: Nocturne is a dark design, and the
                 // light variant would be stock egui wearing our accent.
             });

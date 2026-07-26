@@ -5,6 +5,7 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 use crate::util::{prov_col_value, save_file, smart_cmp, toggle_sort};
 use crate::widgets::table::sortable_header;
 
@@ -23,14 +24,17 @@ impl VmiScopeApp {
             if self.providers_loading {
                 ui.spinner();
             }
-            if ui.button("\u{21bb} Refresh").clicked() {
+            if ui
+                .button(format!("{} Refresh", icons::ARROWS_CLOCKWISE))
+                .clicked()
+            {
                 self.request_providers();
             }
             if let Some(p) = self.providers.as_ref() {
                 ui.weak(format!("({})", p.len()));
                 if !p.is_empty()
                     && ui
-                        .button("\u{1f4be} Snapshot")
+                        .button(format!("{} Snapshot", icons::FLOPPY_DISK))
                         .on_hover_text("Save a baseline")
                         .clicked()
                 {
@@ -40,10 +44,15 @@ impl VmiScopeApp {
                     );
                 }
             }
-            if ui.button("\u{1f4c2} Baseline").clicked() {
+            if ui
+                .button(format!("{} Baseline", icons::FOLDER_OPEN))
+                .clicked()
+            {
                 load_baseline = true;
             }
-            if self.providers_baseline.is_some() && ui.button("\u{2716} clear").clicked() {
+            if self.providers_baseline.is_some()
+                && ui.button(format!("{} clear", icons::X)).clicked()
+            {
                 clear_baseline = true;
             }
         });

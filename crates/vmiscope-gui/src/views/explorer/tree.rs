@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::{VmiScopeApp, ROOT_NAMESPACE};
+use crate::theme::icons;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -32,7 +33,11 @@ impl VmiScopeApp {
 
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 14.0);
-            let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ / ▸
+            let arrow = if expanded {
+                icons::CARET_DOWN
+            } else {
+                icons::CARET_RIGHT
+            };
             if ui
                 .add(egui::Button::new(arrow).frame(false))
                 .on_hover_text("Expand / collapse")

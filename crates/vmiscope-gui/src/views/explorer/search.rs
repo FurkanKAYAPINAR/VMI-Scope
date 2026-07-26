@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::{CentralView, VmiScopeApp};
+use crate::theme::icons;
 
 use vmiscope_core::SearchHit;
 
@@ -84,7 +85,7 @@ impl VmiScopeApp {
     }
 
     pub(crate) fn ui_search(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("\u{1f50d} Global search")
+        egui::CollapsingHeader::new(format!("{} Global search", icons::MAGNIFYING_GLASS))
             .id_salt("global-search")
             .show(ui, |ui| {
                 let mut build = false;
@@ -132,7 +133,7 @@ impl VmiScopeApp {
                         }
                         for h in &hits {
                             let label = match &h.member {
-                                None => format!("\u{1f5c2} {}", h.class),
+                                None => format!("{} {}", icons::TREE_STRUCTURE, h.class),
                                 Some(m) if h.is_method => format!("{} :: {}()", h.class, m),
                                 Some(m) => format!("{} :: {}", h.class, m),
                             };

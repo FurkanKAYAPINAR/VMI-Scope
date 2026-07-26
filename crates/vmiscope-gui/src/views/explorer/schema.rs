@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -48,7 +49,7 @@ impl VmiScopeApp {
             }
         }
         ui.horizontal(|ui| {
-            ui.label("\u{1f50d}");
+            ui.label(icons::MAGNIFYING_GLASS);
             ui.add(
                 egui::TextEdit::singleline(&mut self.schema_filter)
                     .hint_text("filter properties / methods")
@@ -79,7 +80,7 @@ impl VmiScopeApp {
                                 || p.cim_type.to_lowercase().contains(&filter)
                         }) {
                             let label = if p.is_key {
-                                format!("\u{1f511} {}", p.name)
+                                format!("{} {}", icons::KEY, p.name)
                             } else {
                                 p.name.clone()
                             };

@@ -5,6 +5,7 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 use crate::theme::tokens::risk_color;
 use crate::util::{save_file, smart_cmp, sub_col_value, toggle_sort};
 use crate::widgets::table::sortable_header;
@@ -40,24 +41,36 @@ impl VmiScopeApp {
             if self.events_loading {
                 ui.spinner();
             }
-            if ui.button("\u{21bb} Refresh").clicked() {
+            if ui
+                .button(format!("{} Refresh", icons::ARROWS_CLOCKWISE))
+                .clicked()
+            {
                 self.request_events();
             }
             if let Some(report) = self.events_report.as_ref() {
                 if !report.subscriptions.is_empty() {
-                    if ui.button("\u{2b73} CSV").clicked() {
+                    if ui
+                        .button(format!("{} CSV", icons::DOWNLOAD_SIMPLE))
+                        .clicked()
+                    {
                         save_file(
                             "wmi_persistence.csv",
                             &vmiscope_core::export::subscriptions_to_csv(report),
                         );
                     }
-                    if ui.button("\u{2b73} JSON").clicked() {
+                    if ui
+                        .button(format!("{} JSON", icons::DOWNLOAD_SIMPLE))
+                        .clicked()
+                    {
                         save_file(
                             "wmi_persistence.json",
                             &vmiscope_core::export::subscriptions_to_json(report),
                         );
                     }
-                    if ui.button("\u{2b73} HTML").clicked() {
+                    if ui
+                        .button(format!("{} HTML", icons::DOWNLOAD_SIMPLE))
+                        .clicked()
+                    {
                         save_file(
                             "wmi_persistence.html",
                             &vmiscope_core::export::subscriptions_to_html(report),
@@ -65,7 +78,7 @@ impl VmiScopeApp {
                     }
                     ui.separator();
                     if ui
-                        .button("\u{1f4be} Snapshot")
+                        .button(format!("{} Snapshot", icons::FLOPPY_DISK))
                         .on_hover_text("Save a baseline")
                         .clicked()
                     {
@@ -77,13 +90,14 @@ impl VmiScopeApp {
                 }
             }
             if ui
-                .button("\u{1f4c2} Baseline")
+                .button(format!("{} Baseline", icons::FOLDER_OPEN))
                 .on_hover_text("Load a snapshot to diff against")
                 .clicked()
             {
                 load_baseline = true;
             }
-            if self.events_baseline.is_some() && ui.button("\u{2716} clear").clicked() {
+            if self.events_baseline.is_some() && ui.button(format!("{} clear", icons::X)).clicked()
+            {
                 clear_baseline = true;
             }
         });

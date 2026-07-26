@@ -4,6 +4,7 @@ use eframe::egui;
 use egui::Color32;
 
 use crate::app::VmiScopeApp;
+use crate::theme::icons;
 use crate::util::is_dangerous_method;
 
 use vmiscope_core::{param_kind, MethodArg, ParamKind};
@@ -81,7 +82,10 @@ impl VmiScopeApp {
             .show(ctx, |ui| {
                 ui.colored_label(
                     Color32::from_rgb(240, 120, 120),
-                    "\u{26a0} This invokes a WMI method and may change system state.",
+                    format!(
+                        "{} This invokes a WMI method and may change system state.",
+                        icons::WARNING
+                    ),
                 );
                 if is_dangerous_method(&method) {
                     ui.colored_label(

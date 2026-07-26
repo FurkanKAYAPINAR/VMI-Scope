@@ -5,6 +5,7 @@ use egui::Color32;
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{TrackedConn, VmiScopeApp};
+use crate::theme::icons;
 use crate::theme::tokens::state_color;
 use crate::util::{net_col_value, smart_cmp, toggle_sort};
 use crate::widgets::table::sortable_header;
@@ -29,18 +30,21 @@ impl VmiScopeApp {
                 ui.spinner();
             }
             let pause = if self.net_paused {
-                "\u{25b6} Resume"
+                format!("{} Resume", icons::PLAY)
             } else {
-                "\u{23f8} Pause"
+                format!("{} Pause", icons::PAUSE)
             };
             if ui.button(pause).clicked() {
                 self.net_paused = !self.net_paused;
             }
-            if ui.button("\u{21bb} Refresh").clicked() {
+            if ui
+                .button(format!("{} Refresh", icons::ARROWS_CLOCKWISE))
+                .clicked()
+            {
                 self.request_network(now);
             }
             ui.separator();
-            ui.label("\u{1f50d}");
+            ui.label(icons::MAGNIFYING_GLASS);
             ui.add(
                 egui::TextEdit::singleline(&mut self.net_filter)
                     .hint_text("filter process / ip / port / state")
@@ -63,7 +67,7 @@ impl VmiScopeApp {
             ui.weak(format!("\u{25cb} {fading} closing"));
             ui.colored_label(
                 Color32::from_rgb(240, 150, 90),
-                format!("\u{1f310} {external} external"),
+                format!("{} {external} external", icons::GLOBE_SIMPLE),
             );
             ui.checkbox(&mut self.net_external_only, "external only")
                 .on_hover_text("Established TCP connections to public IPs (possible C2 / exfil)");
@@ -173,7 +177,7 @@ impl VmiScopeApp {
                         if c.remote_addr.is_empty() {
                             "*".into()
                         } else if c.is_external() {
-                            format!("\u{1f310} {}", c.remote_addr)
+                            format!("{} {}", icons::GLOBE_SIMPLE, c.remote_addr)
                         } else {
                             c.remote_addr.clone()
                         },

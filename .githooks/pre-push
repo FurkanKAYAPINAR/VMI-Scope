@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pre-push gate: only push if the tree would pass CI.
+# Runs fmt-check, clippy (-D warnings), tests, and a build — aborts the push
+# on any failure. Enable with:  git config core.hooksPath .githooks
+set -e
+
+echo "pre-push: cargo fmt --check"
+cargo fmt --all --check
+
+echo "pre-push: cargo clippy -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+echo "pre-push: cargo test"
+cargo test --all --quiet
+
+echo "pre-push: cargo build"
+cargo build --all
+
+echo "pre-push: OK"

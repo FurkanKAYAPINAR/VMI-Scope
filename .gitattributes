@@ -7,3 +7,6 @@
 *.yml   text eol=lf
 *.lock  text eol=lf
 LICENSE text eol=lf
+
+# Shell hooks must stay LF or the shebang breaks on Windows.
+.githooks/** text eol=lf

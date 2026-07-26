@@ -164,4 +164,147 @@ mod tests {
         let s = vec![sub("F", "C", "x")];
         assert!(diff_subscriptions(&s, &s).is_empty());
     }
+
+    #[test]
+    fn subscription_removed_from_the_baseline_is_reported() {
+        let baseline = vec![sub("F1", "C1", "cmd /c a"), sub("F2", "C2", "cmd /c b")];
+        let current = vec![sub("F1", "C1", "cmd /c a")];
+        let d = diff_subscriptions(&baseline, &current);
+        assert_eq!(d.removed.len(), 1);
+        assert_eq!(d.removed[0].filter_name, "F2");
+        assert_eq!(d.added.len(), 0);
+        assert_eq!(d.changed.len(), 0);
+        assert_eq!(d.unchanged, 1);
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn subscription_diff_of_two_empty_sets_is_empty() {
+        let d = diff_subscriptions(&[], &[]);
+        assert!(d.is_empty());
+        assert_eq!(d.unchanged, 0);
+    }
+
+    #[test]
+    fn subscription_diff_against_an_empty_side() {
+        let s = vec![sub("F1", "C1", "a"), sub("F2", "C2", "b")];
+        // No baseline: everything is new.
+        let fresh = diff_subscriptions(&[], &s);
+        assert_eq!(fresh.added.len(), 2);
+        assert_eq!(fresh.removed.len(), 0);
+        assert_eq!(fresh.unchanged, 0);
+        // Nothing left: everything is gone.
+        let wiped = diff_subscriptions(&s, &[]);
+        assert_eq!(wiped.added.len(), 0);
+        assert_eq!(wiped.removed.len(), 2);
+        assert_eq!(wiped.unchanged, 0);
+    }
+
+    #[test]
+    fn subscription_diff_keys_on_filter_and_consumer_names_only() {
+        // Same identity, different consumer type — a change, not an add/remove.
+        let mut current = sub("F1", "C1", "cmd /c a");
+        current.consumer_type = "ActiveScriptEventConsumer".into();
+        let d = diff_subscriptions(&[sub("F1", "C1", "cmd /c a")], &[current]);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.added.len(), 0);
+        assert_eq!(d.removed.len(), 0);
+    }
+
+    #[test]
+    fn subscription_diff_output_follows_the_input_order() {
+        let baseline = vec![sub("B1", "C1", "a"), sub("B2", "C2", "b")];
+        let current = vec![sub("N1", "X1", "a"), sub("N2", "X2", "b")];
+        let d = diff_subscriptions(&baseline, &current);
+        // `added` walks `current`, `removed` walks `baseline` — the HashMaps are
+        // only ever looked up, never iterated, so both orders are stable.
+        assert_eq!(
+            d.added
+                .iter()
+                .map(|s| s.filter_name.as_str())
+                .collect::<Vec<_>>(),
+            ["N1", "N2"]
+        );
+        assert_eq!(
+            d.removed
+                .iter()
+                .map(|s| s.filter_name.as_str())
+                .collect::<Vec<_>>(),
+            ["B1", "B2"]
+        );
+    }
+
+    fn prov(provider: &str, pid: u32) -> ProviderInfo {
+        ProviderInfo {
+            provider: provider.into(),
+            namespace: "root\\CIMV2".into(),
+            host_pid: pid,
+            host_process: "wmiprvse.exe".into(),
+            hosting_group: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_diff_detects_added_removed_and_unchanged() {
+        let baseline = vec![prov("CIMWin32", 100), prov("WinMgmt", 100)];
+        let current = vec![
+            prov("CIMWin32", 100), // unchanged
+            prov("Nope", 300),     // added
+        ];
+        let d = diff_providers(&baseline, &current);
+        assert_eq!(d.added.len(), 1);
+        assert_eq!(d.added[0].provider, "Nope");
+        assert_eq!(d.removed.len(), 1);
+        assert_eq!(d.removed[0].provider, "WinMgmt");
+        assert_eq!(d.changed.len(), 0);
+        assert_eq!(d.unchanged, 1);
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn provider_diff_detects_a_host_process_rename() {
+        let baseline = vec![prov("CIMWin32", 100)];
+        let mut moved = prov("CIMWin32", 100);
+        moved.host_process = "svchost.exe".into();
+        let d = diff_providers(&baseline, &[moved]);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.unchanged, 0);
+    }
+
+    #[test]
+    fn provider_diff_of_two_empty_sets_is_empty() {
+        let d = diff_providers(&[], &[]);
+        assert!(d.is_empty());
+        assert_eq!(d.unchanged, 0);
+    }
+
+    #[test]
+    fn provider_diff_against_an_empty_side() {
+        let p = vec![prov("CIMWin32", 100), prov("WinMgmt", 200)];
+        let fresh = diff_providers(&[], &p);
+        assert_eq!(fresh.added.len(), 2);
+        assert_eq!(fresh.removed.len(), 0);
+        let wiped = diff_providers(&p, &[]);
+        assert_eq!(wiped.removed.len(), 2);
+        assert_eq!(wiped.added.len(), 0);
+    }
+
+    #[test]
+    fn provider_diff_keys_on_provider_and_namespace() {
+        // Same provider name in a different namespace is a different provider.
+        let mut other_ns = prov("CIMWin32", 100);
+        other_ns.namespace = "root\\StandardCimv2".into();
+        let d = diff_providers(&[prov("CIMWin32", 100)], &[other_ns]);
+        assert_eq!(d.added.len(), 1);
+        assert_eq!(d.removed.len(), 1);
+        assert_eq!(d.unchanged, 0);
+    }
+
+    #[test]
+    fn identical_provider_sets_are_empty_diff() {
+        let p = vec![prov("CIMWin32", 100)];
+        let d = diff_providers(&p, &p);
+        assert!(d.is_empty());
+        assert_eq!(d.unchanged, 1);
+    }
 }

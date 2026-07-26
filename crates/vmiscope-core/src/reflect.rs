@@ -13,7 +13,7 @@ use windows::Win32::System::Wmi as w;
 use windows::Win32::System::Wmi::{IWbemClassObject, IWbemQualifierSet};
 use wmi::{IWbemClassWrapper, Variant, WMIConnection};
 
-use crate::schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema};
+use crate::schema::{ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema};
 use crate::value::{variant_to_string, variant_to_string_vec, variant_to_u32};
 
 /// Map a CIM type code (with the array flag) to a readable name.
@@ -104,10 +104,14 @@ fn qualifier_bool(v: &Variant) -> bool {
     matches!(v, Variant::Bool(true))
 }
 
-/// Read a signature object's parameters (name, CIM type, ID, optional).
-fn read_params(sig: &IWbemClassObject) -> Vec<ParamSchema> {
+/// Fold one signature object's parameters into `params`, merging by name.
+///
+/// `from_in_sig` says which of the two signature objects we are reading, and is
+/// only a fallback: the authoritative direction is the `In`/`Out` qualifier.
+/// WMI spells those with no consistent case at all — `IN`, `In` and `in` all
+/// occur within `root\CIMV2` — hence the lowercased match.
+fn merge_params(sig: &IWbemClassObject, from_in_sig: bool, params: &mut Vec<ParamSchema>) {
     let wrapper = IWbemClassWrapper::new(sig.clone());
-    let mut params = Vec::new();
     for name in wrapper.list_properties().unwrap_or_default() {
         let mut p = ParamSchema {
             name: name.clone(),
@@ -125,12 +129,52 @@ fn read_params(sig: &IWbemClassObject) -> Vec<ParamSchema> {
                     match qn.to_lowercase().as_str() {
                         "id" => p.id = variant_to_u32(&qv) as i32,
                         "optional" => p.optional = qualifier_bool(&qv),
+                        "in" => p.is_in = qualifier_bool(&qv),
+                        "out" => p.is_out = qualifier_bool(&qv),
                         _ => {}
                     }
                 }
             }
         }
-        params.push(p);
+        // No usable direction qualifier: infer it from the signature object the
+        // parameter was found in. Rare, but a provider is free to omit it.
+        if !p.is_in && !p.is_out {
+            p.is_in = from_in_sig;
+            p.is_out = !from_in_sig;
+        }
+        // An `[in, out]` parameter is present in *both* signature objects —
+        // verified on `Win32_USBHub.GetDescriptor` (`RequestLength`) and
+        // `MSFT_VirtualDisk.Resize` (`Size`). The second sighting must only
+        // contribute its direction bit, never a second row.
+        match params
+            .iter_mut()
+            .find(|e| e.name.eq_ignore_ascii_case(&name))
+        {
+            Some(existing) => {
+                existing.is_in |= p.is_in;
+                existing.is_out |= p.is_out;
+                existing.optional |= p.optional;
+                if existing.cim_type.is_empty() {
+                    existing.cim_type = p.cim_type;
+                }
+            }
+            None => params.push(p),
+        }
+    }
+}
+
+/// Read both signature objects of a method into one de-duplicated parameter
+/// list, ordered by the `ID` qualifier (the declared parameter order).
+fn read_params(
+    in_sig: Option<&IWbemClassObject>,
+    out_sig: Option<&IWbemClassObject>,
+) -> Vec<ParamSchema> {
+    let mut params = Vec::new();
+    if let Some(sig) = in_sig {
+        merge_params(sig, true, &mut params);
+    }
+    if let Some(sig) = out_sig {
+        merge_params(sig, false, &mut params);
     }
     params.sort_by_key(|p| p.id);
     params
@@ -151,20 +195,41 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
         .map(|v| variant_to_string(&v))
         .filter(|s| !s.is_empty());
 
-    // Class-level qualifiers.
+    // The derivation chain, nearest ancestor first. It has to be fetched *by
+    // name*: `list_properties()` passes `WBEM_FLAG_NONSYSTEM_ONLY`, so no
+    // `__`-prefixed system property ever shows up in the enumeration. This is
+    // the same object we already hold, so it costs no extra COM round trip.
+    // A root class such as `StdRegProv` returns an empty `VT_ARRAY | VT_BSTR`.
+    schema.derivation = wrapper
+        .get_property("__Derivation")
+        .ok()
+        .map(|v| variant_to_string_vec(&v))
+        .unwrap_or_default();
+
+    // Class-level qualifiers. Everything is kept — `Provider`, `UUID`,
+    // `SupportsCreate`, `Singleton` and friends all drive the schema panel —
+    // while `Description` and `Abstract` are additionally lifted into their own
+    // fields because the rest of the crate consumes them directly.
     unsafe {
         if let Ok(qs) = obj.GetQualifierSet() {
             for (name, val) in read_qualifiers(&qs) {
+                let rendered = variant_to_string(&val);
                 match name.to_lowercase().as_str() {
                     "description" => {
-                        schema.description = Some(variant_to_string(&val)).filter(|s| !s.is_empty())
+                        schema.description = Some(rendered.clone()).filter(|s| !s.is_empty())
                     }
                     "abstract" => schema.is_abstract = qualifier_bool(&val),
                     _ => {}
                 }
+                schema.qualifiers.push((name, rendered));
             }
         }
     }
+    schema
+        .qualifiers
+        .sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+    schema.kind = ClassKind::classify(class, &schema.qualifiers, &schema.derivation);
 
     // Properties.
     let mut prop_names = wrapper.list_properties().unwrap_or_default();
@@ -215,6 +280,17 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
         schema.properties.push(ps);
     }
 
+    // Can a method of this class be invoked against the *class* path even
+    // without the `Static` qualifier? Two cases say yes:
+    //  - No `Key` property. WMI cannot address an instance of such a class, so
+    //    there is no instance path to offer — refusing would make the method
+    //    uninvokable outright (e.g. `StdRegProv`, `Win32_SecurityDescriptorHelper`).
+    //  - `Singleton`. The one instance is `Class=@`, and WMI accepts the bare
+    //    class path for it (e.g. `Win32_OperatingSystem`, `Win32_WMISetting`).
+    // The qualifier itself is unreliable: providers omit it constantly.
+    let class_level_static =
+        schema.kind.contains(ClassKind::SINGLETON) || !schema.properties.iter().any(|p| p.is_key);
+
     // Methods.
     unsafe {
         if obj.BeginMethodEnumeration(0).is_ok() {
@@ -236,12 +312,17 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
                     name: mname.clone(),
                     ..Default::default()
                 };
-                if let Some(sig) = in_sig.as_ref() {
-                    ms.in_params = read_params(sig);
-                }
-                if let Some(sig) = out_sig.as_ref() {
-                    ms.out_params = read_params(sig);
-                }
+                // One merged pass over both signatures, then split by
+                // direction. An `[in, out]` parameter stays in `in_params`
+                // only — that is where the caller supplies it — flagged
+                // `in/out` instead of appearing in both lists unmarked.
+                let params = read_params(in_sig.as_ref(), out_sig.as_ref());
+                ms.in_params = params.iter().filter(|p| p.is_in).cloned().collect();
+                ms.out_params = params
+                    .into_iter()
+                    .filter(|p| p.is_out && !p.is_in)
+                    .collect();
+
                 let (_h, pcw) = wide(&mname);
                 if let Ok(qs) = obj.GetMethodQualifierSet(pcw) {
                     for (qn, qv) in read_qualifiers(&qs) {
@@ -250,11 +331,12 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
                                 ms.description =
                                     Some(variant_to_string(&qv)).filter(|s| !s.is_empty())
                             }
-                            "static" => ms.is_static = qualifier_bool(&qv),
+                            "static" => ms.declared_static = qualifier_bool(&qv),
                             _ => {}
                         }
                     }
                 }
+                ms.is_static = ms.declared_static || class_level_static;
                 schema.methods.push(ms);
             }
             let _ = obj.EndMethodEnumeration();

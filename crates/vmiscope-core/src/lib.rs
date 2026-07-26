@@ -25,5 +25,7 @@ pub use monitor::{EventMonitor, MonitorMsg, DEFAULT_EVENT_QUERY};
 pub use network::{Connection, NetworkSnapshot, Protocol};
 pub use providers::ProviderInfo;
 pub use remote::{Credential, RemoteConn};
-pub use schema::{ClassSchema, MethodSchema, ParamSchema, PropertySchema, SearchHit, SearchIndex};
+pub use schema::{
+    ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema, SearchHit, SearchIndex,
+};
 pub use worker::{QueryResult, Request, Response, WmiWorker};

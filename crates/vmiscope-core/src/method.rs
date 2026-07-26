@@ -9,9 +9,16 @@
 //! every invocation behind an explicit confirmation.
 
 use anyhow::{bail, Result};
-use wmi::{Variant, WMIConnection};
+use wmi::{Variant, WMIConnection, WMIError};
 
 use crate::value::variant_to_string;
+
+/// `WBEM_E_ILLEGAL_OPERATION` — the documented "you cannot do that here" code.
+const WBEM_E_ILLEGAL_OPERATION: i32 = 0x8004_101Eu32 as i32;
+/// `WBEM_E_INVALID_METHOD` — what WMI *actually* returns when a static method
+/// is invoked against an instance path (measured on `Win32_Process.Create`
+/// against `Win32_Process.Handle="0"`; see `examples/probe.rs`).
+const WBEM_E_INVALID_METHOD: i32 = 0x8004_102Eu32 as i32;
 
 /// How a parameter can be edited in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +118,26 @@ pub fn list_instances(conn: &WMIConnection, class: &str) -> Result<Vec<MethodTar
     Ok(targets)
 }
 
+/// Did an invocation fail *because it was aimed at the wrong kind of path*?
+///
+/// Both codes mean "this method does not exist on that object", which is how
+/// WMI reports a static method reached through an instance path. Nothing ran,
+/// so retrying elsewhere is safe.
+fn wrong_target<T>(result: &std::result::Result<T, WMIError>) -> bool {
+    matches!(
+        result,
+        Err(WMIError::HResultError { hres })
+            if *hres == WBEM_E_INVALID_METHOD || *hres == WBEM_E_ILLEGAL_OPERATION
+    )
+}
+
 /// Invoke `method` on `class` (static) or on `object_path` (instance).
+///
+/// `is_static` is advisory, not a gate. WMI omits the `Static` qualifier often
+/// enough that a caller who trusted it would be unable to invoke genuinely
+/// static methods, so an invocation with no instance falls back to the class
+/// path, and an instance-path invocation that WMI rejects as static is retried
+/// there too.
 pub fn invoke_method(
     conn: &WMIConnection,
     class: &str,
@@ -120,10 +146,6 @@ pub fn invoke_method(
     is_static: bool,
     args: &[MethodArg],
 ) -> Result<MethodOutcome> {
-    if !is_static && !object_path.contains('=') {
-        bail!("no instance selected for a non-static method");
-    }
-
     let class_def = conn.get_object(class)?;
     let in_params = match class_def.get_method(method)? {
         Some(sig) => {
@@ -139,8 +161,29 @@ pub fn invoke_method(
         None => None,
     };
 
-    let target = if is_static { class } else { object_path };
-    let out = conn.exec_method(target, method, in_params.as_ref())?;
+    // An instance path always contains a key assignment (`Class.Key="x"`);
+    // anything else means the caller has no instance to offer.
+    let instance = object_path.trim();
+    let has_instance = instance.contains('=');
+    let target = if is_static || !has_instance {
+        class
+    } else {
+        instance
+    };
+
+    let mut result = conn.exec_method(target, method, in_params.as_ref());
+    if target != class && wrong_target(&result) {
+        result = conn.exec_method(class, method, in_params.as_ref());
+    }
+    let out = match result {
+        Ok(out) => out,
+        // Replaces the old up-front refusal: only complain about the missing
+        // instance once WMI has confirmed the class path will not do.
+        Err(e) if !has_instance && !is_static => {
+            bail!("{class}.{method} needs an instance; invoking it on the class path failed: {e}")
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let mut outcome = MethodOutcome::default();
     if let Some(o) = out {
@@ -197,5 +240,19 @@ mod tests {
             value: "abc".into(),
         };
         assert!(build_variant(&bad).is_err());
+    }
+
+    #[test]
+    fn only_wrong_path_errors_trigger_the_class_path_retry() {
+        let hres = |h: u32| -> std::result::Result<(), WMIError> {
+            Err(WMIError::HResultError { hres: h as i32 })
+        };
+        // The code WMI really returns for a static method on an instance path.
+        assert!(wrong_target(&hres(0x8004_102E)));
+        assert!(wrong_target(&hres(0x8004_101E)));
+        // Access denied and "not found" must surface, not be retried away.
+        assert!(!wrong_target(&hres(0x8004_1003)));
+        assert!(!wrong_target(&hres(0x8004_1002)));
+        assert!(!wrong_target::<()>(&Ok(())));
     }
 }

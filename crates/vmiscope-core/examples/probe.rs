@@ -1,7 +1,16 @@
 //! Quick reality check against the live WMI service.
 //! Run with: `cargo run -p vmiscope-core --example probe`
 
-use vmiscope_core::{Request, Response, WmiWorker};
+use vmiscope_core::{ParamSchema, Request, Response, WmiWorker};
+
+/// Render a parameter list as `name: type [direction]`, comma separated.
+fn signature(params: &[ParamSchema]) -> String {
+    params
+        .iter()
+        .map(|p| format!("{}: {} [{}]", p.name, p.cim_type, p.direction()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn main() {
     let worker = WmiWorker::spawn();
@@ -26,11 +35,24 @@ fn main() {
     });
     worker.send(Request::NetworkSnapshot { id: id() });
     worker.send(Request::ListEventSubscriptions { id: id() });
-    worker.send(Request::ClassSchema {
-        id: id(),
-        namespace: "root\\cimv2".into(),
-        class: "Win32_Process".into(),
-    });
+    // Class reflection: one representative of every `ClassKind`, plus the two
+    // classes the parameter-direction and static-method rules hinge on.
+    for class in [
+        "Win32_Process",
+        "Win32_LogicalDiskToPartition",
+        "__InstanceCreationEvent",
+        "CIM_Process",
+        "Win32_PerfFormattedData_PerfProc_Process",
+        "Win32_WMISetting",
+        "Win32_USBHub",
+        "Win32_OperatingSystem",
+    ] {
+        worker.send(Request::ClassSchema {
+            id: id(),
+            namespace: "root\\cimv2".into(),
+            class: class.into(),
+        });
+    }
     worker.send(Request::ClassMof {
         id: id(),
         namespace: "root\\cimv2".into(),
@@ -67,11 +89,52 @@ fn main() {
             },
         ],
     });
+    // Same call, but as a caller who does *not* know the method is static and
+    // has no instance to offer — the shape a missing `Static` qualifier
+    // produces. It must still run, against the class path.
+    worker.send(Request::InvokeMethod {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        class: "StdRegProv".into(),
+        object_path: String::new(),
+        method: "EnumKey".into(),
+        is_static: false,
+        args: vec![
+            vmiscope_core::MethodArg {
+                name: "hDefKey".into(),
+                kind: vmiscope_core::ParamKind::Uint,
+                value: "2147483650".into(),
+            },
+            vmiscope_core::MethodArg {
+                name: "sSubKeyName".into(),
+                kind: vmiscope_core::ParamKind::Str,
+                value: "SOFTWARE".into(),
+            },
+        ],
+    });
+    // The other half of the fallback: a static method aimed at an instance
+    // path. WMI rejects it, we retry on the class path. The command line is
+    // deliberately unreachable, so the retry returns 9 ("path not found")
+    // instead of starting anything.
+    worker.send(Request::InvokeMethod {
+        id: id(),
+        namespace: "root\\cimv2".into(),
+        class: "Win32_Process".into(),
+        object_path: "Win32_Process.Handle=\"0\"".into(),
+        method: "Create".into(),
+        is_static: false,
+        args: vec![vmiscope_core::MethodArg {
+            name: "CommandLine".into(),
+            kind: vmiscope_core::ParamKind::Str,
+            value: "Z:\\vmiscope-no-such-file.exe".into(),
+        }],
+    });
 
     // Give the worker time and drain replies.
+    let expected = next_id as usize;
     let mut received = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while received < 10 && std::time::Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while received < expected && std::time::Instant::now() < deadline {
         for resp in worker.poll() {
             received += 1;
             match resp {
@@ -154,10 +217,33 @@ fn main() {
                         schema.methods.len(),
                         schema
                             .super_class
+                            .as_ref()
                             .map(|s| format!(" : {s}"))
                             .unwrap_or_default()
                     );
-                    for p in schema.properties.iter().take(6) {
+                    let labels = schema.kind.labels();
+                    println!(
+                        "  kind:       {}",
+                        if labels.is_empty() {
+                            "-".into()
+                        } else {
+                            labels.join(" | ")
+                        }
+                    );
+                    println!(
+                        "  derivation: {}",
+                        if schema.derivation.is_empty() {
+                            "-".into()
+                        } else {
+                            schema.derivation.join(" > ")
+                        }
+                    );
+                    println!("  qualifiers ({}):", schema.qualifiers.len());
+                    for (name, value) in &schema.qualifiers {
+                        let short: String = value.chars().take(60).collect();
+                        println!("     {name:<20} = {short}");
+                    }
+                    for p in schema.properties.iter().take(4) {
                         let flags = format!(
                             "{}{}{}",
                             if p.is_key { "K" } else { "" },
@@ -166,13 +252,17 @@ fn main() {
                         );
                         println!("  {:<22} {:<10} {}", p.name, p.cim_type, flags);
                     }
-                    for m in schema.methods.iter().take(6) {
+                    for m in schema.methods.iter().take(8) {
+                        let tag = match (m.declared_static, m.is_static) {
+                            (true, _) => "  [static]",
+                            (false, true) => "  [static: no key / singleton]",
+                            _ => "",
+                        };
                         println!(
-                            "  method {}({} in, {} out){}",
+                            "  method {}({}) -> ({}){tag}",
                             m.name,
-                            m.in_params.len(),
-                            m.out_params.len(),
-                            if m.is_static { " [static]" } else { "" }
+                            signature(&m.in_params),
+                            signature(&m.out_params),
                         );
                     }
                 }
@@ -222,5 +312,5 @@ fn main() {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    println!("\ndone ({received}/3 responses)");
+    println!("\ndone ({received}/{expected} responses)");
 }

@@ -22,9 +22,32 @@ pub struct Config {
     pub saved: Vec<SavedQuery>,
 }
 
-fn config_path() -> Option<PathBuf> {
+fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join("VMI-Scope").join("config.json"))
+    Some(PathBuf::from(base).join("VMI-Scope"))
+}
+
+fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("config.json"))
+}
+
+/// Append a line to the audit log (`%APPDATA%\VMI-Scope\audit.log`) — used to
+/// record every mutating (method-execution) call for a security tool.
+pub fn append_audit(line: &str) {
+    let Some(dir) = config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("audit.log"))
+    {
+        let _ = writeln!(f, "{ts}\t{line}");
+    }
 }
 
 impl Config {

@@ -617,6 +617,21 @@ impl VmiScopeApp {
         is_static: bool,
         args: Vec<MethodArg>,
     ) {
+        // Audit every mutating call.
+        let args_str = args
+            .iter()
+            .map(|a| format!("{}={}", a.name, a.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = if is_static {
+            "(static)".to_string()
+        } else {
+            object_path.clone()
+        };
+        crate::config::append_audit(&format!(
+            "INVOKE {}\\{class}.{method}  target={target}  args=[{args_str}]",
+            self.active_ns
+        ));
         let id = self.alloc_id();
         self.act_invoking = true;
         self.act_outcome = None;

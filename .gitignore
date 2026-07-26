@@ -3,3 +3,11 @@
 Cargo.lock.orig
 .DS_Store
 *.pdb
+
+# Local design references and scratch binaries — not part of the source tree.
+# The design system itself is transcribed into docs/REDESIGN.md; the source
+# bundles are large and stay local.
+/design-refs/
+*.exe
+WMI Explorer*.html
+WMI Explorer*.zip

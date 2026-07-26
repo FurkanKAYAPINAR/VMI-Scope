@@ -289,6 +289,7 @@ pub struct VmiScopeApp {
     net_inflight: bool,
     net_filter: String,
     net_paused: bool,
+    net_external_only: bool,
     /// (column index, ascending). `None` = default (grouped by process).
     net_sort: Option<(usize, bool)>,
 
@@ -387,6 +388,7 @@ impl VmiScopeApp {
             net_inflight: false,
             net_filter: String::new(),
             net_paused: false,
+            net_external_only: false,
             net_sort: None,
             events_report: None,
             events_loading: false,
@@ -1761,22 +1763,36 @@ impl VmiScopeApp {
 
         let active = self.net_conns.values().filter(|t| t.alive).count();
         let fading = self.net_conns.len().saturating_sub(active);
+        let external = self
+            .net_conns
+            .values()
+            .filter(|t| t.conn.is_external())
+            .count();
         ui.horizontal(|ui| {
             ui.colored_label(
                 Color32::from_rgb(120, 210, 140),
                 format!("\u{25cf} {active} active"),
             );
             ui.weak(format!("\u{25cb} {fading} closing"));
-            ui.weak("\u{2014}  auto-refresh 1.5s, closed connections fade out over ~6s");
+            ui.colored_label(
+                Color32::from_rgb(240, 150, 90),
+                format!("\u{1f310} {external} external"),
+            );
+            ui.checkbox(&mut self.net_external_only, "external only")
+                .on_hover_text("Established TCP connections to public IPs (possible C2 / exfil)");
         });
         ui.separator();
 
         // Filter + sort (stable order so fading rows stay put while they dim).
         let filter = self.net_filter.to_lowercase();
+        let external_only = self.net_external_only;
         let mut rows: Vec<&TrackedConn> = self
             .net_conns
             .values()
             .filter(|t| {
+                if external_only && !t.conn.is_external() {
+                    return false;
+                }
                 if filter.is_empty() {
                     return true;
                 }
@@ -1869,6 +1885,8 @@ impl VmiScopeApp {
                         c.local_port.to_string(),
                         if c.remote_addr.is_empty() {
                             "*".into()
+                        } else if c.is_external() {
+                            format!("\u{1f310} {}", c.remote_addr)
                         } else {
                             c.remote_addr.clone()
                         },

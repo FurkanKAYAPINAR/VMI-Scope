@@ -2274,17 +2274,16 @@ impl VmiScopeApp {
             }
             if let Some(p) = self.providers.as_ref() {
                 ui.weak(format!("({})", p.len()));
-                if !p.is_empty() {
-                    if ui
+                if !p.is_empty()
+                    && ui
                         .button("\u{1f4be} Snapshot")
                         .on_hover_text("Save a baseline")
                         .clicked()
-                    {
-                        save_file(
-                            "wmi_providers_snapshot.json",
-                            &vmiscope_core::export::providers_to_json(p),
-                        );
-                    }
+                {
+                    save_file(
+                        "wmi_providers_snapshot.json",
+                        &vmiscope_core::export::providers_to_json(p),
+                    );
                 }
             }
             if ui.button("\u{1f4c2} Baseline").clicked() {

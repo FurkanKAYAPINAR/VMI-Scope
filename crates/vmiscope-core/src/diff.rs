@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::events::Subscription;
+use crate::providers::ProviderInfo;
 
 /// The delta between a baseline and the current set of subscriptions.
 #[derive(Debug, Clone, Default)]
@@ -55,10 +56,77 @@ pub fn diff_subscriptions(baseline: &[Subscription], current: &[Subscription]) -
     diff
 }
 
+/// The delta between a baseline and the current provider set.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderDiff {
+    pub added: Vec<ProviderInfo>,
+    pub removed: Vec<ProviderInfo>,
+    /// Same provider, but host PID / host process changed.
+    pub changed: Vec<ProviderInfo>,
+    pub unchanged: usize,
+}
+
+impl ProviderDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+fn prov_key(p: &ProviderInfo) -> (String, String) {
+    (p.provider.clone(), p.namespace.clone())
+}
+
+/// Diff `current` providers against a `baseline`.
+pub fn diff_providers(baseline: &[ProviderInfo], current: &[ProviderInfo]) -> ProviderDiff {
+    let base: HashMap<(String, String), &ProviderInfo> =
+        baseline.iter().map(|p| (prov_key(p), p)).collect();
+    let cur_keys: HashMap<(String, String), ()> =
+        current.iter().map(|p| (prov_key(p), ())).collect();
+
+    let mut diff = ProviderDiff::default();
+    for c in current {
+        match base.get(&prov_key(c)) {
+            None => diff.added.push(c.clone()),
+            Some(b) if b.host_pid != c.host_pid || b.host_process != c.host_process => {
+                diff.changed.push(c.clone())
+            }
+            Some(_) => diff.unchanged += 1,
+        }
+    }
+    diff.removed = baseline
+        .iter()
+        .filter(|b| !cur_keys.contains_key(&prov_key(b)))
+        .cloned()
+        .collect();
+    diff
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::Risk;
+
+    #[test]
+    fn provider_diff_detects_host_change() {
+        let base = vec![ProviderInfo {
+            provider: "CIMWin32".into(),
+            namespace: "root\\CIMV2".into(),
+            host_pid: 100,
+            host_process: "wmiprvse.exe".into(),
+            hosting_group: String::new(),
+        }];
+        let current = vec![ProviderInfo {
+            provider: "CIMWin32".into(),
+            namespace: "root\\CIMV2".into(),
+            host_pid: 200, // moved to a different host process
+            host_process: "wmiprvse.exe".into(),
+            hosting_group: String::new(),
+        }];
+        let d = diff_providers(&base, &current);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.added.len(), 0);
+        assert_eq!(d.removed.len(), 0);
+    }
 
     fn sub(filter: &str, consumer: &str, action: &str) -> Subscription {
         Subscription {

@@ -2,7 +2,18 @@
 //! analysts drop into a ticket.
 
 use crate::events::{Subscription, SubscriptionReport};
+use crate::providers::ProviderInfo;
 use crate::worker::QueryResult;
+
+/// Providers as pretty JSON (for a baseline snapshot).
+pub fn providers_to_json(providers: &[ProviderInfo]) -> String {
+    serde_json::to_string_pretty(providers).unwrap_or_default()
+}
+
+/// Parse a provider snapshot back for baseline diffing.
+pub fn providers_from_json(json: &str) -> anyhow::Result<Vec<ProviderInfo>> {
+    Ok(serde_json::from_str(json)?)
+}
 
 /// Parse a saved subscription snapshot (the JSON written by
 /// [`subscriptions_to_json`]) back into subscriptions, for baseline diffing.

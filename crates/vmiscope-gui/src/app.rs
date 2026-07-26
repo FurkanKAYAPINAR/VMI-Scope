@@ -15,10 +15,10 @@ use egui_extras::{Column, TableBuilder};
 use crate::config::Config;
 
 use vmiscope_core::{
-    diff_subscriptions, param_kind, ClassSchema, Connection, Credential, EventMonitor, MethodArg,
-    MethodOutcome, MethodTarget, MonitorMsg, ParamKind, Protocol, ProviderInfo, QueryResult,
-    Request, Response, Risk, SearchHit, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
-    DEFAULT_EVENT_QUERY,
+    diff_providers, diff_subscriptions, param_kind, ClassSchema, Connection, Credential,
+    EventMonitor, MethodArg, MethodOutcome, MethodTarget, MonitorMsg, ParamKind, Protocol,
+    ProviderInfo, QueryResult, Request, Response, Risk, SearchHit, SearchIndex, Subscription,
+    SubscriptionReport, WmiWorker, DEFAULT_EVENT_QUERY,
 };
 
 const ROOT_NAMESPACE: &str = "root";
@@ -308,6 +308,7 @@ pub struct VmiScopeApp {
     providers: Option<Vec<ProviderInfo>>,
     providers_loading: bool,
     providers_sort: Option<(usize, bool)>,
+    providers_baseline: Option<Vec<ProviderInfo>>,
 
     // --- events tab (live monitor) ---
     monitor: Option<EventMonitor>,
@@ -406,6 +407,7 @@ impl VmiScopeApp {
             providers: None,
             providers_loading: false,
             providers_sort: None,
+            providers_baseline: None,
             monitor: None,
             monitor_wql: DEFAULT_EVENT_QUERY.to_string(),
             monitor_error: None,
@@ -2260,6 +2262,8 @@ impl VmiScopeApp {
     // ------------------------------------------------------------------
 
     fn ui_providers(&mut self, ui: &mut egui::Ui) {
+        let mut load_baseline = false;
+        let mut clear_baseline = false;
         ui.horizontal(|ui| {
             ui.strong("WMI providers");
             if self.providers_loading {
@@ -2270,9 +2274,84 @@ impl VmiScopeApp {
             }
             if let Some(p) = self.providers.as_ref() {
                 ui.weak(format!("({})", p.len()));
+                if !p.is_empty() {
+                    if ui
+                        .button("\u{1f4be} Snapshot")
+                        .on_hover_text("Save a baseline")
+                        .clicked()
+                    {
+                        save_file(
+                            "wmi_providers_snapshot.json",
+                            &vmiscope_core::export::providers_to_json(p),
+                        );
+                    }
+                }
             }
-            ui.weak("Msft_Providers — which process hosts each provider");
+            if ui.button("\u{1f4c2} Baseline").clicked() {
+                load_baseline = true;
+            }
+            if self.providers_baseline.is_some() && ui.button("\u{2716} clear").clicked() {
+                clear_baseline = true;
+            }
         });
+        if load_baseline {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            {
+                match std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| {
+                        vmiscope_core::export::providers_from_json(&t).map_err(|e| e.to_string())
+                    }) {
+                    Ok(p) => self.providers_baseline = Some(p),
+                    Err(e) => self.push_error(format!("Load provider baseline: {e}")),
+                }
+            }
+        }
+        if clear_baseline {
+            self.providers_baseline = None;
+        }
+
+        // Diff against baseline.
+        if let (Some(base), Some(cur)) = (self.providers_baseline.as_ref(), self.providers.as_ref())
+        {
+            let d = diff_providers(base, cur);
+            ui.horizontal(|ui| {
+                ui.strong("vs baseline:");
+                ui.colored_label(
+                    Color32::from_rgb(240, 100, 100),
+                    format!("+{} new", d.added.len()),
+                );
+                ui.colored_label(
+                    Color32::from_rgb(225, 185, 90),
+                    format!("~{} changed", d.changed.len()),
+                );
+                ui.weak(format!("-{} removed", d.removed.len()));
+            });
+            if !d.is_empty() {
+                egui::CollapsingHeader::new("Diff details")
+                    .id_salt("prov-diff")
+                    .show(ui, |ui| {
+                        for (title, list) in [
+                            ("New", &d.added),
+                            ("Changed", &d.changed),
+                            ("Removed", &d.removed),
+                        ] {
+                            if list.is_empty() {
+                                continue;
+                            }
+                            ui.strong(format!("{title} ({})", list.len()));
+                            for p in list {
+                                ui.label(format!(
+                                    "    {} [{}]  pid {} {}",
+                                    p.provider, p.namespace, p.host_pid, p.host_process
+                                ));
+                            }
+                        }
+                    });
+            }
+        }
         ui.separator();
 
         let sort = self.providers_sort;

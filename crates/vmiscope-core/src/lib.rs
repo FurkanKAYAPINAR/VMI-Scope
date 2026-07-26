@@ -18,7 +18,7 @@ pub mod schema;
 pub mod value;
 pub mod worker;
 
-pub use diff::{diff_subscriptions, SubscriptionDiff};
+pub use diff::{diff_providers, diff_subscriptions, ProviderDiff, SubscriptionDiff};
 pub use events::{Risk, Subscription, SubscriptionReport};
 pub use method::{param_kind, MethodArg, MethodOutcome, MethodTarget, ParamKind};
 pub use monitor::{EventMonitor, MonitorMsg, DEFAULT_EVENT_QUERY};

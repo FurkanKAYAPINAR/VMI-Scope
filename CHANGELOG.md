@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-25
+
+### Added
+- **Persistence hunter — orphan detection & wider scan**: surfaces staged-but-
+  unbound `__EventFilter`/`__EventConsumer` (a binding-only-evasion technique)
+  and scans `root\default` in addition to `root\subscription`.
+- **External-connection flags** (Network tab): established TCP to public IPs is
+  counted, filterable ("external only"), and globe-marked — possible C2/exfil.
+- **Snapshot & diff for Providers** (host-process changes over a baseline).
+- **Persistent query history + saved queries** (`%APPDATA%\VMI-Scope\config.json`).
+- **Light/dark theme switch**; **event-log JSON export**; **error log panel**
+  (errors accumulate instead of overwriting); **audit log** of every mutating
+  method call (`audit.log`).
+
+### Changed
+- CI enforces `clippy -D warnings` and runs **cargo-deny** (advisories + licenses).
+
 ## [0.5.0] - 2026-07-25
 
 ### Added
@@ -98,7 +115,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.2.0...v0.3.0

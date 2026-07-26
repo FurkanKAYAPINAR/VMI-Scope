@@ -163,12 +163,16 @@ feature set, then go past it with security tooling. Status:
       query path is unverified against a live remote host.
 - [x] **crates.io-ready** `vmiscope-core` (publish needs a token).
 
+- [x] **Persistence** deepening — orphan filter/consumer detection + `root\default`.
+- [x] **Snapshot & diff for Providers**; persistent query history + saved queries.
+- [x] **External-connection flags**, theme switch, error log, audit log.
+
 **Next**
 - [ ] Verify alternate credentials against a real remote host; extend to
       schema/methods/MOF over credentialed connections.
-- [ ] Snapshot & diff for **Providers**; baseline of known-good subscriptions.
+- [ ] Baseline of known-good subscriptions; data-driven detection rules (TOML).
 - [ ] Mockable `WmiBackend` trait; publish `vmiscope-core` to crates.io.
-- [ ] Flag suspicious connections inline.
+- [ ] `cargo-dist` signed release binaries + winget; WSMan cross-platform backend.
 
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would
 > need an ETW/`iphlpapi` source and is tracked separately.

@@ -27,7 +27,11 @@ explorers, the core is a reusable Rust crate built on the reflective WMI/COM API
 filling a real gap in the Rust ecosystem (the `wmi` crate is optimized for
 *typed* queries; VMI-Scope does *generic* reflection).
 
-> Status: **v0.2 — feature-complete explorer + security tooling.** See the [Roadmap](#roadmap).
+> Status: **v0.6 shipped.** A full visual and structural redesign onto the
+> Nocturne design system is underway -- the theme, fonts, icon set and widget
+> kit have landed, and the views are adopting them view by view. The plan is
+> [docs/REDESIGN.md](docs/REDESIGN.md); what it got wrong is struck through
+> there rather than quietly edited.
 
 ## Features
 

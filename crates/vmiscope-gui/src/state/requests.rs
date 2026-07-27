@@ -1,10 +1,27 @@
 //! Every state mutation that dispatches work to the background worker: the
 //! `request_*` helpers plus the selection actions that trigger them.
 
+use std::time::Duration;
+
 use crate::app::{CentralView, ConnStatus, VmiScopeApp, DEFAULT_NAMESPACE, ROOT_NAMESPACE};
 use crate::state::ids::PendingKind;
 
 use vmiscope_core::{Credential, MethodArg, Request};
+
+/// Rows a query returns before it stops and says it was truncated.
+///
+/// WQL has no `TOP`, so without a cap `SELECT * FROM CIM_DataFile` really does
+/// try to return every file on the machine. Settings makes this configurable in
+/// Phase 7; until then it is a constant rather than an implicit infinity.
+pub(crate) const ROW_LIMIT: usize = 5_000;
+
+/// How long a single enumeration may run before it gives up.
+///
+/// Needed on top of the row cap because the cap only bites once rows arrive,
+/// and some providers deliver none for a very long time -- `CIM_DataFile`
+/// returned nothing at all in twelve seconds when measured. Without a deadline
+/// the only escape from those is the user noticing.
+pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -202,6 +219,8 @@ impl VmiScopeApp {
             id,
             namespace: self.active_ns.clone(),
             wql,
+            max_rows: Some(ROW_LIMIT),
+            timeout: Some(OPERATION_TIMEOUT),
         });
     }
 

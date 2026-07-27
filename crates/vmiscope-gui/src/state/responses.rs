@@ -19,6 +19,7 @@ impl VmiScopeApp {
                     id,
                     namespace,
                     children,
+                    ..
                 } => {
                     self.pending.remove(&id);
                     self.ns_loading.remove(&namespace);
@@ -28,6 +29,7 @@ impl VmiScopeApp {
                     id,
                     namespace,
                     classes,
+                    ..
                 } => {
                     self.pending.remove(&id);
                     // Only apply if it still matches the namespace we care about.
@@ -51,7 +53,7 @@ impl VmiScopeApp {
                         self.error = None;
                     }
                 }
-                Response::Network { id, snapshot } => {
+                Response::Network { id, snapshot, .. } => {
                     self.pending.remove(&id);
                     self.net_inflight = false;
                     // Mark everything stale, then revive whatever is present now.
@@ -82,12 +84,12 @@ impl VmiScopeApp {
                     self.net_conns
                         .retain(|_, tc| tc.alive || (now - tc.last_seen) < NET_FADE_SECS);
                 }
-                Response::EventSubscriptions { id, report } => {
+                Response::EventSubscriptions { id, report, .. } => {
                     self.pending.remove(&id);
                     self.events_loading = false;
                     self.events_report = Some(report);
                 }
-                Response::Providers { id, providers } => {
+                Response::Providers { id, providers, .. } => {
                     self.pending.remove(&id);
                     self.providers_loading = false;
                     self.providers = Some(providers);
@@ -127,7 +129,7 @@ impl VmiScopeApp {
                     self.act_invoking = false;
                     self.act_outcome = Some((method, outcome));
                 }
-                Response::SearchIndex { id, index } => {
+                Response::SearchIndex { id, index, .. } => {
                     self.pending.remove(&id);
                     self.search_loading = false;
                     self.search_index = Some(index);

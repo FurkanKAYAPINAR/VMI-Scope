@@ -45,7 +45,12 @@ pub(crate) const BAD: Color32 = Color32::from_rgb(0xcf, 0x8a, 0x84);
 // ---------------------------------------------------------------------------
 
 /// Surfaces, borders, muted text. Chroma stays low outside the accent.
-pub(crate) const NEUTRAL: [Color32; 9] = [
+///
+/// The ramps are `static`, not `const`, and that matters: a `const` is inlined
+/// at every use site, so `&STEEL` in two places can be two different addresses
+/// and the reverse lookup in `widgets::button::ramp_of` -- which recovers a
+/// whole ramp from the live accent by identity -- would silently never match.
+pub(crate) static NEUTRAL: [Color32; 9] = [
     Color32::from_rgb(0xf3, 0xf5, 0xfe),
     Color32::from_rgb(0xe4, 0xe7, 0xf5),
     Color32::from_rgb(0xcf, 0xd3, 0xe5),
@@ -58,7 +63,7 @@ pub(crate) const NEUTRAL: [Color32; 9] = [
 ];
 
 /// Steel -- the default accent.
-pub(crate) const STEEL: [Color32; 9] = [
+pub(crate) static STEEL: [Color32; 9] = [
     Color32::from_rgb(0xf2, 0xf8, 0xfb),
     Color32::from_rgb(0xdf, 0xec, 0xf3),
     Color32::from_rgb(0xbe, 0xda, 0xe8),
@@ -70,7 +75,7 @@ pub(crate) const STEEL: [Color32; 9] = [
     Color32::from_rgb(0x1d, 0x31, 0x40),
 ];
 
-pub(crate) const TEAL: [Color32; 9] = [
+pub(crate) static TEAL: [Color32; 9] = [
     Color32::from_rgb(0xf1, 0xfb, 0xf8),
     Color32::from_rgb(0xd5, 0xf0, 0xe9),
     Color32::from_rgb(0xb9, 0xe2, 0xd9),
@@ -82,7 +87,7 @@ pub(crate) const TEAL: [Color32; 9] = [
     Color32::from_rgb(0x17, 0x33, 0x2f),
 ];
 
-pub(crate) const AMBER: [Color32; 9] = [
+pub(crate) static AMBER: [Color32; 9] = [
     Color32::from_rgb(0xfb, 0xf7, 0xee),
     Color32::from_rgb(0xf2, 0xe7, 0xce),
     Color32::from_rgb(0xe6, 0xd6, 0xae),

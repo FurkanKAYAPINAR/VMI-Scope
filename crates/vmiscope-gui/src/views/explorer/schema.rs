@@ -4,6 +4,14 @@ use eframe::egui;
 
 use crate::app::VmiScopeApp;
 use crate::theme::icons;
+use crate::widgets::field::filter_box;
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::hrule;
+
+/// Width of the schema filter. `filter_box` fills whatever it is handed, and a
+/// filter running the width of a 4K window is harder to read than one the size
+/// of what gets typed into it.
+const FILTER_W: f32 = 240.0;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -17,10 +25,7 @@ impl VmiScopeApp {
         }
         if self.schema.is_none() {
             if self.schema_loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak("reflecting schema\u{2026}");
-                });
+                spinner(ui, "reflecting schema\u{2026}");
             } else {
                 ui.weak("No schema available for this class.");
             }
@@ -48,15 +53,11 @@ impl VmiScopeApp {
                 ui.label(d);
             }
         }
-        ui.horizontal(|ui| {
-            ui.label(icons::glyph(icons::MAGNIFYING_GLASS));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.schema_filter)
-                    .hint_text("filter properties / methods")
-                    .desired_width(240.0),
-            );
+        ui.scope(|ui| {
+            ui.set_max_width(FILTER_W);
+            filter_box(ui, &mut self.schema_filter, "filter properties / methods");
         });
-        ui.separator();
+        hrule(ui);
 
         let filter = self.schema_filter.to_lowercase();
         let schema = self.schema.as_ref().unwrap();
@@ -64,9 +65,12 @@ impl VmiScopeApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.strong("Properties");
+                // Four columns, so this is not a `kv_grid`; the striping is
+                // dropped because the design separates rows with a rule and a
+                // hover tint and nothing else. The three-column rebuild that
+                // turns this into a real table is Phase 3.
                 egui::Grid::new("schema-props")
                     .num_columns(4)
-                    .striped(true)
                     .spacing([14.0, 3.0])
                     .show(ui, |ui| {
                         ui.strong("Name");

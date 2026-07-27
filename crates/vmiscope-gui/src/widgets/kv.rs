@@ -18,6 +18,15 @@ use crate::theme::tokens::muted;
 /// that ambiguity is the whole problem. An em dash at least says "we looked".
 pub(crate) const EMPTY: &str = "\u{2014}";
 
+/// Floor for the key column.
+///
+/// `Grid` defaults `min_col_width` to `spacing.interact_size.x`, which this
+/// theme sets to 0 so buttons size to their content. A wrapping label handed
+/// zero available width wraps to one character per line, and the grid then
+/// records *that* as the column width -- so every key rendered as a vertical
+/// column of letters. Naming a floor here fixes it for every call site at once.
+const KEY_MIN_W: f32 = 96.0;
+
 /// A key/value grid. Keys are muted, values are monospace and selectable so
 /// they can be copied out.
 pub(crate) fn kv_grid<'a>(
@@ -25,8 +34,23 @@ pub(crate) fn kv_grid<'a>(
     id: &str,
     rows: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) {
+    kv_grid_sized(ui, id, KEY_MIN_W, rows);
+}
+
+/// [`kv_grid`] with the key column's floor spelled out.
+///
+/// Worth setting where the keys are known to be long -- WMI property names in
+/// a row-detail pane run past the default -- so the column does not have to be
+/// discovered from the first row.
+pub(crate) fn kv_grid_sized<'a>(
+    ui: &mut Ui,
+    id: &str,
+    min_key_width: f32,
+    rows: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
     Grid::new(id)
         .num_columns(2)
+        .min_col_width(min_key_width)
         .spacing([
             ui.spacing().item_spacing.x * 2.0,
             ui.spacing().item_spacing.y,

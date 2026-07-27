@@ -1,13 +1,25 @@
 //! The confirmation gate in front of every method invocation.
 
 use eframe::egui;
-use egui::Color32;
 
 use crate::app::VmiScopeApp;
+use crate::overlays::btn_danger;
 use crate::theme::icons;
+use crate::theme::tokens::{BAD, WARN};
 use crate::util::is_dangerous_method;
+use crate::widgets::button::btn_secondary;
+use crate::widgets::kv::kv_grid_sized;
+use crate::widgets::rule::hrule;
 
 use vmiscope_core::{param_kind, MethodArg, ParamKind};
+
+/// Narrowest the dialog is allowed to be.
+///
+/// An auto-sizing window is only as wide as its widest line, and the two
+/// warnings are the widest lines here -- so without a floor the summary grid
+/// below them gets whatever they happen to leave, and a long object path pushes
+/// the whole dialog around every time the target changes.
+const MIN_W: f32 = 380.0;
 
 impl VmiScopeApp {
     pub(crate) fn ui_confirm_window(&mut self, ctx: &egui::Context) {
@@ -80,42 +92,47 @@ impl VmiScopeApp {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
+                ui.set_min_width(MIN_W);
+                // Two levels, two tokens: the standing caution that every
+                // invocation carries is WARN, and the name-based escalation is
+                // BAD. Painting both the same red would make the second line
+                // read as a restatement rather than as a step up.
                 ui.label(icons::labelled_styled(
                     ui,
                     icons::WARNING,
                     "This invokes a WMI method and may change system state.",
                     egui::TextStyle::Body,
-                    Color32::from_rgb(240, 120, 120),
+                    WARN,
                 ));
                 if is_dangerous_method(&method) {
                     ui.colored_label(
-                        Color32::from_rgb(255, 80, 80),
+                        BAD,
                         format!("\u{201c}{method}\u{201d} looks destructive \u{2014} double-check the target."),
                     );
                 }
-                ui.separator();
-                egui::Grid::new("confirm-grid").num_columns(2).show(ui, |ui| {
-                    ui.strong("Namespace");
-                    ui.label(&ns);
-                    ui.end_row();
-                    ui.strong("Class");
-                    ui.label(&class);
-                    ui.end_row();
-                    ui.strong("Method");
-                    ui.label(&method);
-                    ui.end_row();
-                    ui.strong("Target");
-                    ui.label(if is_static {
-                        "(static)"
-                    } else if target.is_empty() {
-                        "(none)"
-                    } else {
-                        target.as_str()
-                    });
-                    ui.end_row();
+                hrule(ui);
+                let target_text = if is_static {
+                    "(static)"
+                } else if target.is_empty() {
+                    "(none)"
+                } else {
+                    target.as_str()
+                };
+                ui.scope(|ui| {
+                    kv_grid_sized(
+                        ui,
+                        "confirm-grid",
+                        90.0,
+                        [
+                            ("Namespace", ns.as_str()),
+                            ("Class", class.as_str()),
+                            ("Method", method.as_str()),
+                            ("Target", target_text),
+                        ],
+                    );
                 });
                 if !args.is_empty() {
-                    ui.separator();
+                    hrule(ui);
                     ui.strong("Arguments");
                     for a in &args {
                         let shown = if a.value.trim().is_empty() {
@@ -126,16 +143,12 @@ impl VmiScopeApp {
                         ui.label(format!("  {} = {shown}", a.name));
                     }
                 }
-                ui.separator();
+                hrule(ui);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if btn_secondary(ui, "Cancel").clicked() {
                         cancel = true;
                     }
-                    let go = egui::Button::new(
-                        egui::RichText::new("Yes, invoke").color(Color32::WHITE),
-                    )
-                    .fill(Color32::from_rgb(150, 60, 60));
-                    if ui.add(go).clicked() {
+                    if btn_danger(ui, egui::RichText::new("Yes, invoke").color(BAD)).clicked() {
                         do_invoke = true;
                     }
                 });

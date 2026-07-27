@@ -4,6 +4,9 @@ use eframe::egui;
 
 use crate::app::VmiScopeApp;
 use crate::theme::icons;
+use crate::widgets::button::btn_icon;
+use crate::widgets::kv::kv_grid_sized;
+use crate::widgets::rule::hrule;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -13,15 +16,11 @@ impl VmiScopeApp {
     pub(crate) fn ui_detail(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("Row detail");
-            if ui
-                .small_button(icons::glyph(icons::X))
-                .on_hover_text("Close")
-                .clicked()
-            {
+            if btn_icon(ui, icons::X).on_hover_text("Close").clicked() {
                 self.selected_row = None;
             }
         });
-        ui.separator();
+        hrule(ui);
         let (Some(result), Some(ri)) = (self.result.as_ref(), self.selected_row) else {
             return;
         };
@@ -31,21 +30,18 @@ impl VmiScopeApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("detail-grid")
-                    .num_columns(2)
-                    .striped(true)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        for (col, val) in result.columns.iter().zip(row.iter()) {
-                            ui.strong(col);
-                            if val.is_empty() {
-                                ui.weak("\u{2014}"); // em dash for empty
-                            } else {
-                                ui.label(val);
-                            }
-                            ui.end_row();
-                        }
-                    });
+                // `kv_grid` owns the em-dash-for-empty convention, so the branch
+                // that used to spell it out here is gone with it.
+                kv_grid_sized(
+                    ui,
+                    "detail-grid",
+                    140.0,
+                    result
+                        .columns
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(col, val)| (col.as_str(), val.as_str())),
+                );
             });
     }
 }

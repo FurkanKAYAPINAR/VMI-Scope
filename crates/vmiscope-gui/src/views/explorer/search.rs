@@ -4,6 +4,9 @@ use eframe::egui;
 
 use crate::app::{CentralView, VmiScopeApp};
 use crate::theme::icons;
+use crate::widgets::button::btn_secondary;
+use crate::widgets::field::filter_box;
+use crate::widgets::loading::spinner;
 
 use vmiscope_core::SearchHit;
 
@@ -94,12 +97,12 @@ impl VmiScopeApp {
         .show(ui, |ui| {
             let mut build = false;
             ui.horizontal(|ui| {
-                if ui.button("Build index").clicked() {
+                if btn_secondary(ui, "Build index").clicked() {
                     build = true;
                 }
                 ui.checkbox(&mut self.search_methods, "methods");
                 if self.search_loading {
-                    ui.spinner();
+                    spinner(ui, "indexing");
                 }
             });
             if build {
@@ -115,11 +118,10 @@ impl VmiScopeApp {
                     ui.weak(format!("{n} classes indexed"));
                 }
             }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.search_text)
-                    .hint_text("search names")
-                    .desired_width(f32::INFINITY),
-            );
+            // Full-bleed, as it was: a kit input otherwise takes egui's 280pt
+            // `spacing.text_edit_width` and leaves the panel half empty.
+            ui.spacing_mut().text_edit_width = ui.available_width();
+            filter_box(ui, &mut self.search_text, "search names");
             let q = self.search_text.trim().to_lowercase();
             if q.len() < 2 {
                 ui.weak("type at least 2 characters");

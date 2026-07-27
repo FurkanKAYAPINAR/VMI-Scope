@@ -9,12 +9,17 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use eframe::egui;
-use egui::Color32;
 
 use crate::config::Config;
 use crate::state::ids::PendingKind;
 use crate::theme::icons;
+use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, SURFACE};
 use crate::views::network::NET_REFRESH_SECS;
+use crate::widgets::button::{btn_primary, btn_secondary, focus_ring};
+use crate::widgets::chip::dot_chip;
+use crate::widgets::field::mono_input;
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::{hrule, vrule};
 
 use vmiscope_core::{
     ClassSchema, Connection, Credential, EventMonitor, MethodOutcome, MethodTarget, MonitorMsg,
@@ -25,6 +30,12 @@ use vmiscope_core::{
 pub(crate) const ROOT_NAMESPACE: &str = "root";
 pub(crate) const DEFAULT_NAMESPACE: &str = "root\\CIMV2";
 const DEFAULT_QUERY: &str = "SELECT * FROM Win32_OperatingSystem";
+
+/// Widths of the connection bar's fields. The kit's inputs fill whatever they
+/// are handed, and a host box the width of the window would swamp the row.
+const HOST_W: f32 = 160.0;
+const CRED_W: f32 = 90.0;
+const DOMAIN_W: f32 = 80.0;
 
 /// The top-level tools.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -276,11 +287,16 @@ impl VmiScopeApp {
     fn ui_connection_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Host:");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.conn_host)
-                    .hint_text("local (blank) or remote hostname / IP")
-                    .desired_width(160.0),
-            );
+            let resp = ui
+                .scope(|ui| {
+                    ui.set_max_width(HOST_W);
+                    mono_input(
+                        ui,
+                        &mut self.conn_host,
+                        "local (blank) or remote hostname / IP",
+                    )
+                })
+                .inner;
             // No icon in the tooltip: `on_hover_text` takes a plain string, so
             // there is nowhere to name the icon family and the glyph would
             // render in whatever font answered its codepoint.
@@ -290,25 +306,30 @@ impl VmiScopeApp {
                  unverified against a live remote host. Browse/query/network/providers only.",
                 );
             if self.conn_use_creds {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.conn_user)
-                        .hint_text("user")
-                        .desired_width(90.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.conn_pass)
-                        .password(true)
-                        .hint_text("password")
-                        .desired_width(90.0),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.conn_domain)
-                        .hint_text("domain")
-                        .desired_width(80.0),
-                );
+                ui.scope(|ui| {
+                    ui.set_max_width(CRED_W);
+                    mono_input(ui, &mut self.conn_user, "user");
+                });
+                // Hand-rolled rather than `mono_input`: the kit's field has no
+                // password mode, and a masked field is the one place where the
+                // difference matters. Everything else about it is the kit's.
+                ui.scope(|ui| {
+                    ui.set_max_width(CRED_W);
+                    let pass = ui.add(
+                        egui::TextEdit::singleline(&mut self.conn_pass)
+                            .password(true)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text(egui::RichText::new("password").color(muted(38)))
+                            .background_color(SURFACE),
+                    );
+                    focus_ring(ui, &pass);
+                });
+                ui.scope(|ui| {
+                    ui.set_max_width(DOMAIN_W);
+                    mono_input(ui, &mut self.conn_domain, "domain");
+                });
             }
-            let go = ui
-                .button(icons::labelled(ui, icons::PLUGS_CONNECTED, "Connect"))
+            let go = btn_primary(ui, icons::labelled(ui, icons::PLUGS_CONNECTED, "Connect"))
                 .clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
@@ -330,14 +351,17 @@ impl VmiScopeApp {
                 };
                 self.apply_host(host, cred);
             }
-            ui.separator();
+            vrule(ui, DIVIDER);
             match &self.conn_status {
+                // The dot was already the shape here, drawn as a text glyph;
+                // `dot_chip` is the same thing with the design's metrics. Local
+                // is neutral rather than OK: it is the resting state, not an
+                // achievement.
                 ConnStatus::Local => {
-                    ui.weak("\u{25cf} local machine");
+                    dot_chip(ui, NEUTRAL[4], "local machine");
                 }
                 ConnStatus::Connecting => {
-                    ui.spinner();
-                    ui.weak("connecting\u{2026}");
+                    spinner(ui, "connecting\u{2026}");
                 }
                 ConnStatus::Remote(h) => {
                     let mode = if self.conn_use_creds {
@@ -345,10 +369,7 @@ impl VmiScopeApp {
                     } else {
                         "current user"
                     };
-                    ui.colored_label(
-                        Color32::from_rgb(120, 210, 140),
-                        format!("\u{25cf} {h} ({mode})"),
-                    );
+                    dot_chip(ui, OK, &format!("{h} ({mode})"));
                 }
                 ConnStatus::Failed(e) => {
                     ui.label(icons::labelled_styled(
@@ -356,7 +377,7 @@ impl VmiScopeApp {
                         icons::X,
                         e.lines().next().unwrap_or("failed"),
                         egui::TextStyle::Body,
-                        Color32::from_rgb(240, 120, 120),
+                        BAD,
                     ));
                 }
             }
@@ -375,7 +396,7 @@ impl VmiScopeApp {
                     icons::WARNING,
                     "error",
                     egui::TextStyle::Body,
-                    egui::Color32::from_rgb(240, 90, 90),
+                    BAD,
                 ));
                 ui.weak("\u{2014}");
                 ui.label(err.replace('\n', "  \u{2014}  "));
@@ -388,10 +409,7 @@ impl VmiScopeApp {
             }
             if !self.error_log.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(format!("Log ({})", self.error_log.len()))
-                        .clicked()
-                    {
+                    if btn_secondary(ui, format!("Log ({})", self.error_log.len())).clicked() {
                         self.error_log_open = !self.error_log_open;
                     }
                 });
@@ -448,7 +466,7 @@ impl eframe::App for VmiScopeApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("VMI-Scope");
-                ui.separator();
+                vrule(ui, DIVIDER);
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Explorer,
@@ -477,7 +495,7 @@ impl eframe::App for VmiScopeApp {
                 // No light/dark switch: Nocturne is a dark design, and the
                 // light variant would be stock egui wearing our accent.
             });
-            ui.separator();
+            hrule(ui);
             self.ui_connection_bar(ui);
             ui.add_space(4.0);
         });

@@ -3,7 +3,9 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
-use crate::theme::icons;
+use crate::widgets::field::filter_box;
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::hrule;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -11,22 +13,21 @@ impl VmiScopeApp {
     // ------------------------------------------------------------------
 
     pub(crate) fn ui_class_list(&mut self, ui: &mut egui::Ui) {
+        // The filter spans the panel, whatever the user has dragged it to.
+        // `spacing.text_edit_width` is where a kit input takes its width from,
+        // and egui's default of 280 would leave a widened panel half empty.
+        ui.spacing_mut().text_edit_width = ui.available_width();
         ui.horizontal(|ui| {
             ui.strong("Classes");
             if self.classes_loading {
-                ui.spinner();
+                spinner(ui, "listing");
             }
             ui.weak(format!("({})", self.classes.len()));
         });
-        ui.horizontal(|ui| {
-            ui.label(icons::glyph(icons::MAGNIFYING_GLASS));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.class_filter)
-                    .hint_text("filter classes")
-                    .desired_width(f32::INFINITY),
-            );
-        });
-        ui.separator();
+        // The magnifier is a prefix atom inside the field now, so the label that
+        // used to sit beside it is gone with it.
+        filter_box(ui, &mut self.class_filter, "filter classes");
+        hrule(ui);
 
         let mut clicked: Option<String> = None;
         {

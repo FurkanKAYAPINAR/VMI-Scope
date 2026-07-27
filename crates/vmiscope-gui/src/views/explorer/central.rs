@@ -2,12 +2,26 @@
 //! script generator that mirrors the current query.
 
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 
 use crate::app::{CentralView, ScriptLang, VmiScopeApp};
 use crate::theme::icons;
-use crate::util::{generate_script, save_file, smart_cmp, toggle_sort};
-use crate::widgets::table::sortable_header;
+use crate::theme::tokens::DIVIDER;
+use crate::util::{generate_script, save_file};
+use crate::widgets::button::{btn_primary, btn_secondary, focus_ring, segmented};
+use crate::widgets::codeview::{code_panel, Lang};
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::{hrule, vrule};
+use crate::widgets::table::{DataTable, DataTableState, TableColumn};
+
+/// Starting width of a result column. Every column of a WQL result is the same
+/// unknown shape, so they all start equal and the user drags from there.
+const COL_W: f32 = 150.0;
+/// Never shrink a result column below this -- past it the header text is gone
+/// and the column stops being identifiable.
+const COL_MIN: f32 = 48.0;
+/// Height of the generated-script panel. The generator is a reference, not the
+/// thing being worked on, so it gets a fixed slice rather than the pane.
+const SCRIPT_H: f32 = 150.0;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -31,10 +45,9 @@ impl VmiScopeApp {
                 icons::labelled(ui, icons::CUBE, "Schema"),
             );
             if let Some(c) = self.selected_class.clone() {
-                ui.separator();
+                vrule(ui, DIVIDER);
                 ui.weak(&c);
-                if ui
-                    .button(icons::labelled(ui, icons::FILE_TEXT, "MOF"))
+                if btn_secondary(ui, icons::labelled(ui, icons::FILE_TEXT, "MOF"))
                     .on_hover_text("Show MOF text")
                     .clicked()
                 {
@@ -71,7 +84,7 @@ impl VmiScopeApp {
                 self.request_schema(c);
             }
         }
-        ui.separator();
+        hrule(ui);
 
         if self.central_view == CentralView::Schema {
             self.ui_schema(ui);
@@ -83,21 +96,25 @@ impl VmiScopeApp {
             ui.strong("WQL");
             ui.weak(&self.active_ns);
             if self.query_loading {
-                ui.spinner();
+                spinner(ui, "querying");
             }
         });
         let run_shortcut = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
-        ui.add(
+        // The WQL editor stays a hand-rolled `TextEdit`: it is the one multiline
+        // input in the app, and `widgets::field` only covers the single-line
+        // shapes. The focus ring has to be called explicitly for the same
+        // reason -- nothing in egui paints one, and the kit only does it for the
+        // controls it owns.
+        let editor = ui.add(
             egui::TextEdit::multiline(&mut self.query_text)
                 .desired_rows(2)
                 .desired_width(f32::INFINITY)
                 .code_editor()
                 .hint_text("SELECT * FROM Win32_Process"),
         );
+        focus_ring(ui, &editor);
         ui.horizontal(|ui| {
-            if ui
-                .button(icons::labelled(ui, icons::PLAY, "Run  (Ctrl+Enter)"))
-                .clicked()
+            if btn_primary(ui, icons::labelled(ui, icons::PLAY, "Run  (Ctrl+Enter)")).clicked()
                 || run_shortcut
             {
                 self.run_query();
@@ -109,16 +126,14 @@ impl VmiScopeApp {
                     result.columns.len()
                 ));
                 if !result.rows.is_empty() {
-                    ui.separator();
-                    if ui
-                        .button(icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "CSV"))
+                    vrule(ui, DIVIDER);
+                    if btn_secondary(ui, icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "CSV"))
                         .on_hover_text("Export results as CSV")
                         .clicked()
                     {
                         save_file("query.csv", &vmiscope_core::export::query_to_csv(result));
                     }
-                    if ui
-                        .button(icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "JSON"))
+                    if btn_secondary(ui, icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "JSON"))
                         .on_hover_text("Export results as JSON")
                         .clicked()
                     {
@@ -131,6 +146,9 @@ impl VmiScopeApp {
         // Query history + saved queries.
         ui.horizontal(|ui| {
             let history = self.config.history.clone();
+            // `widgets::field::combo` takes a fixed `&[(T, &str)]`; these two
+            // are lists of strings that run a query when picked, so they stay
+            // hand-rolled.
             egui::ComboBox::from_id_salt("query-history")
                 .selected_text(icons::labelled(
                     ui,
@@ -163,93 +181,51 @@ impl VmiScopeApp {
                         }
                     });
             }
-            if ui
-                .button(icons::labelled(ui, icons::STAR, "Save\u{2026}"))
-                .clicked()
-            {
+            if btn_secondary(ui, icons::labelled(ui, icons::STAR, "Save\u{2026}")).clicked() {
                 self.save_query_name.clear();
                 self.save_query_open = true;
             }
         });
 
         self.ui_script_gen(ui);
-        ui.separator();
+        hrule(ui);
 
-        // Results table (virtualized, sortable by clicking a header).
-        let selected_row = self.selected_row;
-        let sort = self.result_sort;
-        let mut newly_clicked: Option<usize> = None;
-        let mut header_clicked: Option<usize> = None;
+        // Results table. The selection and the sort live on the app so they
+        // survive a tab switch; the table gets them on loan for the frame.
+        let mut table = DataTableState {
+            sort: self.result_sort,
+            selected: self.selected_row,
+        };
         if let Some(result) = self.result.as_ref() {
             if result.columns.is_empty() {
                 ui.weak("Query returned no columns.");
             } else {
-                // Row display order for the active sort column.
-                let mut order: Vec<usize> = (0..result.rows.len()).collect();
-                if let Some((ci, asc)) = sort {
-                    order.sort_by(|&a, &b| {
-                        let av = result.rows[a].get(ci).map(String::as_str).unwrap_or("");
-                        let bv = result.rows[b].get(ci).map(String::as_str).unwrap_or("");
-                        let o = smart_cmp(av, bv);
-                        if asc {
-                            o
-                        } else {
-                            o.reverse()
-                        }
-                    });
-                }
-
-                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+                let rows = &result.rows;
                 let ncols = result.columns.len();
-                let mut table = TableBuilder::new(ui)
-                    .id_salt("results-table")
-                    .striped(true)
-                    .resizable(true)
-                    .sense(egui::Sense::click())
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .min_scrolled_height(0.0);
-                for _ in 0..ncols {
-                    table = table.column(
-                        Column::initial(150.0)
-                            .at_least(48.0)
-                            .clip(true)
-                            .resizable(true),
-                    );
-                }
-                table
-                    .header(22.0, |mut header| {
-                        for (ci, col) in result.columns.iter().enumerate() {
-                            header.col(|ui| {
-                                if sortable_header(ui, col, ci, sort) {
-                                    header_clicked = Some(ci);
-                                }
-                            });
+                DataTable::new("results-table")
+                    .columns(
+                        result
+                            .columns
+                            .iter()
+                            .map(|c| TableColumn::initial(c.as_str(), COL_W).at_least(COL_MIN)),
+                    )
+                    .selectable(true)
+                    .sort_key(|row, col| rows[row].get(col).cloned().unwrap_or_default())
+                    .show(ui, &mut table, rows.len(), |row| {
+                        let cells = &rows[row.data_index()];
+                        // Driven by the column count, not by the row's own
+                        // length: a short row leaves blanks rather than
+                        // shifting every cell after it one column left.
+                        for col in 0..ncols {
+                            row.text(cells.get(col).map(String::as_str).unwrap_or(""));
                         }
-                    })
-                    .body(|body| {
-                        body.rows(row_h, order.len(), |mut row| {
-                            let actual = order[row.index()];
-                            row.set_selected(selected_row == Some(actual));
-                            for cell in &result.rows[actual] {
-                                row.col(|ui| {
-                                    ui.label(cell);
-                                });
-                            }
-                            if row.response().clicked() {
-                                newly_clicked = Some(actual);
-                            }
-                        });
                     });
             }
         } else {
             ui.weak("Run a query to see results.");
         }
-        if let Some(ci) = header_clicked {
-            toggle_sort(&mut self.result_sort, ci);
-        }
-        if let Some(ri) = newly_clicked {
-            self.selected_row = Some(ri);
-        }
+        self.result_sort = table.sort;
+        self.selected_row = table.selected;
     }
 
     /// Collapsible PowerShell / VBScript generator for the current query.
@@ -257,30 +233,32 @@ impl VmiScopeApp {
         let script_header =
             icons::labelled(ui, icons::CODE, "Generate script (PowerShell / VBScript)");
         ui.collapsing(script_header, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.script_lang, ScriptLang::PowerShell, "PowerShell");
-                ui.selectable_value(&mut self.script_lang, ScriptLang::VbScript, "VBScript");
-            });
+            segmented(
+                ui,
+                &mut self.script_lang,
+                &[
+                    (ScriptLang::PowerShell, "PowerShell"),
+                    (ScriptLang::VbScript, "VBScript"),
+                ],
+            );
             let script = generate_script(self.script_lang, &self.active_ns, &self.query_text);
             ui.horizontal(|ui| {
-                if ui
-                    .button(icons::labelled(ui, icons::COPY, "Copy"))
-                    .clicked()
-                {
+                if btn_secondary(ui, icons::labelled(ui, icons::COPY, "Copy")).clicked() {
                     ui.ctx().copy_text(script.clone());
                 }
                 ui.weak("PowerShell: paste & run \u{00b7} VBScript: cscript file.vbs");
             });
-            egui::ScrollArea::vertical()
-                .id_salt("script-box")
-                .max_height(150.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(script.as_str()).monospace())
-                            .selectable(true),
-                    );
-                });
+            let lang = match self.script_lang {
+                ScriptLang::PowerShell => Lang::PowerShell,
+                ScriptLang::VbScript => Lang::VbScript,
+            };
+            // `code_panel` scrolls itself and grows to its content, so the cap
+            // goes on the space it is handed rather than on a second, nested
+            // `ScrollArea`.
+            ui.scope(|ui| {
+                ui.set_max_height(SCRIPT_H);
+                code_panel(ui, &script, lang);
+            });
         });
     }
 }

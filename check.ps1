@@ -30,16 +30,14 @@ if (-not $SkipCargo) {
 # every one of them is something that builds fine and quietly breaks the look,
 # which is exactly the class of mistake a reskin invites.
 #
-# They are ADVISORY until the Phase 1 reskin lands, because the pre-Nocturne
-# code violates most of them by construction and a gate that always fails is a
-# gate everyone learns to ignore. The counts below are the Phase 0 baseline:
-# each one must reach zero during Phase 1, at which point flip $EnforceInvariants
-# to $true (task 1.33) and the numbers stop being a target and start being a
-# floor.
+# They were ADVISORY for the length of the Phase 1 reskin, because the
+# pre-Nocturne code violated most of them by construction and a gate that always
+# fails is a gate everyone learns to ignore. Every count reached zero with task
+# 1.31, so as of 1.33 they are ENFORCED: one hit is a failure, and the shrinking
+# baseline that used to live here is gone with the thing it was measuring.
 # ---------------------------------------------------------------------------
 
-$EnforceInvariants = $false
-$Baseline = @{ I1 = 29; I2 = 27; I3 = 3; I4 = 0; I5 = 0; I6 = 0 }
+$EnforceInvariants = $true
 
 $gui = 'crates/vmiscope-gui/src'
 
@@ -66,17 +64,12 @@ function Forbid($id, $pattern, $why, $paths, $allow = $null) {
         return
     }
 
-    # Advisory mode: silent while shrinking, loud if it grows.
-    $was = $script:Baseline[$id]
-    if ($n -gt $was) {
-        Write-Host "==> $id REGRESSED -- $n occurrences, was $was ($why)" -ForegroundColor Red
-        $hits | ForEach-Object {
-            Write-Host ("    {0}:{1}: {2}" -f (Resolve-Path -Relative $_.Path), $_.LineNumber, $_.Line.Trim())
-        }
-        $script:failed += "$id (regression)"
-    } else {
-        $note = if ($n -lt $was) { "down from $was" } else { "at baseline" }
-        Write-Host "==> $id advisory -- $n left, $note" -ForegroundColor Yellow
+    # The advisory path is kept for a future rule that lands against existing
+    # violations: a new invariant can be introduced non-blocking, driven to zero,
+    # and then enforced with the rest, without anyone having to rebuild this.
+    Write-Host "==> $id advisory -- $n left ($why)" -ForegroundColor Yellow
+    $hits | ForEach-Object {
+        Write-Host ("    {0}:{1}: {2}" -f (Resolve-Path -Relative $_.Path), $_.LineNumber, $_.Line.Trim())
     }
 }
 

@@ -3,6 +3,8 @@
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
+use crate::widgets::button::btn_secondary;
+use crate::widgets::rule::hrule;
 
 impl VmiScopeApp {
     pub(crate) fn ui_error_log_window(&mut self, ctx: &egui::Context) {
@@ -15,16 +17,16 @@ impl VmiScopeApp {
             .open(&mut open)
             .default_size([560.0, 300.0])
             .show(ctx, |ui| {
-                if ui.button("Clear").clicked() {
+                if btn_secondary(ui, "Clear").clicked() {
                     clear = true;
                 }
-                ui.separator();
+                hrule(ui);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for e in &self.error_log {
                             ui.label(egui::RichText::new(e).monospace());
-                            ui.separator();
+                            hrule(ui);
                         }
                     });
             });

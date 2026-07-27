@@ -8,8 +8,10 @@
 
 #![allow(dead_code)] // The views adopt the kit in the next commit.
 
+use eframe::egui::text::LayoutJob;
 use eframe::egui::{
-    Color32, Frame, Label, Margin, RichText, ScrollArea, Stroke, TextStyle, Ui, Vec2,
+    Color32, FontId, Frame, Label, Margin, RichText, ScrollArea, Stroke, TextFormat, TextStyle, Ui,
+    Vec2,
 };
 
 use crate::theme::tokens::{a300, muted, DIVIDER, NEUTRAL, OK, R_MD, S2, S3, SURFACE, WARN};
@@ -294,6 +296,29 @@ fn classify_word(word: &str, lang: Lang) -> Role {
     Role::Plain
 }
 
+/// One line as a single laid-out run, with a section per coloured span.
+///
+/// It has to be one `LayoutJob` rather than a `Label` per span: egui inserts
+/// `item_spacing.x` between widgets, so a span-per-label row renders
+/// `SELECT * FROM x` as `SELECT  *  FROM  x` and destroys the one property a
+/// monospace panel exists for. It is also one galley per line instead of one
+/// per token.
+fn line_job(font: &FontId, line: &str, lang: Lang, ramp: &[Color32; 9]) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    for span in tint_line(line, lang) {
+        job.append(
+            &span.text,
+            0.0,
+            TextFormat {
+                font_id: font.clone(),
+                color: span.role.color(ramp),
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 /// Render `code` in a surface panel with a line-number gutter.
 pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang) {
     let ramp = accent_ramp(ui);
@@ -331,17 +356,11 @@ pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang) {
                                     },
                                 );
                             });
-                            for span in tint_line(line, lang) {
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(span.text)
-                                            .text_style(TextStyle::Monospace)
-                                            .color(span.role.color(ramp)),
-                                    )
+                            ui.add(
+                                Label::new(line_job(&font, line, lang, ramp))
                                     .selectable(true)
                                     .wrap_mode(eframe::egui::TextWrapMode::Extend),
-                                );
-                            }
+                            );
                         });
                     }
                 });

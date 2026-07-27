@@ -4,6 +4,13 @@ use eframe::egui;
 
 use crate::app::{VmiScopeApp, ROOT_NAMESPACE};
 use crate::theme::icons;
+use crate::widgets::button::btn_icon;
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::hrule;
+
+/// Horizontal step per tree level. Not on the density scale: the indent is what
+/// makes the hierarchy readable, and a tighter density should not flatten it.
+const INDENT: f32 = 14.0;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -14,10 +21,10 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             ui.strong("Namespaces");
             if self.ns_loading.contains(ROOT_NAMESPACE) {
-                ui.spinner();
+                spinner(ui, "loading");
             }
         });
-        ui.separator();
+        hrule(ui);
         egui::ScrollArea::vertical()
             .id_salt("ns-tree")
             .max_height(ui.available_height() * 0.45)
@@ -32,14 +39,13 @@ impl VmiScopeApp {
         let leaf = path.rsplit('\\').next().unwrap_or(&path).to_string();
 
         ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 14.0);
+            ui.add_space(depth as f32 * INDENT);
             let arrow = if expanded {
                 icons::CARET_DOWN
             } else {
                 icons::CARET_RIGHT
             };
-            if ui
-                .add(egui::Button::new(icons::glyph(arrow)).frame(false))
+            if btn_icon(ui, arrow)
                 .on_hover_text("Expand / collapse")
                 .clicked()
             {
@@ -62,9 +68,8 @@ impl VmiScopeApp {
                 }
                 None => {
                     ui.horizontal(|ui| {
-                        ui.add_space((depth as f32 + 1.0) * 14.0);
-                        ui.spinner();
-                        ui.weak("loading\u{2026}");
+                        ui.add_space((depth as f32 + 1.0) * INDENT);
+                        spinner(ui, "loading\u{2026}");
                     });
                 }
             }

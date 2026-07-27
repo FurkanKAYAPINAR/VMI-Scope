@@ -137,11 +137,6 @@ pub(crate) fn smart_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Cycle a column's sort: unsorted → ascending → descending → unsorted.
-pub(crate) fn toggle_sort(current: &mut Option<(usize, bool)>, col: usize) {
-    *current = match *current {
-        Some((c, true)) if c == col => Some((col, false)),
-        Some((c, false)) if c == col => None,
-        _ => Some((col, true)),
-    };
-}
+// `toggle_sort` lived here until the Explorer's results grid -- the last
+// hand-rolled `TableBuilder` -- moved onto `DataTable`, which owns the
+// tri-state cycle itself as `widgets::table::cycle_sort`.

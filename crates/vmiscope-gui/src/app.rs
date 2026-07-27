@@ -281,12 +281,14 @@ impl VmiScopeApp {
                     .hint_text("local (blank) or remote hostname / IP")
                     .desired_width(160.0),
             );
+            // No icon in the tooltip: `on_hover_text` takes a plain string, so
+            // there is nowhere to name the icon family and the glyph would
+            // render in whatever font answered its codepoint.
             ui.checkbox(&mut self.conn_use_creds, "alt creds")
-                .on_hover_text(format!(
-                    "Alternate credentials for a remote host (raw DCOM).\n{} Experimental — \
+                .on_hover_text(
+                    "Alternate credentials for a remote host (raw DCOM).\nExperimental — \
                  unverified against a live remote host. Browse/query/network/providers only.",
-                    icons::WARNING,
-                ));
+                );
             if self.conn_use_creds {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.conn_user)
@@ -306,7 +308,7 @@ impl VmiScopeApp {
                 );
             }
             let go = ui
-                .button(format!("{} Connect", icons::PLUGS_CONNECTED))
+                .button(icons::labelled(ui, icons::PLUGS_CONNECTED, "Connect"))
                 .clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if go {
@@ -349,10 +351,13 @@ impl VmiScopeApp {
                     );
                 }
                 ConnStatus::Failed(e) => {
-                    ui.colored_label(
+                    ui.label(icons::labelled_styled(
+                        ui,
+                        icons::X,
+                        e.lines().next().unwrap_or("failed"),
+                        egui::TextStyle::Body,
                         Color32::from_rgb(240, 120, 120),
-                        format!("{} {}", icons::X, e.lines().next().unwrap_or("failed")),
-                    );
+                    ));
                 }
             }
         });
@@ -365,10 +370,13 @@ impl VmiScopeApp {
     fn ui_status(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(err) = &self.error {
-                ui.colored_label(
+                ui.label(icons::labelled_styled(
+                    ui,
+                    icons::WARNING,
+                    "error",
+                    egui::TextStyle::Body,
                     egui::Color32::from_rgb(240, 90, 90),
-                    format!("{} error", icons::WARNING),
-                );
+                ));
                 ui.weak("\u{2014}");
                 ui.label(err.replace('\n', "  \u{2014}  "));
             } else {
@@ -444,27 +452,27 @@ impl eframe::App for VmiScopeApp {
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Explorer,
-                    format!("{} Explorer", icons::TREE_STRUCTURE),
+                    icons::labelled(ui, icons::TREE_STRUCTURE, "Explorer"),
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Network,
-                    format!("{} Network", icons::GLOBE_HEMISPHERE_WEST),
+                    icons::labelled(ui, icons::GLOBE_HEMISPHERE_WEST, "Network"),
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Persistence,
-                    format!("{} Persistence", icons::SHIELD_WARNING),
+                    icons::labelled(ui, icons::SHIELD_WARNING, "Persistence"),
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Providers,
-                    format!("{} Providers", icons::PLUGS_CONNECTED),
+                    icons::labelled(ui, icons::PLUGS_CONNECTED, "Providers"),
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
                     Tab::Events,
-                    format!("{} Events", icons::BROADCAST),
+                    icons::labelled(ui, icons::BROADCAST, "Events"),
                 );
                 // No light/dark switch: Nocturne is a dark design, and the
                 // light variant would be stock egui wearing our accent.

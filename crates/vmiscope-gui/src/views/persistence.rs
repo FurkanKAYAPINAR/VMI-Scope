@@ -1,16 +1,22 @@
 //! The Persistence tab: the WMI event-subscription hunter and its baseline diff.
 
 use eframe::egui;
-use egui::Color32;
-use egui_extras::{Column, TableBuilder};
 
 use crate::app::VmiScopeApp;
 use crate::theme::icons;
-use crate::theme::tokens::risk_color;
-use crate::util::{save_file, smart_cmp, sub_col_value, toggle_sort};
-use crate::widgets::table::sortable_header;
+use crate::theme::tokens::{muted, risk_color, BAD, DIVIDER, WARN};
+use crate::util::{save_file, sub_col_value};
+use crate::widgets::button::{btn_ghost, btn_primary, btn_secondary};
+use crate::widgets::chip::dot_chip;
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::{hrule, vrule};
+use crate::widgets::table::{DataTable, DataTableState, TableColumn};
 
 use vmiscope_core::{diff_subscriptions, Risk};
+
+/// Strength of the muted diff text -- removed rows are context, not a finding:
+/// persistence that took itself away is not what anyone is hunting for.
+const DIM: u8 = 55;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -39,18 +45,14 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             ui.strong("WMI event subscriptions");
             if self.events_loading {
-                ui.spinner();
+                spinner(ui, "scanning");
             }
-            if ui
-                .button(format!("{} Refresh", icons::ARROWS_CLOCKWISE))
-                .clicked()
-            {
+            if btn_primary(ui, icons::labelled(ui, icons::ARROWS_CLOCKWISE, "Refresh")).clicked() {
                 self.request_events();
             }
             if let Some(report) = self.events_report.as_ref() {
                 if !report.subscriptions.is_empty() {
-                    if ui
-                        .button(format!("{} CSV", icons::DOWNLOAD_SIMPLE))
+                    if btn_secondary(ui, icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "CSV"))
                         .clicked()
                     {
                         save_file(
@@ -58,8 +60,7 @@ impl VmiScopeApp {
                             &vmiscope_core::export::subscriptions_to_csv(report),
                         );
                     }
-                    if ui
-                        .button(format!("{} JSON", icons::DOWNLOAD_SIMPLE))
+                    if btn_secondary(ui, icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "JSON"))
                         .clicked()
                     {
                         save_file(
@@ -67,8 +68,7 @@ impl VmiScopeApp {
                             &vmiscope_core::export::subscriptions_to_json(report),
                         );
                     }
-                    if ui
-                        .button(format!("{} HTML", icons::DOWNLOAD_SIMPLE))
+                    if btn_secondary(ui, icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "HTML"))
                         .clicked()
                     {
                         save_file(
@@ -76,9 +76,8 @@ impl VmiScopeApp {
                             &vmiscope_core::export::subscriptions_to_html(report),
                         );
                     }
-                    ui.separator();
-                    if ui
-                        .button(format!("{} Snapshot", icons::FLOPPY_DISK))
+                    vrule(ui, DIVIDER);
+                    if btn_secondary(ui, icons::labelled(ui, icons::FLOPPY_DISK, "Snapshot"))
                         .on_hover_text("Save a baseline")
                         .clicked()
                     {
@@ -89,14 +88,14 @@ impl VmiScopeApp {
                     }
                 }
             }
-            if ui
-                .button(format!("{} Baseline", icons::FOLDER_OPEN))
+            if btn_secondary(ui, icons::labelled(ui, icons::FOLDER_OPEN, "Baseline"))
                 .on_hover_text("Load a snapshot to diff against")
                 .clicked()
             {
                 load_baseline = true;
             }
-            if self.events_baseline.is_some() && ui.button(format!("{} clear", icons::X)).clicked()
+            if self.events_baseline.is_some()
+                && btn_ghost(ui, icons::labelled(ui, icons::X, "clear")).clicked()
             {
                 clear_baseline = true;
             }
@@ -110,18 +109,18 @@ impl VmiScopeApp {
 
         if let Some(report) = self.events_report.as_ref() {
             ui.horizontal(|ui| {
-                ui.colored_label(
-                    risk_color(Risk::High),
-                    format!("\u{25cf} {} high", report.count(Risk::High)),
-                );
-                ui.colored_label(
-                    risk_color(Risk::Medium),
-                    format!("\u{25cf} {} medium", report.count(Risk::Medium)),
-                );
-                ui.colored_label(
-                    risk_color(Risk::Low),
-                    format!("\u{25cf} {} low", report.count(Risk::Low)),
-                );
+                let counts = [
+                    (Risk::High, "high"),
+                    (Risk::Medium, "medium"),
+                    (Risk::Low, "low"),
+                ];
+                for (risk, label) in counts {
+                    dot_chip(
+                        ui,
+                        risk_color(risk),
+                        &format!("{} {label}", report.count(risk)),
+                    );
+                }
             });
         }
 
@@ -132,15 +131,9 @@ impl VmiScopeApp {
             let d = diff_subscriptions(base, &report.subscriptions);
             ui.horizontal(|ui| {
                 ui.strong("vs baseline:");
-                ui.colored_label(
-                    Color32::from_rgb(240, 100, 100),
-                    format!("+{} new", d.added.len()),
-                );
-                ui.colored_label(
-                    Color32::from_rgb(225, 185, 90),
-                    format!("~{} changed", d.changed.len()),
-                );
-                ui.weak(format!("-{} removed", d.removed.len()));
+                dot_chip(ui, BAD, &format!("+{} new", d.added.len()));
+                dot_chip(ui, WARN, &format!("~{} changed", d.changed.len()));
+                dot_chip(ui, muted(DIM), &format!("-{} removed", d.removed.len()));
                 ui.weak(format!("\u{00b7} {} unchanged", d.unchanged));
             });
             if !d.is_empty() {
@@ -149,13 +142,9 @@ impl VmiScopeApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         let sections = [
-                            ("New", &d.added, Color32::from_rgb(240, 100, 100)),
-                            ("Changed", &d.changed, Color32::from_rgb(225, 185, 90)),
-                            (
-                                "Removed (was in baseline)",
-                                &d.removed,
-                                Color32::from_gray(150),
-                            ),
+                            ("New", &d.added, BAD),
+                            ("Changed", &d.changed, WARN),
+                            ("Removed (was in baseline)", &d.removed, muted(DIM)),
                         ];
                         for (title, list, color) in sections {
                             if list.is_empty() {
@@ -172,104 +161,59 @@ impl VmiScopeApp {
                     });
             }
         }
-        ui.separator();
+        hrule(ui);
 
-        let sort = self.events_sort;
-        let mut header_clicked: Option<usize> = None;
+        // The sort lives on the app so it survives a tab switch; the table gets
+        // it on loan for the frame.
+        let mut table = DataTableState {
+            sort: self.events_sort,
+            selected: None,
+        };
 
         if let Some(report) = self.events_report.as_ref() {
-            if report.subscriptions.is_empty() {
+            let subs = &report.subscriptions;
+            if subs.is_empty() {
                 ui.weak("No permanent event subscriptions found.");
             } else {
-                let mut order: Vec<usize> = (0..report.subscriptions.len()).collect();
-                if let Some((ci, asc)) = sort {
-                    order.sort_by(|&a, &b| {
-                        let o = smart_cmp(
-                            &sub_col_value(&report.subscriptions[a], ci),
-                            &sub_col_value(&report.subscriptions[b], ci),
-                        );
-                        if asc {
-                            o
+                DataTable::new("events-table")
+                    .columns([
+                        TableColumn::initial("Risk", 64.0).at_least(48.0),
+                        TableColumn::initial("Consumer type", 168.0).at_least(48.0),
+                        TableColumn::initial("Consumer", 150.0).at_least(48.0),
+                        TableColumn::initial("Filter", 150.0).at_least(48.0),
+                        TableColumn::initial("Action / query", 260.0).at_least(48.0),
+                        TableColumn::initial("Why", 220.0).at_least(48.0),
+                    ])
+                    .sort_key(|row, col| sub_col_value(&subs[row], col))
+                    .show(ui, &mut table, subs.len(), |row| {
+                        let s = &subs[row.data_index()];
+                        let color = risk_color(s.risk);
+
+                        row.colored(s.risk.as_str(), color);
+                        row.text(s.consumer_type.as_str());
+                        row.text(s.consumer_name.as_str());
+                        row.text(s.filter_name.as_str());
+
+                        let action = if s.action.is_empty() {
+                            s.filter_query.as_str()
                         } else {
-                            o.reverse()
-                        }
-                    });
-                }
+                            s.action.as_str()
+                        };
+                        // The tooltip carries both halves, because the cell only
+                        // ever shows whichever one is populated.
+                        row.text(action).on_hover_text(format!(
+                            "filter query:\n{}\n\naction:\n{}",
+                            s.filter_query, s.action
+                        ));
 
-                let headers = [
-                    "Risk",
-                    "Consumer type",
-                    "Consumer",
-                    "Filter",
-                    "Action / query",
-                    "Why",
-                ];
-                let widths = [64.0, 168.0, 150.0, 150.0, 260.0, 220.0];
-                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-
-                let mut table = TableBuilder::new(ui)
-                    .id_salt("events-table")
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .min_scrolled_height(0.0);
-                for w in widths {
-                    table =
-                        table.column(Column::initial(w).at_least(48.0).clip(true).resizable(true));
-                }
-                table
-                    .header(22.0, |mut header| {
-                        for (ci, h) in headers.iter().enumerate() {
-                            header.col(|ui| {
-                                if sortable_header(ui, h, ci, sort) {
-                                    header_clicked = Some(ci);
-                                }
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(row_h, order.len(), |mut row| {
-                            let s = &report.subscriptions[order[row.index()]];
-                            let color = risk_color(s.risk);
-                            row.col(|ui| {
-                                ui.label(
-                                    egui::RichText::new(s.risk.as_str()).color(color).strong(),
-                                );
-                            });
-                            row.col(|ui| {
-                                ui.label(s.consumer_type.as_str());
-                            });
-                            row.col(|ui| {
-                                ui.label(s.consumer_name.as_str());
-                            });
-                            row.col(|ui| {
-                                ui.label(s.filter_name.as_str());
-                            });
-                            row.col(|ui| {
-                                let text = if s.action.is_empty() {
-                                    s.filter_query.as_str()
-                                } else {
-                                    s.action.as_str()
-                                };
-                                ui.label(text).on_hover_text(format!(
-                                    "filter query:\n{}\n\naction:\n{}",
-                                    s.filter_query, s.action
-                                ));
-                            });
-                            row.col(|ui| {
-                                let why = s.reasons.join("; ");
-                                ui.label(egui::RichText::new(why.as_str()).color(color))
-                                    .on_hover_text(why);
-                            });
-                        });
+                        let why = s.reasons.join("; ");
+                        row.colored(why.as_str(), color).on_hover_text(why);
                     });
             }
         } else if !self.events_loading {
             ui.weak("Click Refresh to scan for WMI persistence.");
         }
 
-        if let Some(ci) = header_clicked {
-            toggle_sort(&mut self.events_sort, ci);
-        }
+        self.events_sort = table.sort;
     }
 }

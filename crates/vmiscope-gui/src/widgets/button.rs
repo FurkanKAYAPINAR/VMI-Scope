@@ -13,10 +13,13 @@
 
 #![allow(dead_code)] // The views adopt the kit in the next commit.
 
+use std::sync::Arc;
+
 use eframe::egui::{
-    Button, Color32, Frame, Rect, Response, RichText, Stroke, StrokeKind, Ui, Vec2,
+    Button, Color32, Frame, Rect, Response, RichText, Stroke, StrokeKind, Ui, Vec2, WidgetText,
 };
 
+use crate::theme::icons;
 use crate::theme::tokens::{a500, muted, AMBER, DIVIDER, R_MD, R_SM, S1, STEEL, TEAL, TEXT};
 use crate::widgets::rule::{self, HAIRLINE};
 
@@ -122,7 +125,27 @@ struct Skin {
     pad_x: Option<f32>,
 }
 
-fn skinned(ui: &mut Ui, skin: &Skin, text: RichText) -> Response {
+/// Paint `text` in `color`, whichever shape it arrived in.
+///
+/// Each variant below owns its label colour, and `WidgetText::color` is
+/// documented as a no-op on a `LayoutJob` -- which is exactly what an
+/// icon-plus-label pairing is, since its two halves need two font families.
+/// Without this, `btn_primary(ui, icons::labelled(..))` would keep the body
+/// colour the helper built it with instead of taking the accent.
+fn painted_in(text: impl Into<WidgetText>, color: Color32) -> WidgetText {
+    match text.into() {
+        WidgetText::LayoutJob(job) => {
+            let mut job = Arc::unwrap_or_clone(job);
+            for section in &mut job.sections {
+                section.format.color = color;
+            }
+            WidgetText::LayoutJob(Arc::new(job))
+        }
+        other => other.color(color),
+    }
+}
+
+fn skinned(ui: &mut Ui, skin: &Skin, text: WidgetText) -> Response {
     let response = ui
         .scope(|ui| {
             if let Some(pad_x) = skin.pad_x {
@@ -151,7 +174,7 @@ fn skinned(ui: &mut Ui, skin: &Skin, text: RichText) -> Response {
 ///
 /// The label colour is set explicitly because `Visuals::override_text_color` is
 /// `Some(TEXT)` globally, which otherwise wins over the widget's `fg_stroke`.
-pub(crate) fn btn_primary(ui: &mut Ui, text: impl Into<RichText>) -> Response {
+pub(crate) fn btn_primary(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
     let a = accent(ui);
     let skin = Skin {
         stroke: Stroke::new(HAIRLINE, a),
@@ -160,12 +183,12 @@ pub(crate) fn btn_primary(ui: &mut Ui, text: impl Into<RichText>) -> Response {
         press: PRESS_ACCENT,
         pad_x: None,
     };
-    skinned(ui, &skin, text.into().color(a))
+    skinned(ui, &skin, painted_in(text, a))
 }
 
 /// The default action: a divider outline and body text. Everything that is not
 /// the one thing the panel is for.
-pub(crate) fn btn_secondary(ui: &mut Ui, text: impl Into<RichText>) -> Response {
+pub(crate) fn btn_secondary(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
     let skin = Skin {
         stroke: Stroke::new(HAIRLINE, DIVIDER),
         tint: TEXT,
@@ -173,12 +196,12 @@ pub(crate) fn btn_secondary(ui: &mut Ui, text: impl Into<RichText>) -> Response 
         press: PRESS_TEXT,
         pad_x: None,
     };
-    skinned(ui, &skin, text.into().color(TEXT))
+    skinned(ui, &skin, painted_in(text, TEXT))
 }
 
 /// A borderless accent action, padded tight enough to sit inline in a sentence
 /// or at the end of a toolbar without reading as a third button.
-pub(crate) fn btn_ghost(ui: &mut Ui, text: impl Into<RichText>) -> Response {
+pub(crate) fn btn_ghost(ui: &mut Ui, text: impl Into<WidgetText>) -> Response {
     let a = accent(ui);
     let skin = Skin {
         stroke: Stroke::NONE,
@@ -187,7 +210,7 @@ pub(crate) fn btn_ghost(ui: &mut Ui, text: impl Into<RichText>) -> Response {
         press: PRESS_GHOST,
         pad_x: Some(S1),
     };
-    skinned(ui, &skin, text.into().color(a))
+    skinned(ui, &skin, painted_in(text, a))
 }
 
 /// A square, frameless icon button sized to the current row height, so icon
@@ -216,7 +239,7 @@ pub(crate) fn btn_icon_sized(ui: &mut Ui, glyph: &str, side: f32) -> Response {
             ui.spacing_mut().button_padding = Vec2::ZERO;
             ui.add_sized(
                 Vec2::splat(side),
-                Button::new(RichText::new(glyph).color(muted(70))).corner_radius(R_SM),
+                Button::new(icons::glyph(glyph).color(muted(70))).corner_radius(R_SM),
             )
         })
         .inner;

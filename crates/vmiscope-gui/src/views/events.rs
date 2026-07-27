@@ -18,14 +18,20 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             ui.strong("Live WMI events");
             if self.monitor.is_some() {
-                if ui.button(format!("{} Stop", icons::STOP)).clicked() {
+                if ui
+                    .button(icons::labelled(ui, icons::STOP, "Stop"))
+                    .clicked()
+                {
                     self.monitor = None;
                     // The error belongs to the subscription being torn down;
                     // leaving it up outlives the thing it describes.
                     self.monitor_error = None;
                 }
                 ui.colored_label(Color32::from_rgb(120, 210, 140), "\u{25cf} monitoring");
-            } else if ui.button(format!("{} Start", icons::PLAY)).clicked() {
+            } else if ui
+                .button(icons::labelled(ui, icons::PLAY, "Start"))
+                .clicked()
+            {
                 self.monitor_error = None;
                 self.monitor = Some(EventMonitor::start(
                     self.active_ns.clone(),
@@ -37,7 +43,7 @@ impl VmiScopeApp {
             }
             if !self.events_log.is_empty()
                 && ui
-                    .button(format!("{} JSON", icons::DOWNLOAD_SIMPLE))
+                    .button(icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "JSON"))
                     .on_hover_text("Export events")
                     .clicked()
             {

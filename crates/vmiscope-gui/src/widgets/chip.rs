@@ -9,9 +9,10 @@
 
 use eframe::egui::{
     Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Margin, Response, RichText, Sense,
-    Stroke, TextStyle, Ui, Vec2,
+    Stroke, TextStyle, Ui, Vec2, WidgetText,
 };
 
+use crate::theme::icons;
 use crate::theme::tokens::{a100, a300, a800, muted, NEUTRAL, R_SM, S1, S2, S3, TEXT};
 use crate::widgets::button::{accent, accent_ramp};
 use crate::widgets::rule::HAIRLINE;
@@ -32,6 +33,9 @@ const BADGE_FONT: f32 = 9.0;
 
 /// Diameter of a status dot.
 const DOT: f32 = 6.0;
+/// A dot chip's label strength, as a percentage of the body colour. Named
+/// because both the plain and the icon-led chip have to agree on it.
+const DOT_LABEL: u8 = 70;
 
 /// Background strength for the untinted chips -- count pills and the like.
 const CHIP_TINT: f32 = 0.06;
@@ -169,16 +173,31 @@ pub(crate) fn kind_badge(ui: &mut Ui, kind: Kind) -> Response {
 /// takes one rather than deriving it -- the caller is the only thing that knows
 /// what the dot means.
 pub(crate) fn dot_chip(ui: &mut Ui, color: Color32, label: &str) -> Response {
+    let text = RichText::new(label)
+        .text_style(TextStyle::Small)
+        .color(muted(DOT_LABEL));
+    dotted(ui, color, text)
+}
+
+/// [`dot_chip`] with an icon between the dot and the label.
+///
+/// The icon needs the icon family, which a single `RichText` cannot carry
+/// alongside the label's -- so it goes through `icons::labelled_styled` rather
+/// than being concatenated into the label. The style and colour are the chip's
+/// own, so a call site never restates them.
+pub(crate) fn dot_chip_icon(ui: &mut Ui, color: Color32, icon: &str, label: &str) -> Response {
+    let text = icons::labelled_styled(ui, icon, label, TextStyle::Small, muted(DOT_LABEL));
+    dotted(ui, color, text)
+}
+
+/// The shared body of the two dot chips: the filled dot, then the text.
+fn dotted(ui: &mut Ui, color: Color32, text: impl Into<WidgetText>) -> Response {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(DOT), Sense::hover());
         if ui.is_rect_visible(rect) {
             ui.painter().circle_filled(rect.center(), DOT * 0.5, color);
         }
-        ui.label(
-            RichText::new(label)
-                .text_style(TextStyle::Small)
-                .color(muted(70)),
-        )
+        ui.label(text)
     })
     .inner
 }

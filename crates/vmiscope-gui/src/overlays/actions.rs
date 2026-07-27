@@ -15,7 +15,17 @@ impl VmiScopeApp {
 
     pub(crate) fn ui_actions(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong(format!("{} Actions", icons::GEAR_SIX));
+            // `ui.strong` takes a `RichText`, which carries one font family and
+            // so cannot hold the icon; the colour it would have applied is
+            // spelled out instead.
+            let strong = ui.visuals().strong_text_color();
+            ui.label(icons::labelled_styled(
+                ui,
+                icons::GEAR_SIX,
+                "Actions",
+                egui::TextStyle::Body,
+                strong,
+            ));
             if self.act_invoking {
                 ui.spinner();
             }
@@ -171,10 +181,13 @@ impl VmiScopeApp {
         let can_invoke =
             !self.act_invoking && (minfo.is_static || !self.act_target.trim().is_empty());
         ui.add_enabled_ui(can_invoke, |ui| {
-            let btn = egui::Button::new(
-                egui::RichText::new(format!("{} Invoke {class}.{mname}", icons::WARNING))
-                    .color(Color32::WHITE),
-            )
+            let btn = egui::Button::new(icons::labelled_styled(
+                ui,
+                icons::WARNING,
+                &format!("Invoke {class}.{mname}"),
+                egui::TextStyle::Button,
+                Color32::WHITE,
+            ))
             .fill(Color32::from_rgb(150, 60, 60));
             if ui.add(btn).clicked() {
                 self.confirm_open = true;

@@ -1,15 +1,22 @@
 //! The Providers tab: WMI providers mapped to their host processes.
 
 use eframe::egui;
-use egui::Color32;
-use egui_extras::{Column, TableBuilder};
 
 use crate::app::VmiScopeApp;
 use crate::theme::icons;
-use crate::util::{prov_col_value, save_file, smart_cmp, toggle_sort};
-use crate::widgets::table::sortable_header;
+use crate::theme::tokens::{muted, BAD, WARN};
+use crate::util::{prov_col_value, save_file};
+use crate::widgets::button::{btn_ghost, btn_primary, btn_secondary};
+use crate::widgets::chip::{count_pill, dot_chip};
+use crate::widgets::loading::spinner;
+use crate::widgets::rule::hrule;
+use crate::widgets::table::{DataTable, DataTableState, TableColumn};
 
 use vmiscope_core::diff_providers;
+
+/// Strength of the muted diff text -- removed rows are context, not a finding:
+/// a provider that went away is the one thing here nobody hunts for.
+const DIM: u8 = 55;
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -22,19 +29,15 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             ui.strong("WMI providers");
             if self.providers_loading {
-                ui.spinner();
+                spinner(ui, "listing");
             }
-            if ui
-                .button(format!("{} Refresh", icons::ARROWS_CLOCKWISE))
-                .clicked()
-            {
+            if btn_primary(ui, icons::labelled(ui, icons::ARROWS_CLOCKWISE, "Refresh")).clicked() {
                 self.request_providers();
             }
             if let Some(p) = self.providers.as_ref() {
-                ui.weak(format!("({})", p.len()));
+                count_pill(ui, p.len());
                 if !p.is_empty()
-                    && ui
-                        .button(format!("{} Snapshot", icons::FLOPPY_DISK))
+                    && btn_secondary(ui, icons::labelled(ui, icons::FLOPPY_DISK, "Snapshot"))
                         .on_hover_text("Save a baseline")
                         .clicked()
                 {
@@ -44,14 +47,11 @@ impl VmiScopeApp {
                     );
                 }
             }
-            if ui
-                .button(format!("{} Baseline", icons::FOLDER_OPEN))
-                .clicked()
-            {
+            if btn_secondary(ui, icons::labelled(ui, icons::FOLDER_OPEN, "Baseline")).clicked() {
                 load_baseline = true;
             }
             if self.providers_baseline.is_some()
-                && ui.button(format!("{} clear", icons::X)).clicked()
+                && btn_ghost(ui, icons::labelled(ui, icons::X, "clear")).clicked()
             {
                 clear_baseline = true;
             }
@@ -81,15 +81,9 @@ impl VmiScopeApp {
             let d = diff_providers(base, cur);
             ui.horizontal(|ui| {
                 ui.strong("vs baseline:");
-                ui.colored_label(
-                    Color32::from_rgb(240, 100, 100),
-                    format!("+{} new", d.added.len()),
-                );
-                ui.colored_label(
-                    Color32::from_rgb(225, 185, 90),
-                    format!("~{} changed", d.changed.len()),
-                );
-                ui.weak(format!("-{} removed", d.removed.len()));
+                dot_chip(ui, BAD, &format!("+{} new", d.added.len()));
+                dot_chip(ui, WARN, &format!("~{} changed", d.changed.len()));
+                dot_chip(ui, muted(DIM), &format!("-{} removed", d.removed.len()));
             });
             if !d.is_empty() {
                 egui::CollapsingHeader::new("Diff details")
@@ -114,87 +108,43 @@ impl VmiScopeApp {
                     });
             }
         }
-        ui.separator();
+        hrule(ui);
 
-        let sort = self.providers_sort;
-        let mut header_clicked: Option<usize> = None;
+        // The sort lives on the app so it survives a tab switch; the table gets
+        // it on loan for the frame.
+        let mut table = DataTableState {
+            sort: self.providers_sort,
+            selected: None,
+        };
 
         if let Some(providers) = self.providers.as_ref() {
             if providers.is_empty() {
                 ui.weak("No providers returned.");
             } else {
-                let mut order: Vec<usize> = (0..providers.len()).collect();
-                if let Some((ci, asc)) = sort {
-                    order.sort_by(|&a, &b| {
-                        let o = smart_cmp(
-                            &prov_col_value(&providers[a], ci),
-                            &prov_col_value(&providers[b], ci),
-                        );
-                        if asc {
-                            o
-                        } else {
-                            o.reverse()
-                        }
-                    });
-                }
-
-                let headers = [
-                    "Provider",
-                    "Namespace",
-                    "Host PID",
-                    "Host process",
-                    "Hosting group",
-                ];
-                let widths = [220.0, 160.0, 74.0, 170.0, 200.0];
-                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
-
-                let mut table = TableBuilder::new(ui)
-                    .id_salt("providers-table")
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .min_scrolled_height(0.0);
-                for w in widths {
-                    table =
-                        table.column(Column::initial(w).at_least(48.0).clip(true).resizable(true));
-                }
-                table
-                    .header(22.0, |mut header| {
-                        for (ci, h) in headers.iter().enumerate() {
-                            header.col(|ui| {
-                                if sortable_header(ui, h, ci, sort) {
-                                    header_clicked = Some(ci);
-                                }
-                            });
-                        }
-                    })
-                    .body(|body| {
-                        body.rows(row_h, order.len(), |mut row| {
-                            let p = &providers[order[row.index()]];
-                            row.col(|ui| {
-                                ui.label(p.provider.as_str());
-                            });
-                            row.col(|ui| {
-                                ui.label(p.namespace.as_str());
-                            });
-                            row.col(|ui| {
-                                ui.label(p.host_pid.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(p.host_process.as_str());
-                            });
-                            row.col(|ui| {
-                                ui.label(p.hosting_group.as_str());
-                            });
-                        });
+                DataTable::new("providers-table")
+                    .columns([
+                        TableColumn::initial("Provider", 220.0).at_least(48.0),
+                        TableColumn::initial("Namespace", 160.0).at_least(48.0),
+                        TableColumn::initial("Host PID", 74.0)
+                            .at_least(48.0)
+                            .numeric(true),
+                        TableColumn::initial("Host process", 170.0).at_least(48.0),
+                        TableColumn::initial("Hosting group", 200.0).at_least(48.0),
+                    ])
+                    .sort_key(|row, col| prov_col_value(&providers[row], col))
+                    .show(ui, &mut table, providers.len(), |row| {
+                        let p = &providers[row.data_index()];
+                        row.text(p.provider.as_str());
+                        row.text(p.namespace.as_str());
+                        row.text(p.host_pid.to_string());
+                        row.text(p.host_process.as_str());
+                        row.text(p.hosting_group.as_str());
                     });
             }
         } else if !self.providers_loading {
             ui.weak("Click Refresh to list WMI providers.");
         }
 
-        if let Some(ci) = header_clicked {
-            toggle_sort(&mut self.providers_sort, ci);
-        }
+        self.providers_sort = table.sort;
     }
 }

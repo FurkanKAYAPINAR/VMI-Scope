@@ -23,18 +23,18 @@ impl VmiScopeApp {
             ui.selectable_value(
                 &mut self.central_view,
                 CentralView::Instances,
-                format!("{} Instances", icons::FILE_TEXT),
+                icons::labelled(ui, icons::FILE_TEXT, "Instances"),
             );
             ui.selectable_value(
                 &mut self.central_view,
                 CentralView::Schema,
-                format!("{} Schema", icons::CUBE),
+                icons::labelled(ui, icons::CUBE, "Schema"),
             );
             if let Some(c) = self.selected_class.clone() {
                 ui.separator();
                 ui.weak(&c);
                 if ui
-                    .button(format!("{} MOF", icons::FILE_TEXT))
+                    .button(icons::labelled(ui, icons::FILE_TEXT, "MOF"))
                     .on_hover_text("Show MOF text")
                     .clicked()
                 {
@@ -42,7 +42,10 @@ impl VmiScopeApp {
                 }
                 let was_open = self.actions_open;
                 if ui
-                    .selectable_label(self.actions_open, format!("{} Actions", icons::GEAR_SIX))
+                    .selectable_label(
+                        self.actions_open,
+                        icons::labelled(ui, icons::GEAR_SIX, "Actions"),
+                    )
                     .on_hover_text("Invoke methods (mutating)")
                     .clicked()
                 {
@@ -93,7 +96,7 @@ impl VmiScopeApp {
         );
         ui.horizontal(|ui| {
             if ui
-                .button(format!("{} Run  (Ctrl+Enter)", icons::PLAY))
+                .button(icons::labelled(ui, icons::PLAY, "Run  (Ctrl+Enter)"))
                 .clicked()
                 || run_shortcut
             {
@@ -108,14 +111,14 @@ impl VmiScopeApp {
                 if !result.rows.is_empty() {
                     ui.separator();
                     if ui
-                        .button(format!("{} CSV", icons::DOWNLOAD_SIMPLE))
+                        .button(icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "CSV"))
                         .on_hover_text("Export results as CSV")
                         .clicked()
                     {
                         save_file("query.csv", &vmiscope_core::export::query_to_csv(result));
                     }
                     if ui
-                        .button(format!("{} JSON", icons::DOWNLOAD_SIMPLE))
+                        .button(icons::labelled(ui, icons::DOWNLOAD_SIMPLE, "JSON"))
                         .on_hover_text("Export results as JSON")
                         .clicked()
                     {
@@ -129,7 +132,11 @@ impl VmiScopeApp {
         ui.horizontal(|ui| {
             let history = self.config.history.clone();
             egui::ComboBox::from_id_salt("query-history")
-                .selected_text(format!("{} History ({})", icons::TIMER, history.len()))
+                .selected_text(icons::labelled(
+                    ui,
+                    icons::TIMER,
+                    &format!("History ({})", history.len()),
+                ))
                 .show_ui(ui, |ui| {
                     for q in &history {
                         let short: String = q.chars().take(80).collect();
@@ -142,7 +149,11 @@ impl VmiScopeApp {
             let saved = self.config.saved.clone();
             if !saved.is_empty() {
                 egui::ComboBox::from_id_salt("saved-queries")
-                    .selected_text(format!("{} Saved ({})", icons::STAR, saved.len()))
+                    .selected_text(icons::labelled(
+                        ui,
+                        icons::STAR,
+                        &format!("Saved ({})", saved.len()),
+                    ))
                     .show_ui(ui, |ui| {
                         for sq in &saved {
                             if ui.selectable_label(false, &sq.name).clicked() {
@@ -152,7 +163,10 @@ impl VmiScopeApp {
                         }
                     });
             }
-            if ui.button(format!("{} Save\u{2026}", icons::STAR)).clicked() {
+            if ui
+                .button(icons::labelled(ui, icons::STAR, "Save\u{2026}"))
+                .clicked()
+            {
                 self.save_query_name.clear();
                 self.save_query_open = true;
             }
@@ -240,7 +254,8 @@ impl VmiScopeApp {
 
     /// Collapsible PowerShell / VBScript generator for the current query.
     pub(crate) fn ui_script_gen(&mut self, ui: &mut egui::Ui) {
-        let script_header = format!("{} Generate script (PowerShell / VBScript)", icons::CODE);
+        let script_header =
+            icons::labelled(ui, icons::CODE, "Generate script (PowerShell / VBScript)");
         ui.collapsing(script_header, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.script_lang, ScriptLang::PowerShell, "PowerShell");
@@ -248,7 +263,10 @@ impl VmiScopeApp {
             });
             let script = generate_script(self.script_lang, &self.active_ns, &self.query_text);
             ui.horizontal(|ui| {
-                if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                if ui
+                    .button(icons::labelled(ui, icons::COPY, "Copy"))
+                    .clicked()
+                {
                     ui.ctx().copy_text(script.clone());
                 }
                 ui.weak("PowerShell: paste & run \u{00b7} VBScript: cscript file.vbs");

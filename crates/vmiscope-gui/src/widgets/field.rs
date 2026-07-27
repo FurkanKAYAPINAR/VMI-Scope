@@ -56,7 +56,7 @@ pub(crate) fn filter_box(ui: &mut Ui, value: &mut String, hint: &str) -> Respons
     let response = ui.add(
         TextEdit::singleline(value)
             .font(TextStyle::Monospace)
-            .prefix(RichText::new(icons::MAGNIFYING_GLASS).color(muted(45)))
+            .prefix(icons::glyph(icons::MAGNIFYING_GLASS).color(muted(45)))
             .hint_text(RichText::new(hint).color(muted(38)))
             .background_color(SURFACE),
     );

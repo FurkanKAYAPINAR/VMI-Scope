@@ -26,7 +26,10 @@ impl VmiScopeApp {
                     });
                 }
                 if let Some(text) = self.mof_text.clone() {
-                    if ui.button(format!("{} Copy", icons::COPY)).clicked() {
+                    if ui
+                        .button(icons::labelled(ui, icons::COPY, "Copy"))
+                        .clicked()
+                    {
                         ui.ctx().copy_text(text.clone());
                     }
                     egui::ScrollArea::both()

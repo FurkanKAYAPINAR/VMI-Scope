@@ -80,13 +80,13 @@ impl VmiScopeApp {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.colored_label(
+                ui.label(icons::labelled_styled(
+                    ui,
+                    icons::WARNING,
+                    "This invokes a WMI method and may change system state.",
+                    egui::TextStyle::Body,
                     Color32::from_rgb(240, 120, 120),
-                    format!(
-                        "{} This invokes a WMI method and may change system state.",
-                        icons::WARNING
-                    ),
-                );
+                ));
                 if is_dangerous_method(&method) {
                     ui.colored_label(
                         Color32::from_rgb(255, 80, 80),

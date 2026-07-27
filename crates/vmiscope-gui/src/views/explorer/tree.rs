@@ -39,7 +39,7 @@ impl VmiScopeApp {
                 icons::CARET_RIGHT
             };
             if ui
-                .add(egui::Button::new(arrow).frame(false))
+                .add(egui::Button::new(icons::glyph(arrow)).frame(false))
                 .on_hover_text("Expand / collapse")
                 .clicked()
             {

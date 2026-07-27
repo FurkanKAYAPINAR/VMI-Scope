@@ -595,6 +595,20 @@ impl RowCtx<'_, '_, '_> {
         })
     }
 
+    /// A text cell led by an icon, in the row's colour.
+    ///
+    /// The icon cannot ride in the same string as the text -- it needs the icon
+    /// family, and one `RichText` carries one family -- so the cell is laid out
+    /// as two sections. `icon` is a [`crate::theme::icons`] constant.
+    pub(crate) fn icon_text(&mut self, icon: &str, text: &str) -> Response {
+        let color = self.tinted(self.color);
+        let (icon, text) = (icon.to_owned(), text.to_owned());
+        self.cell(move |ui| {
+            let job = icons::labelled_styled(ui, &icon, &text, egui::TextStyle::Body, color);
+            ui.add(egui::Label::new(job));
+        })
+    }
+
     /// A text cell in an explicit colour (risk, protocol state, ...), still
     /// subject to the row's alpha.
     pub(crate) fn colored(&mut self, text: impl Into<egui::RichText>, color: Color32) -> Response {
@@ -746,7 +760,12 @@ fn sorted_dir(sort: Sort, col: usize) -> Option<bool> {
 
 /// The design's header treatment: 11px, uppercase, letter-spaced, muted until
 /// it is the active sort column, with a caret for the direction.
-fn header_text(ui: &egui::Ui, title: &str, sorted: Option<bool>) -> egui::RichText {
+///
+/// The caret *trails* its title, which is the one place in the app where
+/// `icons::labelled` -- which leads with the icon -- does not fit. The two
+/// halves are therefore appended to a `LayoutJob` in order; they need separate
+/// sections regardless, since only the caret is in the icon family.
+fn header_text(ui: &egui::Ui, title: &str, sorted: Option<bool>) -> egui::WidgetText {
     // `TextStyle::resolve` panics on a missing key, and a widget has no
     // business panicking because the theme was not installed.
     let font = ui
@@ -756,11 +775,6 @@ fn header_text(ui: &egui::Ui, title: &str, sorted: Option<bool>) -> egui::RichTe
         .cloned()
         .unwrap_or_else(|| egui::FontId::proportional(11.0));
 
-    let label = match sorted {
-        Some(true) => format!("{} {}", title.to_uppercase(), icons::CARET_UP),
-        Some(false) => format!("{} {}", title.to_uppercase(), icons::CARET_DOWN),
-        None => title.to_uppercase(),
-    };
     let color = if sorted.is_some() {
         // The live accent. `Visuals` has no accent field; `theme::apply_accent`
         // puts a500 in `hyperlink_color`, so that is where a widget reads it.
@@ -769,10 +783,39 @@ fn header_text(ui: &egui::Ui, title: &str, sorted: Option<bool>) -> egui::RichTe
         muted(HEADER_TINT)
     };
 
-    egui::RichText::new(label)
-        .font(font)
+    let Some(ascending) = sorted else {
+        return egui::RichText::new(title.to_uppercase())
+            .font(font)
+            .extra_letter_spacing(0.5)
+            .color(color)
+            .into();
+    };
+
+    let caret = if ascending {
+        icons::CARET_UP
+    } else {
+        icons::CARET_DOWN
+    };
+    let mut job = egui::text::LayoutJob::default();
+    // The separating space belongs to the title's section: it is text, and the
+    // icon font's own space is not the one this header was measured against.
+    egui::RichText::new(format!("{} ", title.to_uppercase()))
+        .font(font.clone())
         .extra_letter_spacing(0.5)
         .color(color)
+        .append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    icons::glyph(caret).size(font.size).color(color).append_to(
+        &mut job,
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Center,
+    );
+    job.into()
 }
 
 /// A sortable header cell for a hand-rolled `TableBuilder`.

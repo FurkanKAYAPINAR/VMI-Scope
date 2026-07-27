@@ -13,7 +13,11 @@ impl VmiScopeApp {
     pub(crate) fn ui_detail(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("Row detail");
-            if ui.small_button(icons::X).on_hover_text("Close").clicked() {
+            if ui
+                .small_button(icons::glyph(icons::X))
+                .on_hover_text("Close")
+                .clicked()
+            {
                 self.selected_row = None;
             }
         });

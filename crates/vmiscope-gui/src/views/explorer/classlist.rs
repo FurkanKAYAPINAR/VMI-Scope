@@ -19,7 +19,7 @@ impl VmiScopeApp {
             ui.weak(format!("({})", self.classes.len()));
         });
         ui.horizontal(|ui| {
-            ui.label(icons::MAGNIFYING_GLASS);
+            ui.label(icons::glyph(icons::MAGNIFYING_GLASS));
             ui.add(
                 egui::TextEdit::singleline(&mut self.class_filter)
                     .hint_text("filter classes")

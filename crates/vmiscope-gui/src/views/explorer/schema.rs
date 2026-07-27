@@ -49,7 +49,7 @@ impl VmiScopeApp {
             }
         }
         ui.horizontal(|ui| {
-            ui.label(icons::MAGNIFYING_GLASS);
+            ui.label(icons::glyph(icons::MAGNIFYING_GLASS));
             ui.add(
                 egui::TextEdit::singleline(&mut self.schema_filter)
                     .hint_text("filter properties / methods")
@@ -79,12 +79,22 @@ impl VmiScopeApp {
                                 || p.name.to_lowercase().contains(&filter)
                                 || p.cim_type.to_lowercase().contains(&filter)
                         }) {
-                            let label = if p.is_key {
-                                format!("{} {}", icons::KEY, p.name)
+                            // A key property is led by its icon, which needs the
+                            // icon family and so cannot share the name's
+                            // section; `TextStyle::Body` keeps both branches
+                            // the size a plain `ui.label` would have been.
+                            let resp = if p.is_key {
+                                let color = ui.visuals().text_color();
+                                ui.label(icons::labelled_styled(
+                                    ui,
+                                    icons::KEY,
+                                    &p.name,
+                                    egui::TextStyle::Body,
+                                    color,
+                                ))
                             } else {
-                                p.name.clone()
+                                ui.label(p.name.as_str())
                             };
-                            let resp = ui.label(label);
                             if !p.value_map.is_empty() {
                                 let vm = p
                                     .value_map

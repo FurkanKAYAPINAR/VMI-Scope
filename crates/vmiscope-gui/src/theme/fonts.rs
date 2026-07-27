@@ -68,24 +68,35 @@ fn definitions() -> FontDefinitions {
         .font_data
         .insert(ICONS.into(), Arc::new(FontData::from_static(PHOSPHOR)));
 
-    // Fallback is per character and first match wins, so the icon font goes last
-    // in every family. Phosphor ships each icon name as a ligature -- if it ever
-    // led a family, the words "copy", "key", "star" and "folder" would render as
-    // pictures.
+    // Icons get their OWN family, and the text families do not fall back to
+    // them. Mixing the two cannot be made to work in either order, which was
+    // established by parsing the three cmaps rather than by reasoning:
+    //
+    //   Phosphor holds 1,513 Private Use Area glyphs.
+    //   Inter holds 745 of its own, colliding with 32 of our 94 icons.
+    //   Phosphor also covers 26 Latin letters and the space, to carry the
+    //   ligatures that spell its icon names.
+    //
+    // So with the icon font last, Inter answers a third of the icons first and
+    // they render as unrelated letters -- a download arrow came out as "S with
+    // caron". With it first, Phosphor answers lowercase text and its own name
+    // ligatures fire, turning the words "copy", "key" and "folder" into
+    // pictures. Separate families is the only arrangement where neither font
+    // can be asked for a character it should not answer.
+    //
+    // Icons are therefore rendered explicitly: see `theme::icons::glyph`.
     fonts
         .families
-        .insert(FontFamily::Proportional, vec![UI.into(), ICONS.into()]);
+        .insert(FontFamily::Proportional, vec![UI.into()]);
     fonts
         .families
-        .insert(FontFamily::Monospace, vec![MONO.into(), ICONS.into()]);
-    // No trailing text fallback on the medium family: both Inter entries are the
-    // same blob at different weights, so their coverage is identical and a
-    // fallback to the regular weight could never resolve anything the medium
-    // weight had already missed.
-    fonts.families.insert(
-        FontFamily::Name(UI_MEDIUM.into()),
-        vec![UI_MEDIUM.into(), ICONS.into()],
-    );
+        .insert(FontFamily::Monospace, vec![MONO.into()]);
+    fonts
+        .families
+        .insert(FontFamily::Name(UI_MEDIUM.into()), vec![UI_MEDIUM.into()]);
+    fonts
+        .families
+        .insert(FontFamily::Name(ICONS.into()), vec![ICONS.into()]);
 
     fonts
 }
@@ -94,30 +105,40 @@ fn definitions() -> FontDefinitions {
 mod tests {
     use super::*;
 
-    /// Every family must exist, must not lead with the icon font, and must fall
-    /// back to it. Getting this order wrong is silent: text keeps rendering,
-    /// just occasionally as pictures, because Phosphor ships each icon name as
-    /// a ligature -- "copy", "key", "star" and "folder" are all icon names.
+    /// No family may mix the icon font with a text font, in either order.
     ///
-    /// This inspects the real map rather than rebuilding one, so it cannot drift
-    /// away from what actually ships.
+    /// The previous version of this test asserted the opposite -- that every
+    /// text family should *fall back* to the icon font -- and that assertion is
+    /// what guaranteed the bug. egui resolves a family per character, first
+    /// match wins, and Inter carries 745 Private Use Area glyphs of its own,
+    /// 32 of which collide with icons we use. With the icon font trailing,
+    /// Inter answered a third of them and they rendered as unrelated letters.
+    /// Putting it first is no better: Phosphor covers 26 Latin letters and the
+    /// space to carry its name ligatures, so it would answer lowercase text and
+    /// turn the words "copy", "key" and "folder" into pictures.
+    ///
+    /// This inspects the real map rather than rebuilding one, so it cannot
+    /// drift away from what ships.
     #[test]
-    fn icon_font_is_always_the_fallback() {
+    fn no_family_mixes_icons_with_text() {
         let fonts = definitions();
 
         for family in [
             FontFamily::Proportional,
             FontFamily::Monospace,
             FontFamily::Name(UI_MEDIUM.into()),
+            FontFamily::Name(ICONS.into()),
         ] {
             let chain = fonts.families.get(&family).expect("family is registered");
             assert!(!chain.is_empty(), "{family:?} resolves to no font");
-            assert_ne!(chain[0], ICONS, "{family:?} leads with the icon font");
-            assert_eq!(
-                chain.last().map(String::as_str),
-                Some(ICONS),
-                "{family:?} does not fall back to the icon font"
+
+            let has_icons = chain.iter().any(|f| f == ICONS);
+            let has_text = chain.iter().any(|f| f != ICONS);
+            assert!(
+                !(has_icons && has_text),
+                "{family:?} mixes the icon font with a text font: {chain:?}"
             );
+
             for name in chain {
                 assert!(
                     fonts.font_data.contains_key(name),
@@ -125,6 +146,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The icon family must exist and must be the icon font, since every icon
+    /// is rendered by naming it explicitly.
+    #[test]
+    fn the_icon_family_is_the_icon_font() {
+        let fonts = definitions();
+        let chain = fonts
+            .families
+            .get(&FontFamily::Name(ICONS.into()))
+            .expect("icon family is registered");
+        assert_eq!(chain, &[ICONS.to_string()]);
     }
 
     /// The embedded files must be the ones we think they are: a truncated or

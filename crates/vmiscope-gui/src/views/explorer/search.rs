@@ -85,66 +85,72 @@ impl VmiScopeApp {
     }
 
     pub(crate) fn ui_search(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(format!("{} Global search", icons::MAGNIFYING_GLASS))
-            .id_salt("global-search")
-            .show(ui, |ui| {
-                let mut build = false;
-                ui.horizontal(|ui| {
-                    if ui.button("Build index").clicked() {
-                        build = true;
-                    }
-                    ui.checkbox(&mut self.search_methods, "methods");
-                    if self.search_loading {
-                        ui.spinner();
-                    }
-                });
-                if build {
-                    self.request_search_index(self.search_methods);
+        egui::CollapsingHeader::new(icons::labelled(
+            ui,
+            icons::MAGNIFYING_GLASS,
+            "Global search",
+        ))
+        .id_salt("global-search")
+        .show(ui, |ui| {
+            let mut build = false;
+            ui.horizontal(|ui| {
+                if ui.button("Build index").clicked() {
+                    build = true;
                 }
-                let indexed = self.search_index.as_ref().map(|i| i.classes.len());
-                match indexed {
-                    None => {
-                        ui.weak("build the index to search class / property / method names");
-                        return;
-                    }
-                    Some(n) => {
-                        ui.weak(format!("{n} classes indexed"));
-                    }
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search_text)
-                        .hint_text("search names")
-                        .desired_width(f32::INFINITY),
-                );
-                let q = self.search_text.trim().to_lowercase();
-                if q.len() < 2 {
-                    ui.weak("type at least 2 characters");
-                    return;
-                }
-                let hits = self.compute_hits(&q);
-                let mut clicked: Option<SearchHit> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("search-results")
-                    .max_height(240.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if hits.is_empty() {
-                            ui.weak("no matches");
-                        }
-                        for h in &hits {
-                            let label = match &h.member {
-                                None => format!("{} {}", icons::TREE_STRUCTURE, h.class),
-                                Some(m) if h.is_method => format!("{} :: {}()", h.class, m),
-                                Some(m) => format!("{} :: {}", h.class, m),
-                            };
-                            if ui.selectable_label(false, label).clicked() {
-                                clicked = Some(h.clone());
-                            }
-                        }
-                    });
-                if let Some(h) = clicked {
-                    self.apply_search_hit(h);
+                ui.checkbox(&mut self.search_methods, "methods");
+                if self.search_loading {
+                    ui.spinner();
                 }
             });
+            if build {
+                self.request_search_index(self.search_methods);
+            }
+            let indexed = self.search_index.as_ref().map(|i| i.classes.len());
+            match indexed {
+                None => {
+                    ui.weak("build the index to search class / property / method names");
+                    return;
+                }
+                Some(n) => {
+                    ui.weak(format!("{n} classes indexed"));
+                }
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search_text)
+                    .hint_text("search names")
+                    .desired_width(f32::INFINITY),
+            );
+            let q = self.search_text.trim().to_lowercase();
+            if q.len() < 2 {
+                ui.weak("type at least 2 characters");
+                return;
+            }
+            let hits = self.compute_hits(&q);
+            let mut clicked: Option<SearchHit> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("search-results")
+                .max_height(240.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if hits.is_empty() {
+                        ui.weak("no matches");
+                    }
+                    for h in &hits {
+                        // A class hit is led by its icon, which needs the
+                        // icon family; the member hits are plain text.
+                        let label: egui::WidgetText = match &h.member {
+                            None => icons::labelled(ui, icons::TREE_STRUCTURE, &h.class).into(),
+                            Some(m) if h.is_method => format!("{} :: {}()", h.class, m).into(),
+                            Some(m) => format!("{} :: {}", h.class, m).into(),
+                        };
+                        if ui.selectable_label(false, label).clicked() {
+                            clicked = Some(h.clone());
+                        }
+                    }
+                });
+            if let Some(h) = clicked {
+                self.apply_search_hit(h);
+            }
+        });
     }
 }

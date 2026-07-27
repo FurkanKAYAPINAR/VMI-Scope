@@ -5,10 +5,83 @@
 //! Codepoints are NOT stable across Phosphor major versions: regenerate if the
 //! bundled font is ever bumped, and never hand-edit a value here.
 //!
-//! The font is registered as the last fallback of both built-in families, so these
-//! strings render inline with text.
+//! The icon font is its OWN family, deliberately not a fallback of the text
+//! families -- see `theme::fonts` for the measurements that forced that. So an
+//! icon is never simply concatenated into a label: use [`glyph`] for an icon on
+//! its own, or [`labelled`] for the icon-plus-text pairing that most buttons
+//! want. Concatenating a constant into a `format!` renders it in whatever font
+//! answers that codepoint first, which for a third of these is Inter.
 
 #![allow(dead_code)]
+
+use eframe::egui::text::LayoutJob;
+use eframe::egui::{Align, FontFamily, FontId, RichText, TextFormat, TextStyle, Ui};
+
+/// The family icons are rendered in. Matches `theme::fonts::ICONS`.
+fn family() -> FontFamily {
+    FontFamily::Name(crate::theme::fonts::ICONS.into())
+}
+
+/// An icon on its own, in the icon font.
+///
+/// Pass the result anywhere a `RichText` goes; add `.color(..)` or `.size(..)`
+/// as usual.
+pub(crate) fn glyph(icon: &str) -> RichText {
+    RichText::new(icon).family(family())
+}
+
+/// An icon followed by a label, as one piece of text.
+///
+/// The two halves need different fonts, which a single `RichText` cannot
+/// express, so this builds a `LayoutJob` with a section each. It is accepted
+/// anywhere `impl Into<WidgetText>` is -- buttons, labels, selectable labels.
+pub(crate) fn labelled(ui: &Ui, icon: &str, label: &str) -> LayoutJob {
+    labelled_styled(
+        ui,
+        icon,
+        label,
+        TextStyle::Button,
+        ui.visuals().text_color(),
+    )
+}
+
+/// [`labelled`], with the text style and colour spelled out.
+pub(crate) fn labelled_styled(
+    ui: &Ui,
+    icon: &str,
+    label: &str,
+    style: TextStyle,
+    color: eframe::egui::Color32,
+) -> LayoutJob {
+    let text_font = style.resolve(ui.style());
+    // The icon rides slightly smaller than its label: Phosphor's glyphs are
+    // drawn to a full em box while Inter's lowercase is not, so matching the
+    // nominal sizes makes every icon look oversized next to its word.
+    let icon_font = FontId::new(text_font.size * 0.95, family());
+
+    let mut job = LayoutJob::default();
+    job.append(
+        icon,
+        0.0,
+        TextFormat {
+            font_id: icon_font,
+            color,
+            valign: Align::Center,
+            ..Default::default()
+        },
+    );
+    job.append(
+        label,
+        ui.spacing().item_spacing.x * 0.9,
+        TextFormat {
+            font_id: text_font,
+            color,
+            valign: Align::Center,
+            ..Default::default()
+        },
+    );
+    job
+}
 
 // Rail and shell
 pub const TREE_STRUCTURE: &str = "\u{e67c}";

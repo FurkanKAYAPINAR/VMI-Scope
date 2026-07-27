@@ -6,29 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-27
+
 ### Added
+- **The Nocturne design system.** A dark ground, one accent (steel, with teal
+  and amber alternates), Inter for text and JetBrains Mono for every value,
+  path and identifier, and the Phosphor icon set -- all embedded, nothing
+  fetched at runtime. Outlined buttons rather than filled ones, table rows
+  separated by a rule that fades at each end, a 2px accent focus ring.
+- **A widget kit**: one virtualised, sortable, selectable data table replacing
+  four hand-rolled ones; a syntax-tinted code panel for generated scripts and
+  MOF; cards, chips, fields, key/value grids and waiting states. Every view now
+  draws through it, so the look cannot drift view by view.
 - **Class reflection**: every class-level qualifier, the `__Derivation` ancestry
   chain, and a `ClassKind` bit set (Dynamic / Association / Event / System /
-  Abstract / Singleton / Perf) are now read and exposed on `ClassSchema`, so the
-  Explorer can badge, filter and describe a class without a second round trip.
+  Abstract / Singleton / Perf) on `ClassSchema`, so the Explorer can badge and
+  filter a class without a second round trip.
 - **Parameter direction**: a method's in- and out-signatures are merged into one
   list, so a parameter appears once carrying `[in]`, `[out]` or `[in/out]`
   instead of being silently duplicated.
-- **Design plan**: `docs/REDESIGN.md` — the full Nocturne redesign, phased, with
-  every egui 0.35 API checked against the pinned sources.
-- `check.ps1`, a local gate that runs CI plus the design-system invariants a
-  compiler cannot catch.
+- **A design-system gate** (`check.ps1`) enforcing what a compiler cannot: no
+  colour literal outside the token module, no unthemeable separator, no glyph
+  the embedded fonts cannot render.
+- **Documentation**: [docs/REDESIGN.md](docs/REDESIGN.md), the phased plan with
+  every egui 0.35 API checked against the pinned sources, and
+  [docs/FINDINGS.md](docs/FINDINGS.md), the WMI and egui behaviour this work had
+  to establish by measurement.
 
 ### Changed
+- Queries are bounded by a row cap **and** a deadline, and a partial result
+  always says which. A cap alone is not enough: `CIM_DataFile` yields no rows at
+  all for at least twelve seconds, so there is never anything to count.
+- Cancelling a query now lands in about 10 ms, and closing the window during one
+  exits in about 600 ms instead of hanging.
 - **Method invocation is more robust**: `is_static` now also covers a class with
   no `Key` property or `Singleton = TRUE`, because WMI omits the `Static`
   qualifier far more often than not (`Win32_OperatingSystem` carries it on none
   of its five methods). An instance-path call WMI rejects is retried against the
   class path.
-- `crates/vmiscope-gui/src/app.rs` split from 2,973 lines into 28 modules. Pure
-  code motion, verified item-by-item; no behaviour or pixel changed.
+- `default_fonts` is off on egui and eframe. Shipping three real faces and
+  dropping the four egui embeds is a net +159 KiB, not +1.5 MB.
+- `crates/vmiscope-gui/src/app.rs` split from 2,973 lines into 28 modules, then
+  reskinned. The split itself was pure code motion, verified item by item.
 
 ### Fixed
+- **A third of the icon set rendered as unrelated letters.** The icon font was a
+  fallback of the text families, and Inter carries 745 Private Use Area glyphs
+  of its own that answered 32 of ours first -- a download arrow rendered as `S`
+  with a caron. Icons now have their own family.
 - **The confirmation gate could invoke a method it had not described.** If the
   class schema was unavailable when the dialog was confirmed, it assumed the
   method was static and took no arguments, then invoked it against the class
@@ -146,7 +171,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.3.0...v0.4.0

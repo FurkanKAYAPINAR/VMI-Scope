@@ -9,9 +9,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use windows::Win32::System::Wmi::IWbemClassObject;
 use wmi::{Variant, WMIConnection};
 
+use crate::enumerate::{self, CancelToken, Completion, DirectConn, WorkerControl};
 use crate::events::{assess, first_quoted, Risk, Subscription, SubscriptionReport};
 use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
@@ -29,10 +32,27 @@ pub enum Request {
     /// Enumerate the class names defined in `namespace`.
     ListClasses { id: u64, namespace: String },
     /// Run an arbitrary WQL query in `namespace`.
+    ///
+    /// `max_rows` caps the result. WQL has no `TOP`/`LIMIT`, so an unbounded
+    /// `SELECT * FROM CIM_DataFile` really does walk the whole filesystem.
+    ///
+    /// `timeout` bounds it in the other dimension, and both are needed. A row
+    /// cap only bites once rows arrive, and some providers deliver none for a
+    /// very long time: measured on this machine, `Win32_Process` capped at 5
+    /// answers in 36 ms, while `CIM_DataFile` capped at 200 returns *nothing*
+    /// in 45 s, because that provider materialises its whole result before
+    /// yielding the first row. With no deadline the only remaining escape is
+    /// the user noticing and pressing cancel.
+    ///
+    /// A partial result always says why -- [`Completion::Truncated`],
+    /// [`Completion::TimedOut`] or [`Completion::Cancelled`] -- rather than
+    /// pretending to be whole.
     Query {
         id: u64,
         namespace: String,
         wql: String,
+        max_rows: Option<usize>,
+        timeout: Option<Duration>,
     },
     /// Take a snapshot of the live TCP/UDP connection table.
     NetworkSnapshot { id: u64 },
@@ -82,7 +102,16 @@ pub enum Request {
         host: Option<String>,
         cred: Option<Credential>,
     },
+    /// Stop the enumeration running under `id`.
+    ///
+    /// [`WmiWorker::send`] raises the flag *before* queueing this message,
+    /// because a `Cancel` that waited its turn in the channel would be waiting
+    /// behind exactly the query it exists to stop.
+    Cancel { id: u64 },
     /// Stop the worker thread.
+    ///
+    /// Like `Cancel`, the effect comes from a flag raised before the send, not
+    /// from the message itself.
     Shutdown,
 }
 
@@ -92,44 +121,67 @@ pub enum Request {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Milliseconds spent binding the namespace.
+    ///
+    /// Reported apart from `elapsed_ms` because the bind happens on *every*
+    /// request: folded together, a 3 ms query on a 40 ms connection would read
+    /// as a 43 ms query and every timing shown to a user would be a lie.
+    pub connect_ms: u64,
+    /// Milliseconds spent enumerating, with the bind above excluded.
+    pub elapsed_ms: u64,
+    /// Why the enumeration stopped — whole, capped, or cancelled.
+    pub completion: Completion,
 }
 
 /// A reply from the WMI thread. `id` echoes the originating request's `id`.
+///
+/// Where a variant carries `elapsed_ms`, it is the wall time of the whole
+/// operation *including* the namespace bind. Only [`Response::QueryResult`]
+/// splits the two, because only the query path has a single bind to attribute
+/// the cost to — the security scans bind several namespaces each, so one
+/// "connect" figure would be meaningless.
 #[derive(Debug, Clone)]
 pub enum Response {
     ChildNamespaces {
         id: u64,
         namespace: String,
         children: Vec<String>,
+        elapsed_ms: u64,
     },
     Classes {
         id: u64,
         namespace: String,
         classes: Vec<String>,
+        elapsed_ms: u64,
     },
     QueryResult {
         id: u64,
         namespace: String,
         wql: String,
+        /// Carries its own `connect_ms` / `elapsed_ms` / `completion`.
         result: QueryResult,
     },
     Network {
         id: u64,
         snapshot: NetworkSnapshot,
+        elapsed_ms: u64,
     },
     EventSubscriptions {
         id: u64,
         report: SubscriptionReport,
+        elapsed_ms: u64,
     },
     Providers {
         id: u64,
         providers: Vec<ProviderInfo>,
+        elapsed_ms: u64,
     },
     Schema {
         id: u64,
         namespace: String,
         class: String,
         schema: ClassSchema,
+        elapsed_ms: u64,
     },
     Mof {
         id: u64,
@@ -150,6 +202,7 @@ pub enum Response {
     SearchIndex {
         id: u64,
         index: SearchIndex,
+        elapsed_ms: u64,
     },
     HostConnected {
         id: u64,
@@ -166,6 +219,7 @@ pub enum Response {
 pub struct WmiWorker {
     tx: Sender<Request>,
     rx: Receiver<Response>,
+    control: WorkerControl,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -174,20 +228,40 @@ impl WmiWorker {
     pub fn spawn() -> Self {
         let (req_tx, req_rx) = mpsc::channel::<Request>();
         let (res_tx, res_rx) = mpsc::channel::<Response>();
+        let control = WorkerControl::new();
+        let worker_control = control.clone();
         let handle = thread::Builder::new()
             .name("wmi-worker".into())
-            .spawn(move || run(req_rx, res_tx))
+            .spawn(move || run(req_rx, res_tx, worker_control))
             .expect("failed to spawn wmi worker thread");
         Self {
             tx: req_tx,
             rx: res_rx,
+            control,
             handle: Some(handle),
         }
     }
 
     /// Queue a request. Non-blocking; the reply arrives later via [`WmiWorker::poll`].
+    ///
+    /// [`Request::Cancel`] and [`Request::Shutdown`] additionally raise their
+    /// flag before the send. Both exist to interrupt work that is *already
+    /// running*, and a message sitting in a FIFO behind that work cannot do it.
     pub fn send(&self, req: Request) {
+        match &req {
+            Request::Cancel { id } => self.control.cancel(*id),
+            Request::Shutdown => self.control.shutdown(),
+            _ => {}
+        }
         let _ = self.tx.send(req);
+    }
+
+    /// Cancel the request with `id`; equivalent to sending [`Request::Cancel`].
+    ///
+    /// A cancelled query still replies, with the rows it had and
+    /// [`Completion::Cancelled`] — silence would strand the caller's spinner.
+    pub fn cancel(&self, id: u64) {
+        self.send(Request::Cancel { id });
     }
 
     /// Drain all currently available responses without blocking.
@@ -198,6 +272,12 @@ impl WmiWorker {
 
 impl Drop for WmiWorker {
     fn drop(&mut self) {
+        // Flag first, message second. `Drop` joins the thread, so if the
+        // shutdown had to travel through the request channel it would land
+        // behind whatever is running -- and closing the window during a
+        // `CIM_DataFile` query would hang the application until the filesystem
+        // walk finished. The flag is read every batch instead.
+        self.control.shutdown();
         let _ = self.tx.send(Request::Shutdown);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -205,22 +285,42 @@ impl Drop for WmiWorker {
     }
 }
 
+/// Milliseconds elapsed since `start`, saturating into `u64`.
+fn ms(start: Instant) -> u64 {
+    start.elapsed().as_millis() as u64
+}
+
 /// The worker thread's main loop.
 ///
 /// `wmi` 0.18 initializes COM implicitly (an MTA via `CoIncrementMTAUsage`)
 /// the first time a connection is created. [`WMIConnection`] is `!Send`, so
 /// all connections are created and used here, never handed to another thread.
-fn run(rx: Receiver<Request>, tx: Sender<Response>) {
+fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
     for req in rx {
+        // The flag, not the message, is what makes shutdown prompt: by the
+        // time `Request::Shutdown` reaches the front of the queue there may be
+        // a hundred requests ahead of it that were sent first.
+        if control.is_shutdown() {
+            break;
+        }
+
         match req {
             Request::Shutdown => break,
 
+            // The work was already done by `WmiWorker::send`, which raised the
+            // flag. Arriving here only means the request has drained past, so
+            // the flag can be forgotten -- otherwise cancelling an id that had
+            // already finished would leave an entry behind for good.
+            Request::Cancel { id } => control.end(id),
+
             Request::ListChildNamespaces { id, namespace } => {
+                let t0 = Instant::now();
                 let resp = match list_child_namespaces(&namespace) {
                     Ok(children) => Response::ChildNamespaces {
                         id,
                         namespace,
                         children,
+                        elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
@@ -232,11 +332,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
             }
 
             Request::ListClasses { id, namespace } => {
-                let resp = match q_class_names(&namespace) {
+                let t0 = Instant::now();
+                let resp = match q_class_names(&namespace, &control) {
                     Ok(classes) => Response::Classes {
                         id,
                         namespace,
                         classes,
+                        elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
@@ -247,8 +349,17 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                 let _ = tx.send(resp);
             }
 
-            Request::Query { id, namespace, wql } => {
-                let resp = match run_query(&namespace, &wql) {
+            Request::Query {
+                id,
+                namespace,
+                wql,
+                max_rows,
+                timeout,
+            } => {
+                let cancel = control.begin(id);
+                let outcome = run_query(&namespace, &wql, max_rows, timeout, &cancel);
+                control.end(id);
+                let resp = match outcome {
                     Ok(result) => Response::QueryResult {
                         id,
                         namespace,
@@ -265,8 +376,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
             }
 
             Request::NetworkSnapshot { id } => {
+                let t0 = Instant::now();
                 let resp = match list_connections() {
-                    Ok(snapshot) => Response::Network { id, snapshot },
+                    Ok(snapshot) => Response::Network {
+                        id,
+                        snapshot,
+                        elapsed_ms: ms(t0),
+                    },
                     Err(e) => Response::Error {
                         id,
                         context: "Network snapshot".into(),
@@ -277,8 +393,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
             }
 
             Request::ListEventSubscriptions { id } => {
+                let t0 = Instant::now();
                 let resp = match list_event_subscriptions() {
-                    Ok(report) => Response::EventSubscriptions { id, report },
+                    Ok(report) => Response::EventSubscriptions {
+                        id,
+                        report,
+                        elapsed_ms: ms(t0),
+                    },
                     Err(e) => Response::Error {
                         id,
                         context: "Enumerate event subscriptions".into(),
@@ -289,8 +410,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
             }
 
             Request::ListProviders { id } => {
+                let t0 = Instant::now();
                 let resp = match list_providers() {
-                    Ok(providers) => Response::Providers { id, providers },
+                    Ok(providers) => Response::Providers {
+                        id,
+                        providers,
+                        elapsed_ms: ms(t0),
+                    },
                     Err(e) => Response::Error {
                         id,
                         context: "Enumerate WMI providers".into(),
@@ -305,6 +431,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                 namespace,
                 class,
             } => {
+                let t0 = Instant::now();
                 let resp = match connect(&namespace)
                     .and_then(|c| crate::reflect::read_class_schema(&c, &class))
                 {
@@ -313,6 +440,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                         namespace,
                         class,
                         schema,
+                        elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
@@ -402,8 +530,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>) {
                 namespace,
                 include_methods,
             } => {
-                let resp = match build_search_index(&namespace, include_methods) {
-                    Ok(index) => Response::SearchIndex { id, index },
+                let t0 = Instant::now();
+                let resp = match build_search_index(&namespace, include_methods, &control) {
+                    Ok(index) => Response::SearchIndex {
+                        id,
+                        index,
+                        elapsed_ms: ms(t0),
+                    },
                     Err(e) => Response::Error {
                         id,
                         context: format!("Build search index for {namespace}"),
@@ -455,13 +588,17 @@ thread_local! {
 /// Kept per-request for simplicity; connections are cheap relative to the
 /// user-driven cadence of an explorer.
 fn connect(namespace: &str) -> anyhow::Result<WMIConnection> {
-    let host = HOST.with(|h| h.borrow().clone());
-    match host {
+    match current_host() {
         Some(server) => Ok(WMIConnection::with_credentials_and_namespace(
             &server, namespace, None, None, None,
         )?),
         None => Ok(WMIConnection::with_namespace_path(namespace)?),
     }
+}
+
+/// The host all connections currently target, or `None` for this machine.
+fn current_host() -> Option<String> {
+    HOST.with(|h| h.borrow().clone())
 }
 
 /// Are we in alternate-credential mode (raw DCOM), or local/SSO (`wmi` crate)?
@@ -502,12 +639,20 @@ fn q_maps(namespace: &str, wql: &str) -> anyhow::Result<Vec<HashMap<String, Vari
     }
 }
 
+/// Make sure the raw-DCOM connection for `namespace` exists.
+///
+/// Called before timing an alternate-credential query so the cost of building
+/// the connection lands in `connect_ms` instead of being charged to the query.
+fn ensure_remote(namespace: &str) -> anyhow::Result<()> {
+    with_remote(namespace, |_| Ok(()))
+}
+
 /// Enumerate class names, dispatching local/SSO vs alternate-credential.
-fn q_class_names(namespace: &str) -> anyhow::Result<Vec<String>> {
+fn q_class_names(namespace: &str, control: &WorkerControl) -> anyhow::Result<Vec<String>> {
     if is_alt_cred() {
         with_remote(namespace, |r| r.list_class_names())
     } else {
-        list_classes_local(namespace)
+        list_classes_local(namespace, control)
     }
 }
 
@@ -525,7 +670,7 @@ fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-fn list_classes_local(namespace: &str) -> anyhow::Result<Vec<String>> {
+fn list_classes_local(namespace: &str, control: &WorkerControl) -> anyhow::Result<Vec<String>> {
     let conn = connect(namespace)?;
     // `meta_class` enumerates class *definitions*. The generic `HashMap` path
     // hides WMI system properties (`WBEM_FLAG_NONSYSTEM_ONLY`), so we drop to
@@ -533,6 +678,13 @@ fn list_classes_local(namespace: &str) -> anyhow::Result<Vec<String>> {
     // the reflective wrapper.
     let mut classes: Vec<String> = Vec::new();
     for item in conn.exec_query("SELECT * FROM meta_class")? {
+        // This iterator is the `wmi` crate's, which pulls one object per
+        // `Next(WBEM_INFINITE, ..)`, so it cannot be chunked from here. It is
+        // bounded (~1,400 classes in `root\CIMV2`) but not instant, and exit
+        // should not wait for it either.
+        if control.is_shutdown() {
+            anyhow::bail!("worker is shutting down");
+        }
         let obj = item?;
         if let Ok(name) = obj.class() {
             if !name.is_empty() {
@@ -545,8 +697,55 @@ fn list_classes_local(namespace: &str) -> anyhow::Result<Vec<String>> {
     Ok(classes)
 }
 
-fn run_query(namespace: &str, wql: &str) -> anyhow::Result<QueryResult> {
-    Ok(to_table(q_maps(namespace, wql)?))
+/// Run a WQL query as a chunked, cancellable enumeration.
+///
+/// Two things separate this from the old one-shot `raw_query` path. It pulls
+/// objects in batches with a finite per-batch timeout, so the request can be
+/// cancelled and the worker can be told to exit mid-query; and it honours
+/// `max_rows`, reporting truncation as a fact rather than handing back a short
+/// table that looks complete.
+///
+/// The bind is timed separately from the enumeration — see
+/// [`QueryResult::connect_ms`].
+fn run_query(
+    namespace: &str,
+    wql: &str,
+    max_rows: Option<usize>,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> anyhow::Result<QueryResult> {
+    // Both transports flatten an object identically; only the way the
+    // enumerator is obtained differs.
+    let to_map = |obj: &IWbemClassObject| unsafe { crate::remote::object_to_map(obj) };
+    let alt_cred = is_alt_cred();
+
+    let t_connect = Instant::now();
+    let direct = if alt_cred {
+        ensure_remote(namespace)?;
+        None
+    } else {
+        Some(DirectConn::open(current_host().as_deref(), namespace)?)
+    };
+    let connect_ms = ms(t_connect);
+
+    let t_exec = Instant::now();
+    let (rows, completion) = match &direct {
+        Some(conn) => {
+            let en = conn.exec_enum(wql)?;
+            enumerate::drain(&en, max_rows, deadline, cancel, to_map)?
+        }
+        None => with_remote(namespace, |r| {
+            let en = r.exec_enum(wql)?;
+            enumerate::drain(&en, max_rows, deadline, cancel, to_map)
+        })?,
+    };
+    let elapsed_ms = ms(t_exec);
+
+    let mut table = to_table(rows);
+    table.connect_ms = connect_ms;
+    table.elapsed_ms = elapsed_ms;
+    table.completion = completion;
+    Ok(table)
 }
 
 /// Flatten a list of property maps into a column-aligned table. Columns are
@@ -576,6 +775,7 @@ fn to_table(rows: Vec<HashMap<String, Variant>>) -> QueryResult {
     QueryResult {
         columns,
         rows: table_rows,
+        ..Default::default()
     }
 }
 
@@ -805,7 +1005,11 @@ fn process_names() -> anyhow::Result<HashMap<u32, String>> {
 }
 
 /// Build a class/property(/method) name index for a namespace (for search).
-fn build_search_index(namespace: &str, include_methods: bool) -> anyhow::Result<SearchIndex> {
+fn build_search_index(
+    namespace: &str,
+    include_methods: bool,
+    control: &WorkerControl,
+) -> anyhow::Result<SearchIndex> {
     let conn = connect(namespace)?;
     let mut index = SearchIndex {
         namespace: namespace.to_string(),
@@ -813,6 +1017,12 @@ fn build_search_index(namespace: &str, include_methods: bool) -> anyhow::Result<
         ..Default::default()
     };
     for item in conn.exec_query("SELECT * FROM meta_class")? {
+        // The longest-running request that is not a query: reflecting every
+        // class in a namespace. Same caveat as `list_classes_local` -- the
+        // `wmi` iterator cannot be chunked, so the check is per object.
+        if control.is_shutdown() {
+            anyhow::bail!("worker is shutting down");
+        }
         let Ok(obj) = item else { continue };
         let class = obj.class().unwrap_or_default();
         if class.is_empty() {

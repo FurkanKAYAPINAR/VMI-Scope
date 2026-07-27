@@ -32,6 +32,8 @@ fn main() {
         id: id(),
         namespace: "root\\cimv2".into(),
         wql: "SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem".into(),
+        max_rows: None,
+        timeout: None,
     });
     worker.send(Request::NetworkSnapshot { id: id() });
     worker.send(Request::ListEventSubscriptions { id: id() });

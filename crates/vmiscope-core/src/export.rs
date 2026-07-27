@@ -288,6 +288,7 @@ mod tests {
         let r = QueryResult {
             columns: vec!["Name".into(), "Note".into()],
             rows: vec![vec!["a,b".into(), "say \"hi\"".into()]],
+            ..Default::default()
         };
         let csv = query_to_csv(&r);
         assert!(csv.starts_with("Name,Note\n"));
@@ -322,6 +323,7 @@ mod tests {
         let r = QueryResult {
             columns: vec!["A".into()],
             rows: vec![vec!["1".into()], vec!["2".into()]],
+            ..Default::default()
         };
         let json = query_to_json(&r);
         assert!(json.contains("\"A\": \"1\""));
@@ -333,6 +335,7 @@ mod tests {
         let r = QueryResult {
             columns: vec!["Desc".into()],
             rows: vec![vec!["line one\nline two".into()], vec!["cr\r\nlf".into()]],
+            ..Default::default()
         };
         assert_eq!(
             query_to_csv(&r),
@@ -345,6 +348,7 @@ mod tests {
         let r = QueryResult {
             columns: vec!["Zeta".into(), "Alpha".into(), "Mu".into()],
             rows: vec![vec!["z".into(), "a".into(), "m".into()]],
+            ..Default::default()
         };
         assert_eq!(query_to_csv(&r), "Zeta,Alpha,Mu\nz,a,m\n");
     }
@@ -354,6 +358,7 @@ mod tests {
         let header_only = QueryResult {
             columns: vec!["Name".into(), "ProcessId".into()],
             rows: vec![],
+            ..Default::default()
         };
         assert_eq!(query_to_csv(&header_only), "Name,ProcessId\n");
         assert_eq!(query_to_json(&header_only), "[]");
@@ -369,6 +374,7 @@ mod tests {
         let r = QueryResult {
             columns: vec!["Zeta".into(), "Alpha".into()],
             rows: vec![vec!["z".into(), "a".into()]],
+            ..Default::default()
         };
         let json = query_to_json(&r);
         // `serde_json::Map` is a `BTreeMap` here (the `preserve_order` feature

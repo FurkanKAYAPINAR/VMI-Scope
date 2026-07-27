@@ -24,8 +24,8 @@ use windows::Win32::System::Rpc::{
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Wmi::{
     IEnumWbemClassObject, IWbemClassObject, IWbemContext, IWbemLocator, IWbemServices, WbemLocator,
-    WBEM_FLAG_CONNECT_USE_MAX_WAIT, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_NONSYSTEM_ONLY,
-    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
+    CIMTYPE_ENUMERATION, WBEM_FLAG_CONNECT_USE_MAX_WAIT, WBEM_FLAG_FORWARD_ONLY,
+    WBEM_FLAG_NONSYSTEM_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
 };
 use wmi::{Variant, WMIConnection};
 
@@ -110,7 +110,18 @@ unsafe fn set_blanket(proxy: &windows::core::IUnknown, ident: *const c_void) -> 
     Ok(())
 }
 
-unsafe fn object_to_map(obj: &IWbemClassObject) -> anyhow::Result<HashMap<String, Variant>> {
+/// Read every non-system property of `obj` into a name -> value map.
+///
+/// Shared with the chunked local query path in [`crate::enumerate`] so both
+/// transports flatten an object the same way.
+///
+/// # Safety
+///
+/// `obj` must be a live `IWbemClassObject` with no enumeration already open on
+/// it — `BeginEnumeration` fails on a second concurrent walk.
+pub(crate) unsafe fn object_to_map(
+    obj: &IWbemClassObject,
+) -> anyhow::Result<HashMap<String, Variant>> {
     let mut map = HashMap::new();
     obj.BeginEnumeration(WBEM_FLAG_NONSYSTEM_ONLY.0)?;
     loop {
@@ -123,10 +134,19 @@ unsafe fn object_to_map(obj: &IWbemClassObject) -> anyhow::Result<HashMap<String
         if name.is_empty() {
             break;
         }
-        map.insert(
-            name.to_string(),
-            Variant::from_variant(&val).unwrap_or(Variant::Null),
-        );
+        let raw = Variant::from_variant(&val).unwrap_or(Variant::Null);
+        // WMI hands several CIM types over in a different VARIANT type than
+        // they are declared as -- a `uint64` arrives as `VT_BSTR`, a null array
+        // as `VT_NULL`. The `wmi` crate normalizes with the CIM type it reads
+        // alongside the value, and so must we, or the same property would
+        // render differently depending on which path fetched it. The
+        // conversion is fallible (a provider may report a type its value
+        // cannot hold), and a raw value beats no value.
+        let value = raw
+            .clone()
+            .convert_into_cim_type(CIMTYPE_ENUMERATION(ctype))
+            .unwrap_or(raw);
+        map.insert(name.to_string(), value);
     }
     obj.EndEnumeration()?;
     Ok(map)
@@ -169,7 +189,9 @@ impl RemoteConn {
         }
     }
 
-    fn exec(&self, wql: &str) -> anyhow::Result<IEnumWbemClassObject> {
+    /// Start a WQL enumeration and hand back the raw enumerator, so callers
+    /// that need to pace themselves (see [`crate::enumerate::drain`]) can.
+    pub(crate) fn exec_enum(&self, wql: &str) -> anyhow::Result<IEnumWbemClassObject> {
         unsafe {
             let en: IEnumWbemClassObject = self.svc.ExecQuery(
                 &windows::core::BSTR::from("WQL"),
@@ -188,7 +210,7 @@ impl RemoteConn {
 
     /// Run a query, returning each row as a property map.
     pub fn exec_maps(&self, wql: &str) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
-        let en = self.exec(wql)?;
+        let en = self.exec_enum(wql)?;
         let mut out = Vec::new();
         unsafe {
             loop {
@@ -210,7 +232,7 @@ impl RemoteConn {
 
     /// Enumerate class names via `meta_class`.
     pub fn list_class_names(&self) -> anyhow::Result<Vec<String>> {
-        let en = self.exec("SELECT * FROM meta_class")?;
+        let en = self.exec_enum("SELECT * FROM meta_class")?;
         let mut names = Vec::new();
         unsafe {
             loop {

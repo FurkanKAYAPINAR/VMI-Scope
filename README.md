@@ -177,6 +177,32 @@ feature set, then go past it with security tooling. Status:
 > Note: per-connection *throughput* (bytes/sec) isn't exposed by WMI; that would
 > need an ETW/`iphlpapi` source and is tracked separately.
 
+## Findings
+
+Building this turned up a number of WMI and egui behaviours that are not
+documented anywhere we could find, and several that contradicted what we had
+assumed. They are written up, with the measurements, in
+[docs/FINDINGS.md](docs/FINDINGS.md) — among them:
+
+- **A row cap cannot bound a WMI query.** `CIM_DataFile` capped at 200 rows
+  returns *nothing at all* in 45 seconds, because that provider materialises its
+  whole result before releasing the first object. There is never anything to
+  count, so the cap never fires. Only a deadline bounds it.
+- **A polled `WITHIN` subscription misses 93% of instant-exit processes**
+  (measured: 67 of 72, with a liveness control). Not 100% — a catch happens when
+  a poll boundary lands inside the process lifetime.
+- **`Win32_ProcessStartTrace` is gated by its provider, not by being extrinsic.**
+  `Win32_VolumeChangeEvent` is also extrinsic and subscribes fine unelevated;
+  the five kernel-trace classes are refused. Whether elevation lifts it is
+  *untested* here, and labelled as such.
+- **egui 0.35 shapes text with HarfBuzz now**, so OpenType ligatures fire and
+  cannot be disabled — stock JetBrains Mono silently renders `!=` in a WQL
+  filter as `≠`.
+
+The redesign this work belongs to is planned in
+[docs/REDESIGN.md](docs/REDESIGN.md), which strikes through its own claims where
+live WMI disproved them.
+
 ## Why Rust
 
 The reflective WMI/COM path is where Rust's WMI ecosystem is thinnest — building

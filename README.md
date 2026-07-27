@@ -202,6 +202,11 @@ assumed. They are written up, with the measurements, in
 - **egui 0.35 shapes text with HarfBuzz now**, so OpenType ligatures fire and
   cannot be disabled — stock JetBrains Mono silently renders `!=` in a WQL
   filter as `≠`.
+- **An icon font cannot share a family with a text font, in either order.**
+  Inter carries 745 Private Use Area glyphs of its own and answered 32 of our
+  94 icons before Phosphor saw them; Phosphor carries 26 Latin letters and
+  would answer lowercase text if put first. The test written to prevent this
+  asserted the wrong invariant and guaranteed it instead.
 
 The redesign this work belongs to is planned in
 [docs/REDESIGN.md](docs/REDESIGN.md), which strikes through its own claims where

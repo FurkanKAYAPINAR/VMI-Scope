@@ -173,6 +173,49 @@ Phosphor is affected too: it ships every icon *name* as a ligature, so if the
 icon font ever led a family instead of trailing it, the words "copy", "key",
 "star" and "folder" would render as pictures.
 
+### An icon font cannot share a family with a text font, in either order
+
+This one cost the most, and the test written to prevent it asserted the wrong
+thing and guaranteed it instead.
+
+egui resolves a family **per character, first match wins**. The obvious
+arrangement is `Proportional = [Inter, Phosphor]`, so text comes from Inter and
+anything Inter lacks — the icons — falls through. Measured from the three
+`cmap` tables:
+
+```
+Private Use Area glyphs
+  Phosphor        1513
+  Inter            745     <- answers these before Phosphor ever sees them
+  JetBrains Mono     7
+
+our 94 icons, answered first by a text font
+  in Proportional: 32  (34%)
+  in Monospace:     1
+```
+
+A third of the icon set rendered as unrelated letters: the download arrow came
+out as `Š`, the floppy as `!`, the folder as `ſ`, the refresh arrow as `.`. It
+is not obviously wrong at a glance — it reads as a font that is merely a bit
+odd — which is why it survived a build, a test suite and a screenshot review.
+
+Reversing the order does not help. Phosphor covers **26 Latin letters and the
+space**, because it ships each icon's *name* as an OpenType ligature. Put it
+first and it answers lowercase text, and (since egui 0.35 shapes with HarfBuzz
+and cannot disable ligatures) the words "copy", "key", "star" and "folder"
+render as pictures.
+
+The only arrangement where neither font is asked for a character it should not
+answer is **separate families**: the icon font gets `FontFamily::Name("icons")`
+and the text families do not fall back to it. Icons are then rendered by naming
+that family — for icon-plus-label, a `LayoutJob` with a section each, since one
+`RichText` carries exactly one family.
+
+The lesson is about the test, not the fonts. The original test asserted "every
+text family must fall back to the icon font", which is precisely the broken
+arrangement, stated as an invariant and passing. A test can only protect the
+property you thought to name.
+
 ### Turning off `default_fonts` costs less than leaving it on
 
 `epaint_default_fonts` embeds **1,414,020 bytes** into every egui binary (Hack,

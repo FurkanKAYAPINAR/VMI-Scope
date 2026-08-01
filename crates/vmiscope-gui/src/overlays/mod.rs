@@ -10,6 +10,7 @@ pub(crate) mod actions;
 pub(crate) mod confirm;
 pub(crate) mod errorlog;
 pub(crate) mod mof;
+pub(crate) mod palette;
 pub(crate) mod save_query;
 
 // ---------------------------------------------------------------------------

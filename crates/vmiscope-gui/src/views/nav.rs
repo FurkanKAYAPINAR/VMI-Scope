@@ -128,12 +128,7 @@ impl View {
     pub(crate) fn is_placeholder(self) -> bool {
         matches!(
             self,
-            Self::Query
-                | Self::Process
-                | Self::Saved
-                | Self::Compare
-                | Self::Machines
-                | Self::Settings
+            Self::Query | Self::Process | Self::Saved | Self::Compare | Self::Machines
         )
     }
 }

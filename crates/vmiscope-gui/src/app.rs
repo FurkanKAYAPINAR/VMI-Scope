@@ -84,9 +84,18 @@ pub struct VmiScopeApp {
     /// `--decorated`: the OS draws the caption and the resize border, so the
     /// shell must not draw its own. Read by the title bar and by `shell::chrome`.
     pub(crate) decorated: bool,
-    /// The command palette's open flag. The palette itself lands with task
-    /// 2.16; until then the title bar's trigger owns it.
+    /// The command palette's open flag. Set by the title bar's trigger, by
+    /// Ctrl+K, and cleared by the palette itself. See `overlays::palette`.
     pub(crate) palette_open: bool,
+    /// Was the palette drawn last frame? The difference against `palette_open`
+    /// is what the palette reads as "just opened", which is the one frame it
+    /// takes focus and selects the previous query.
+    pub(crate) palette_shown: bool,
+    /// The palette's query. Kept across opens deliberately -- it is pre-selected
+    /// when the palette reopens, so it is a starting point rather than clutter.
+    pub(crate) palette_query: String,
+    /// Index of the highlighted palette row.
+    pub(crate) palette_sel: usize,
     /// Persisted query history + saved queries.
     pub(crate) config: Config,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
@@ -193,7 +202,22 @@ impl VmiScopeApp {
         // Fonts first: `set_fonts` rebuilds the atlas, and installing the style
         // against the old font set would size text against the wrong metrics.
         crate::theme::fonts::install(&cc.egui_ctx);
-        crate::theme::install(&cc.egui_ctx, crate::theme::Theme::default());
+        // Load config before installing the style so a persisted accent/density
+        // lands on the first frame instead of flashing the default and swapping.
+        let config = Config::load();
+        crate::theme::install(
+            &cc.egui_ctx,
+            crate::theme::Theme {
+                accent: config.accent,
+                density: config.density,
+            },
+        );
+        // The generator's live language starts from the persisted default; the
+        // Settings control keeps the two in step after that.
+        let script_lang = match config.default_lang {
+            crate::config::CodeLang::PowerShell => ScriptLang::PowerShell,
+            crate::config::CodeLang::VbScript => ScriptLang::VbScript,
+        };
 
         // Windows 11 rounds a decorated window itself; an undecorated one keeps
         // square corners unless DWM is told otherwise, and the shell frame's
@@ -213,7 +237,10 @@ impl VmiScopeApp {
             view: View::Explorer,
             decorated,
             palette_open: false,
-            config: Config::load(),
+            palette_shown: false,
+            palette_query: String::new(),
+            palette_sel: 0,
+            config,
             class_cache: HashMap::new(),
             conn_host: String::new(),
             conn_status: ConnStatus::Local,
@@ -250,7 +277,7 @@ impl VmiScopeApp {
             class_filter: String::new(),
             selected_class: None,
             query_text: DEFAULT_QUERY.to_string(),
-            script_lang: ScriptLang::PowerShell,
+            script_lang,
             save_query_open: false,
             save_query_name: String::new(),
             central_view: CentralView::Instances,
@@ -528,6 +555,11 @@ impl VmiScopeApp {
                     self.ui_connect_card(ui);
                 });
             }
+            View::Settings => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_settings(ui);
+                });
+            }
             other => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.ui_placeholder(ui, other);
@@ -578,8 +610,11 @@ impl eframe::App for VmiScopeApp {
             }
         }
 
-        // Drive the live network refresh from the frame clock.
+        // Drive the live network refresh from the frame clock. `live_polling` is
+        // the Settings-level switch for all live views; `net_paused` is the
+        // Network view's own per-visit pause on top of it.
         if self.view == View::Network
+            && self.config.live_polling
             && !self.net_paused
             && !self.net_inflight
             && (now - self.net_last_refresh) >= NET_REFRESH_SECS
@@ -597,11 +632,10 @@ impl eframe::App for VmiScopeApp {
             self.request_providers();
         }
 
-        // Escape closes the palette. The palette itself is task 2.16; this only
-        // keeps its flag from being a state you cannot get back out of.
-        if self.palette_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.palette_open = false;
-        }
+        // The global keys, before anything draws: a shortcut has to be decided
+        // before a view gets a chance to read the same keystroke. See
+        // `overlays::palette` for the focus rule and the matching order.
+        self.handle_shortcuts(ui, now);
 
         // The shell. Panel order is the whole trick here:
         //
@@ -632,11 +666,15 @@ impl eframe::App for VmiScopeApp {
         self.ui_save_query_window(ui.ctx());
         self.ui_error_log_window(ui.ctx());
 
+        // The palette is last, and a `Modal` rather than a `Window`: it is the
+        // frontmost thing in the app and it dims what it covers.
+        self.ui_palette(ui, now);
+
         // Repaint while work is in flight, and continuously on the live views.
         if !self.pending.is_empty() {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
-        if self.view == View::Network && !self.net_paused {
+        if self.view == View::Network && self.config.live_polling && !self.net_paused {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
         // Keep events flowing in while the monitor runs.

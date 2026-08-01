@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-01
+
+### Added
+- **A real application shell.** The five-tab strip is gone. An undecorated
+  window with a 40px title bar (app mark, machine chip, palette trigger, live
+  toggle, and its own minimise / maximise / close), a 64px rail carrying all
+  eleven destinations in three groups, and a 24px status bar. `--decorated`
+  restores the OS caption for anyone who wants it.
+- **A Ctrl+K command palette** over every destination plus Refresh, Run query,
+  Toggle live, Export and the theme switches, with class, property and method
+  hits from the existing search index. Arrow keys move, Enter runs, Esc closes.
+- **Settings**, in four groups. Accent, density, live polling, default script
+  language, row limit and operation timeout take effect immediately; everything
+  else renders disabled with a tooltip naming what will wire it, because an
+  enabled control that does nothing is worse than no control.
+- **Process monitoring in the core**: `Win32_ProcessStartTrace` / `StopTrace`
+  where the token allows it, falling back to the polled query where it does
+  not, and saying which mode it is in. The row model keeps ended processes on
+  screen, dimmed, rather than dropping them.
+
+### Changed
+- `Config` is versioned. A v1 file loads, keeps its history and saved queries,
+  and is migrated in place.
+- A maximised undecorated window no longer hangs 8 points off every screen
+  edge, which had been putting the top of the title bar and the outer edge of
+  the close button off the display.
+
 ## [0.7.0] - 2026-07-27
 
 ### Added
@@ -171,7 +198,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.4.0...v0.5.0

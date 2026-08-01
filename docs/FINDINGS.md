@@ -113,6 +113,37 @@ line. `Win32_Process.CreationDate` is `CIM_DATETIME` while `TIME_CREATED` is a
 `UInt64` FILETIME — different epochs *and* representations, so the obvious
 comparison silently no-ops.
 
+### WMI marshals `uint64` as a `BSTR`
+
+`Win32_ProcessStartTrace.TIME_CREATED` is declared `uint64` and arrives as
+**text**. A variant conversion that only handles the numeric cases reads it as
+0 — silently, with no error anywhere. The PID-reuse guard that compares an
+event's creation time against `Win32_Process.CreationDate` therefore failed on
+every single event, and the symptom was "command-line enrichment doesn't work",
+which is a long way from the cause.
+
+### `wmi::exec_notification_query` cannot carry two subscriptions on one thread
+
+`QueryResultEnumerator::next` hardcodes `Next(WBEM_INFINITE, ..)`, so a thread
+pumping two notification streams parks inside whichever one is quiet and
+starves the other. Process start and stop are exactly that shape. The fix is
+the same raw `IWbemServices::ExecNotificationQuery` with `lTimeout = 0` on both
+— which also lets the monitor thread be joined on drop, something the
+`WBEM_INFINITE` path cannot offer.
+
+### The intrinsic fallback cannot see a process's owner
+
+`Win32_ProcessStartTrace` carries a `Sid`. Its polled stand-in delivers a
+`TargetInstance` that is a `Win32_Process`, and **`Win32_Process` has no `Sid`
+property at all** — so a SID-based owner column is dead in the only mode an
+unelevated operator can reach, and every row shows a blank user. `GetOwner`
+fills it there, with the race that implies.
+
+Related: in that mode `TargetInstance.CommandLine` is NULL for any process the
+subscribing token does not own — all of session 0. That has to be reported as
+*unreadable*, not as an empty command line. They are different facts, and a
+security tool that conflates them is lying by omission.
+
 ### Class qualifier casing is not stable
 
 `root\CIMV2` returns `dynamic` and `provider` lowercase, but `Association`,

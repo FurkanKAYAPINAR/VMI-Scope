@@ -901,6 +901,18 @@ security tool.
 
 ### 9.2 What the trace classes actually carry
 
+> **Correction, found by implementing it.** This section notes that the trace
+> classes carry the owner SID and that the intrinsic path needs `GetOwner`, but
+> does not draw the conclusion: the polled fallback delivers a `TargetInstance`
+> that is a `Win32_Process`, and `Win32_Process` has **no `Sid` property at
+> all**. So task 4b.6's SID pipeline is unreachable in the only mode an
+> unelevated operator can use, and the owner column is blank on every row
+> unless `GetOwner` fills it there. Two more things only running revealed:
+> `TIME_CREATED` is a `uint64` that WMI marshals as a `BSTR`, so a numeric-only
+> conversion reads 0 and the PID-reuse guard fails on every event; and in the
+> fallback `TargetInstance.CommandLine` is NULL for any process this token does
+> not own, which must be reported as unreadable rather than as empty.
+
 Verified against the live schema on this machine:
 
 `Win32_ProcessStartTrace` → `ProcessID`, `ParentProcessID`, `ProcessName`,

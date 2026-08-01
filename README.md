@@ -35,12 +35,21 @@ filling a real gap in the Rust ecosystem (the `wmi` crate is optimized for
 
 ## Features
 
-Five tabs: **Explorer** (browse WMI), **Network** (live connections),
-**Persistence** (WMI event-subscription hunter, with snapshot/diff + HTML/CSV/JSON
-export), **Providers**, and **Events** (live WMI notification monitor).
-Every table sorts — click a column header (ascending → descending → off).
-Point the **Host** field in the top bar at a remote machine (current-user SSO)
-and every tab reflects it.
+Eleven destinations on a rail, in three groups:
+
+| | |
+|---|---|
+| **Explore** | Explorer · Query · Events |
+| **Security** | Process · Network · Persistence · Providers |
+| **Data** | Saved · Compare · Machines |
+
+Some of those are still being built; they appear in the rail dimmed, with a
+view that says so. Hiding unfinished work only makes it invisible.
+
+**Ctrl+K** opens a command palette over every destination and over class,
+property and method names. Every table sorts — click a column header
+(ascending → descending → off). Point the machine chip at a remote host
+(current-user SSO) and every view follows it.
 
 ### Explorer
 - **Namespace tree** — lazily enumerated from `root` down (`__NAMESPACE`).
@@ -95,14 +104,23 @@ front-end could later be swapped (e.g. Tauri) without touching the engine.
 ```
 vmi-scope/
 ├─ crates/
-│  ├─ vmiscope-core/     # GUI-agnostic WMI engine
-│  │  ├─ worker.rs       #   background thread: Request → Response over channels
-│  │  ├─ value.rs        #   wmi::Variant → display string
-│  │  └─ examples/probe.rs   # CLI reality-check against live WMI
-│  └─ vmiscope-gui/      # egui / eframe desktop front-end
-│     ├─ app.rs          #   state, request/response plumbing, all panels
-│     └─ main.rs         #   window boot
+│  ├─ vmiscope-core/       # GUI-agnostic WMI engine
+│  │  ├─ worker.rs         #   background thread: Request → Response over channels
+│  │  ├─ enumerate.rs      #   chunked, cancellable, deadline-bounded enumeration
+│  │  ├─ reflect.rs        #   raw IWbemClassObject reflection
+│  │  ├─ procmon.rs        #   process start/stop, trace with a polled fallback
+│  │  └─ examples/         #   probe, cancel, proctrace — reality checks vs live WMI
+│  └─ vmiscope-gui/        # egui / eframe desktop front-end
+│     ├─ theme/            #   tokens, embedded fonts, verified icon codepoints
+│     ├─ widgets/          #   the Nocturne kit: one table, one code panel, ...
+│     ├─ shell/            #   custom title bar, rail, status bar, window chrome
+│     ├─ views/            #   one module per destination
+│     └─ state/            #   request/response plumbing and per-view models
 ```
+
+`check.ps1` runs CI plus the design-system invariants a compiler cannot catch:
+no colour literal outside the token module, no unthemeable separator, and no
+glyph the embedded fonts cannot render.
 
 **Threading model.** COM apartments are thread-affine and `wmi`'s
 `WMIConnection` is `!Send`, so a single dedicated worker thread owns every

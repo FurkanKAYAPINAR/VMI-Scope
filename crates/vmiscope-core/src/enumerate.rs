@@ -365,6 +365,35 @@ impl DirectConn {
         // `COAUTHIDENTITY` of the alternate-credential path has to be pushed
         // onto each new proxy by hand.
     }
+
+    /// Open an event subscription and hand back the raw enumerator.
+    ///
+    /// The same reason [`DirectConn`] exists at all applies twice over here.
+    /// `wmi`'s `exec_notification_query` returns an opaque iterator whose
+    /// `next()` pulls one object per `Next(WBEM_INFINITE, ..)`, and this
+    /// monitor needs **two** subscriptions merged on **one** thread — which is
+    /// impossible with a blocking pull, because whichever stream is quiet parks
+    /// the thread and starves the other. Owning the enumerator allows a finite
+    /// (in practice zero) `lTimeout`, so both can be drained in turn and the
+    /// stop flag can be read between rounds.
+    ///
+    /// The error is returned unmapped, as a `windows::core::Error`: the access
+    /// denial that gates `Win32_ProcessStartTrace` surfaces from
+    /// `ExecNotificationQuery` itself, and [`crate::procmon`] needs the HRESULT
+    /// intact to classify it.
+    pub(crate) fn exec_notification(
+        &self,
+        wql: &str,
+    ) -> windows::core::Result<IEnumWbemClassObject> {
+        unsafe {
+            self.svc.ExecNotificationQuery(
+                &windows::core::BSTR::from("WQL"),
+                &windows::core::BSTR::from(wql),
+                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                None::<&IWbemContext>,
+            )
+        }
+    }
 }
 
 unsafe fn set_blanket(svc: &IWbemServices, auth: RPC_C_AUTHN_LEVEL) -> anyhow::Result<()> {

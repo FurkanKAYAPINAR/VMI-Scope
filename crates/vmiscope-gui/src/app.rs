@@ -11,15 +11,18 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::config::Config;
+use crate::shell;
 use crate::state::ids::PendingKind;
 use crate::theme::icons;
-use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, SURFACE};
+use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, S2, S6, SURFACE};
+use crate::views::nav::View;
 use crate::views::network::NET_REFRESH_SECS;
-use crate::widgets::button::{btn_primary, btn_secondary, focus_ring};
+use crate::widgets::button::{btn_primary, focus_ring};
+use crate::widgets::card::card;
 use crate::widgets::chip::dot_chip;
 use crate::widgets::field::mono_input;
 use crate::widgets::loading::spinner;
-use crate::widgets::rule::{hrule, vrule};
+use crate::widgets::rule::vrule;
 
 use vmiscope_core::{
     ClassSchema, Connection, Credential, EventMonitor, MethodOutcome, MethodTarget, MonitorMsg,
@@ -37,15 +40,9 @@ const HOST_W: f32 = 160.0;
 const CRED_W: f32 = 90.0;
 const DOMAIN_W: f32 = 80.0;
 
-/// The top-level tools.
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub(crate) enum Tab {
-    Explorer,
-    Network,
-    Persistence,
-    Providers,
-    Events,
-}
+/// The temporary connect card's maximum width inside the Machines placeholder.
+/// Full-bleed, the row's fields would spread across the whole window.
+const CONNECT_CARD_W: f32 = 640.0;
 
 /// A connection tracked across snapshots so it can fade out after it closes.
 pub(crate) struct TrackedConn {
@@ -82,7 +79,14 @@ pub struct VmiScopeApp {
     pub(crate) worker: WmiWorker,
     pub(crate) next_id: u64,
     pub(crate) pending: HashMap<u64, PendingKind>,
-    pub(crate) active_tab: Tab,
+    /// Where we are. The rail's eleven destinations; see `views::nav`.
+    pub(crate) view: View,
+    /// `--decorated`: the OS draws the caption and the resize border, so the
+    /// shell must not draw its own. Read by the title bar and by `shell::chrome`.
+    pub(crate) decorated: bool,
+    /// The command palette's open flag. The palette itself lands with task
+    /// 2.16; until then the title bar's trigger owns it.
+    pub(crate) palette_open: bool,
     /// Persisted query history + saved queries.
     pub(crate) config: Config,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
@@ -185,17 +189,30 @@ pub struct VmiScopeApp {
 }
 
 impl VmiScopeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, decorated: bool) -> Self {
         // Fonts first: `set_fonts` rebuilds the atlas, and installing the style
         // against the old font set would size text against the wrong metrics.
         crate::theme::fonts::install(&cc.egui_ctx);
         crate::theme::install(&cc.egui_ctx, crate::theme::Theme::default());
 
+        // Windows 11 rounds a decorated window itself; an undecorated one keeps
+        // square corners unless DWM is told otherwise, and the shell frame's
+        // `R_LG` radius would then be drawn inside a square hole.
+        #[cfg(windows)]
+        if !decorated {
+            use winit::platform::windows::{CornerPreference, WindowExtWindows};
+            if let Some(window) = cc.winit_window() {
+                window.set_corner_preference(CornerPreference::Round);
+            }
+        }
+
         let mut app = Self {
             worker: WmiWorker::spawn(),
             next_id: 0,
             pending: HashMap::new(),
-            active_tab: Tab::Explorer,
+            view: View::Explorer,
+            decorated,
+            palette_open: false,
             config: Config::load(),
             class_cache: HashMap::new(),
             conn_host: String::new(),
@@ -281,7 +298,60 @@ impl VmiScopeApp {
     }
 
     // ------------------------------------------------------------------
+    // Shell services
+    // ------------------------------------------------------------------
+
+    /// Re-fetch whatever the active view is showing. Bound to the title bar's
+    /// refresh button, and to F5 once task 2.21 lands the shortcut.
+    ///
+    /// The placeholder destinations have nothing to re-fetch, and Events is
+    /// deliberately not restarted: the monitor is a live subscription on the
+    /// far side, so tearing it down and rebuilding it is a decision its own
+    /// view asks for explicitly.
+    pub(crate) fn refresh_active_view(&mut self, now: f64) {
+        match self.view {
+            View::Explorer | View::Query => self.run_query(),
+            View::Network => self.request_network(now),
+            View::Persistence => self.request_events(),
+            View::Providers => self.request_providers(),
+            View::Events
+            | View::Process
+            | View::Saved
+            | View::Compare
+            | View::Machines
+            | View::Settings => {}
+        }
+    }
+
+    /// The empty state a destination shows before it is built.
+    ///
+    /// The rail deliberately lists every planned destination, so every one of
+    /// them has to land somewhere that says what it will be rather than on a
+    /// blank pane that reads as a rendering failure.
+    fn ui_placeholder(&self, ui: &mut egui::Ui, view: View) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(S6);
+            ui.label(icons::glyph(view.icon()).size(34.0).color(muted(20)));
+            ui.add_space(S2);
+            ui.heading(view.title());
+            ui.label(egui::RichText::new(view.hint()).color(muted(55)));
+            ui.add_space(S2);
+            ui.label(
+                egui::RichText::new("Not built yet \u{2014} this destination is on the roadmap.")
+                    .text_style(egui::TextStyle::Small)
+                    .color(muted(38)),
+            );
+        });
+    }
+
+    // ------------------------------------------------------------------
     // UI: connection bar (remote host, current user / SSO)
+    //
+    // Moved out of the top bar by task 2.26. Its logic is untouched; only its
+    // home changed. It now lives inside the Machines placeholder, which is
+    // where the real connection manager lands in Phase 5 and where the title
+    // bar's machine chip already navigates -- so someone looking for "point
+    // this at another box" arrives at it from the thing that shows the box.
     // ------------------------------------------------------------------
 
     fn ui_connection_bar(&mut self, ui: &mut egui::Ui) {
@@ -384,36 +454,105 @@ impl VmiScopeApp {
         });
     }
 
-    // ------------------------------------------------------------------
-    // UI: status bar
-    // ------------------------------------------------------------------
+    // The status bar moved wholesale into `shell::statusbar` with task 2.15;
+    // its error / namespace / query line and the `Log (n)` toggle live there.
 
-    fn ui_status(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if let Some(err) = &self.error {
-                ui.label(icons::labelled_styled(
-                    ui,
-                    icons::WARNING,
-                    "error",
-                    egui::TextStyle::Body,
-                    BAD,
-                ));
-                ui.weak("\u{2014}");
-                ui.label(err.replace('\n', "  \u{2014}  "));
-            } else {
-                ui.weak(format!("Namespace: {}", self.active_ns));
-                if !self.result_wql.is_empty() {
-                    ui.weak("\u{2014}");
-                    ui.weak(&self.result_wql);
+    /// The per-view content, added inside the shell's central panel.
+    ///
+    /// Every one of the eleven destinations is dispatched here. The six with no
+    /// view yet get the empty state rather than falling through to a blank
+    /// pane.
+    fn ui_view(&mut self, ui: &mut egui::Ui, now: f64) {
+        match self.view {
+            View::Explorer => {
+                egui::Panel::left("vs_browser")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .size_range(egui::Rangef::new(200.0, 520.0))
+                    .show(ui, |ui| {
+                        self.ui_namespace_tree(ui);
+                        ui.add_space(6.0);
+                        self.ui_search(ui);
+                        ui.add_space(6.0);
+                        self.ui_class_list(ui);
+                    });
+
+                if self.actions_open {
+                    egui::Panel::right("vs_actions")
+                        .resizable(true)
+                        .default_size(360.0)
+                        .size_range(egui::Rangef::new(260.0, 620.0))
+                        .show(ui, |ui| {
+                            self.ui_actions(ui);
+                        });
                 }
-            }
-            if !self.error_log.is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if btn_secondary(ui, format!("Log ({})", self.error_log.len())).clicked() {
-                        self.error_log_open = !self.error_log_open;
-                    }
+
+                if self.selected_row.is_some() {
+                    egui::Panel::right("vs_detail")
+                        .resizable(true)
+                        .default_size(340.0)
+                        .size_range(egui::Rangef::new(220.0, 560.0))
+                        .show(ui, |ui| {
+                            self.ui_detail(ui);
+                        });
+                }
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_central(ui);
                 });
             }
+            View::Network => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_network(ui, now);
+                });
+            }
+            View::Persistence => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_persistence(ui);
+                });
+            }
+            View::Providers => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_providers(ui);
+                });
+            }
+            View::Events => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_events(ui);
+                });
+            }
+            View::Machines => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_placeholder(ui, View::Machines);
+                    ui.add_space(S6);
+                    self.ui_connect_card(ui);
+                });
+            }
+            other => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_placeholder(ui, other);
+                });
+            }
+        }
+    }
+
+    /// The temporary home of the connection bar. See the note above
+    /// `ui_connection_bar`.
+    fn ui_connect_card(&mut self, ui: &mut egui::Ui) {
+        let width = CONNECT_CARD_W.min(ui.available_width());
+        ui.vertical_centered(|ui| {
+            ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                ui.set_width(width);
+                card(ui, |ui| {
+                    ui.label(icons::labelled(
+                        ui,
+                        icons::PLUGS_CONNECTED,
+                        "Connect to a host",
+                    ));
+                    ui.add_space(S2);
+                    self.ui_connection_bar(ui);
+                });
+            });
         });
     }
 }
@@ -440,7 +579,7 @@ impl eframe::App for VmiScopeApp {
         }
 
         // Drive the live network refresh from the frame clock.
-        if self.active_tab == Tab::Network
+        if self.view == View::Network
             && !self.net_paused
             && !self.net_inflight
             && (now - self.net_last_refresh) >= NET_REFRESH_SECS
@@ -448,134 +587,56 @@ impl eframe::App for VmiScopeApp {
             self.request_network(now);
         }
 
-        // Load the persistence scan the first time its tab is opened.
-        if self.active_tab == Tab::Persistence
-            && self.events_report.is_none()
-            && !self.events_loading
-        {
+        // Load the persistence scan the first time its view is opened.
+        if self.view == View::Persistence && self.events_report.is_none() && !self.events_loading {
             self.request_events();
         }
 
-        // Load the provider list the first time its tab is opened.
-        if self.active_tab == Tab::Providers && self.providers.is_none() && !self.providers_loading
-        {
+        // Load the provider list the first time its view is opened.
+        if self.view == View::Providers && self.providers.is_none() && !self.providers_loading {
             self.request_providers();
         }
 
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("VMI-Scope");
-                vrule(ui, DIVIDER);
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    Tab::Explorer,
-                    icons::labelled(ui, icons::TREE_STRUCTURE, "Explorer"),
-                );
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    Tab::Network,
-                    icons::labelled(ui, icons::GLOBE_HEMISPHERE_WEST, "Network"),
-                );
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    Tab::Persistence,
-                    icons::labelled(ui, icons::SHIELD_WARNING, "Persistence"),
-                );
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    Tab::Providers,
-                    icons::labelled(ui, icons::PLUGS_CONNECTED, "Providers"),
-                );
-                ui.selectable_value(
-                    &mut self.active_tab,
-                    Tab::Events,
-                    icons::labelled(ui, icons::BROADCAST, "Events"),
-                );
-                // No light/dark switch: Nocturne is a dark design, and the
-                // light variant would be stock egui wearing our accent.
-            });
-            hrule(ui);
-            self.ui_connection_bar(ui);
-            ui.add_space(4.0);
-        });
-
-        egui::Panel::bottom("status").show(ui, |ui| {
-            self.ui_status(ui);
-        });
-
-        match self.active_tab {
-            Tab::Explorer => {
-                egui::Panel::left("browser")
-                    .resizable(true)
-                    .default_size(300.0)
-                    .size_range(egui::Rangef::new(200.0, 520.0))
-                    .show(ui, |ui| {
-                        self.ui_namespace_tree(ui);
-                        ui.add_space(6.0);
-                        self.ui_search(ui);
-                        ui.add_space(6.0);
-                        self.ui_class_list(ui);
-                    });
-
-                if self.actions_open {
-                    egui::Panel::right("actions")
-                        .resizable(true)
-                        .default_size(360.0)
-                        .size_range(egui::Rangef::new(260.0, 620.0))
-                        .show(ui, |ui| {
-                            self.ui_actions(ui);
-                        });
-                }
-
-                if self.selected_row.is_some() {
-                    egui::Panel::right("detail")
-                        .resizable(true)
-                        .default_size(340.0)
-                        .size_range(egui::Rangef::new(220.0, 560.0))
-                        .show(ui, |ui| {
-                            self.ui_detail(ui);
-                        });
-                }
-
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_central(ui);
-                });
-            }
-            Tab::Network => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_network(ui, now);
-                });
-            }
-            Tab::Persistence => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_persistence(ui);
-                });
-            }
-            Tab::Providers => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_providers(ui);
-                });
-            }
-            Tab::Events => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_events(ui);
-                });
-            }
+        // Escape closes the palette. The palette itself is task 2.16; this only
+        // keeps its flag from being a state you cannot get back out of.
+        if self.palette_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.palette_open = false;
         }
 
+        // The shell. Panel order is the whole trick here:
+        //
+        //   1. `title_drag` BEFORE the title bar, so the bar's buttons -- which
+        //      register later -- win the hit test where they overlap it.
+        //   2. title bar, status bar, rail, then the view's own panels, then a
+        //      `CentralPanel` LAST. egui requires the central panel last, and
+        //      the chrome has to be outermost or the views would lay out over it.
+        //   3. `resize_strips` AFTER everything, or the panels swallow the
+        //      window edges and nothing resizes.
+        //
+        // See `shell::chrome` for why 1 and 3 are the way round they are.
+        egui::CentralPanel::default()
+            .frame(shell::chrome::shell_frame(ui, self.decorated))
+            .show(ui, |ui| {
+                shell::chrome::title_drag(ui, self.decorated);
+                shell::titlebar::show(self, ui);
+                shell::statusbar::show(self, ui);
+                shell::rail::show(self, ui);
+                self.ui_view(ui, now);
+                shell::chrome::resize_strips(ui, self.decorated);
+            });
+
         // MOF viewer, method-invocation confirmation, and save-query dialog float
-        // above the tabs.
+        // above the views.
         self.ui_mof_window(ui.ctx());
         self.ui_confirm_window(ui.ctx());
         self.ui_save_query_window(ui.ctx());
         self.ui_error_log_window(ui.ctx());
 
-        // Repaint while work is in flight, and continuously on the live tab.
+        // Repaint while work is in flight, and continuously on the live views.
         if !self.pending.is_empty() {
             ui.ctx().request_repaint_after(Duration::from_millis(30));
         }
-        if self.active_tab == Tab::Network && !self.net_paused {
+        if self.view == View::Network && !self.net_paused {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
         // Keep events flowing in while the monitor runs.

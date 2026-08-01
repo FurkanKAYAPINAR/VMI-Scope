@@ -126,7 +126,15 @@ impl View {
     /// Views that are not built yet, so the rail can show them as coming
     /// without pretending they work. Removed as each one lands.
     pub(crate) fn is_placeholder(self) -> bool {
-        matches!(self, Self::Query | Self::Process | Self::Saved | Self::Compare | Self::Machines)
+        matches!(
+            self,
+            Self::Query
+                | Self::Process
+                | Self::Saved
+                | Self::Compare
+                | Self::Machines
+                | Self::Settings
+        )
     }
 }
 

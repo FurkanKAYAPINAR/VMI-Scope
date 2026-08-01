@@ -452,6 +452,17 @@ if ui.add(Button::new(ICON_MINUS).frame(false).min_size(vec2(38.0,40.0))).clicke
 
 ### 3.4 Rail (final order — resolves the 7-slot problem)
 
+> **Corrections from building it.** The icon column below is stale in one row:
+> Machines ships `HARD_DRIVES`, not `ph-desktop-tower` (`views/nav.rs` is the
+> source of truth). The help glyph and avatar in the bottom cluster were never
+> built -- they are not destinations, and inventing an account affordance for a
+> local tool would be a lie. Section 3.3's "WMI Explorer" title is likewise
+> wrong: the product is VMI-Scope, which is what the window, the binary and the
+> title bar all say. Section 3.2 names a `TITLEBAR_BG` token that does not
+> exist; all three chrome bars use 3.5's own formula, `SURFACE` at 55%. And
+> 3.1's `with_icon(include_bytes!("../assets/icon.png"))` cannot be written --
+> there is no icon file, only fonts -- so it is skipped until one exists.
+
 The mock has 7; we ship **11 destinations in 3 groups**, separated by faded 40px-wide hairlines, with the settings/help/avatar cluster pinned to the bottom. A 64px × 11-item rail at 44px/item = 484px, which fits the 560px min content height (780 − 40 − 24 = 716 at default size).
 
 ```
@@ -486,6 +497,22 @@ Rationale: the design's three deliberate clusters (browse / library / config) su
 24px, `Frame::NONE.fill(SURFACE.gamma_multiply(0.55) over BG).inner_margin(Margin::symmetric(12,0))`, 11px Small. Left: live dot (pulsing) + connection text. `·` + view context text. Right (`Layout::right_to_left`): "F5 refresh" · "Ctrl K palette" · provider-host stats (mono; dashes when the poll is disabled) · error-log toggle `Log (n)` when `error_log` is non-empty (preserved from today's `ui_status:2779`).
 
 ### 3.6 Window resizing (mandatory re-implementation)
+
+> **Correction: the snippet below needs a clamp.** On a window narrower than
+> twice the grab width, the edge strips invert, and an inverted rect is never
+> hit -- the symptom is "resizing stopped working" at small sizes, with nothing
+> in the code looking wrong. The shipped version clamps and has a test.
+>
+> **Missing entirely: the maximised overhang.** Measured here: maximised,
+> Windows places the window at `-8,-8 .. 1928,1040` against a `0,0 .. 1920,1032`
+> work area -- **8 points off-screen on every side**. A decorated window hides
+> that under its frame; an undecorated one draws into it, so the top of the
+> title bar and the outer edge of the close button are simply not on the
+> display. `shell::chrome::maximized_inset` pulls the shell in by
+> `SM_CXSIZEFRAME + SM_CXPADDEDBORDER` while maximised (and drops the corner
+> radius, since a maximised window has no visible corners). Verified by
+> sampling the rendered window: restored, the accent glyph's outline is at x=11
+> with no inset; maximised, the shell boundary sits at exactly x=8.
 
 With `decorations(false)`, egui-winit forwards `with_undecorated_shadow(true)`, winit's `WM_NCCALCSIZE` swallows the whole non-client area, and winit implements **no `WM_NCHITTEST`**. So: no OS resize border, no OS caption drag, and a documented **1px black line at the top edge** (`params.rgrc[0].top += 1`).
 

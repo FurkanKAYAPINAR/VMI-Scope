@@ -29,7 +29,12 @@ eframe = { version = "0.35.0", default-features = false, features = [
 ] }
 egui = { version = "0.35.0", default-features = false }
 egui_extras = "0.35.0"
-winit = "0.30.13"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+winit = "0.30.13"
+
+# One call, GetSystemMetrics, to find how far a maximised undecorated window
+# hangs off the screen. See `shell::chrome::maximized_inset`.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging"] }

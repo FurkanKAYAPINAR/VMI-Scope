@@ -3,5 +3,6 @@
 
 pub(crate) mod errors;
 pub(crate) mod ids;
+pub(crate) mod processes;
 pub(crate) mod requests;
 pub(crate) mod responses;

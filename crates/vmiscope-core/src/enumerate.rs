@@ -24,8 +24,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Wmi::{
     IEnumWbemClassObject, IWbemClassObject, IWbemContext, IWbemLocator, IWbemServices, WbemLocator,
-    WBEM_FLAG_CONNECT_USE_MAX_WAIT, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
-    WBEM_S_FALSE,
+    WBEM_FLAG_CONNECT_USE_MAX_WAIT, WBEM_FLAG_DEEP, WBEM_FLAG_FORWARD_ONLY,
+    WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_FLAG_SHALLOW, WBEM_GENERIC_FLAG_TYPE, WBEM_S_FALSE,
 };
 use wmi::WMIConnection;
 
@@ -302,6 +302,49 @@ pub(crate) fn drain<T>(
     Ok((rows, completion))
 }
 
+/// Count the objects an enumerator yields without reading anything off them.
+///
+/// The cheapest thing that can be done with a WMI object is nothing at all, and
+/// this does exactly that: `make` drops its argument, so no `Get`, no
+/// `BeginEnumeration`, no `__CLASS`. `Vec<()>` never allocates — a zero-sized
+/// element makes `push` a length increment — so the whole count costs one
+/// `usize`.
+///
+/// It routes through [`drain`] rather than looping on `Next` itself, which is
+/// what makes it cancellable and deadline-bounded like everything else. A
+/// partial count comes back as a `Completion` that says so; see
+/// [`crate::schema::Tally`] for why that distinction is load-bearing.
+pub(crate) fn count(
+    en: &IEnumWbemClassObject,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> anyhow::Result<(usize, Completion)> {
+    let (rows, completion) = drain(en, None, deadline, cancel, |_| Ok(()))?;
+    Ok((rows.len(), completion))
+}
+
+/// The flag pair every enumeration here opens with.
+///
+/// `FORWARD_ONLY` lets WMI release each object once it has been handed over
+/// (no rewind buffer), and `RETURN_IMMEDIATELY` makes the call semi-synchronous
+/// so [`drain`] gets control back between batches instead of after the provider
+/// has finished.
+const ENUM_FLAGS: i32 = WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0;
+
+/// `WBEM_FLAG_DEEP` (0) or `WBEM_FLAG_SHALLOW` (1).
+///
+/// The two constants are `WBEM_QUERY_FLAG_TYPE` while `CreateClassEnum` and
+/// `CreateInstanceEnum` take `WBEM_GENERIC_FLAG_TYPE`, so the `|` has to happen
+/// on the raw `i32` and be re-wrapped. Note that *deep is zero*: forgetting the
+/// flag entirely gives a deep enumeration, not an error.
+const fn depth(deep: bool) -> i32 {
+    if deep {
+        WBEM_FLAG_DEEP.0
+    } else {
+        WBEM_FLAG_SHALLOW.0
+    }
+}
+
 /// A raw `IWbemServices` bound to one namespace.
 ///
 /// The `wmi` crate keeps its own `IWbemServices` `pub(crate)` and its query
@@ -364,6 +407,78 @@ impl DirectConn {
         // is exactly what the `wmi` crate relies on. Only the explicit
         // `COAUTHIDENTITY` of the alternate-credential path has to be pushed
         // onto each new proxy by hand.
+    }
+
+    /// Enumerate class *definitions* — `CreateClassEnum`, not a WQL query.
+    ///
+    /// `SELECT * FROM meta_class` reaches the same objects through the query
+    /// engine: it parses WQL, builds a projection and evaluates a (trivial)
+    /// filter, all to arrive where `CreateClassEnum` starts. With
+    /// `superclass = None` and `deep = true` WMI returns every class in the
+    /// namespace, system classes included.
+    ///
+    /// A NULL `strSuperclass` is what selects "from the root of the hierarchy",
+    /// and `BSTR::new()` is a null pointer — the same idiom
+    /// [`DirectConn::open`] relies on.
+    pub(crate) fn class_enum(
+        &self,
+        superclass: Option<&str>,
+        deep: bool,
+    ) -> anyhow::Result<IEnumWbemClassObject> {
+        let root = match superclass {
+            Some(s) => windows::core::BSTR::from(s),
+            None => windows::core::BSTR::new(),
+        };
+        unsafe {
+            Ok(self.svc.CreateClassEnum(
+                &root,
+                WBEM_GENERIC_FLAG_TYPE(ENUM_FLAGS | depth(deep)),
+                None::<&IWbemContext>,
+            )?)
+        }
+    }
+
+    /// Enumerate the instances of one class.
+    ///
+    /// `deep` here means the opposite of what it means for a class enumeration:
+    /// `WBEM_FLAG_DEEP` includes instances of subclasses, `WBEM_FLAG_SHALLOW`
+    /// restricts the result to instances of `class` itself. The distinction is
+    /// visible in the numbers — `CIM_LogicalFile` shallow is a handful,
+    /// `CIM_LogicalFile` deep is the filesystem.
+    ///
+    /// WQL has no `COUNT(*)`, so counting instances means enumerating them and
+    /// throwing every object away; [`count`] is the other half of that.
+    pub(crate) fn instance_enum(
+        &self,
+        class: &str,
+        deep: bool,
+    ) -> anyhow::Result<IEnumWbemClassObject> {
+        unsafe {
+            Ok(self.svc.CreateInstanceEnum(
+                &windows::core::BSTR::from(class),
+                WBEM_GENERIC_FLAG_TYPE(ENUM_FLAGS | depth(deep)),
+                None::<&IWbemContext>,
+            )?)
+        }
+    }
+
+    /// Fetch one class definition or instance by path.
+    ///
+    /// `GetObject` reports "not found" through the HRESULT but leaves the out
+    /// pointer untouched on some paths, so a `None` that survived a successful
+    /// call is turned into an error rather than unwrapped.
+    pub(crate) fn get_object(&self, path: &str) -> anyhow::Result<IWbemClassObject> {
+        unsafe {
+            let mut obj: Option<IWbemClassObject> = None;
+            self.svc.GetObject(
+                &windows::core::BSTR::from(path),
+                WBEM_GENERIC_FLAG_TYPE(0),
+                None::<&IWbemContext>,
+                Some(&mut obj),
+                None,
+            )?;
+            obj.ok_or_else(|| anyhow::anyhow!("WMI returned no object for {path}"))
+        }
     }
 
     /// Open an event subscription and hand back the raw enumerator.

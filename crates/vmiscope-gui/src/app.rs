@@ -17,6 +17,7 @@ use crate::theme::icons;
 use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, S2, S6, SURFACE};
 use crate::views::nav::View;
 use crate::views::network::NET_REFRESH_SECS;
+use crate::views::process::ProcessView;
 use crate::widgets::button::{btn_primary, focus_ring};
 use crate::widgets::card::card;
 use crate::widgets::chip::dot_chip;
@@ -25,9 +26,9 @@ use crate::widgets::loading::spinner;
 use crate::widgets::rule::vrule;
 
 use vmiscope_core::{
-    ClassSchema, Connection, Credential, EventMonitor, MethodOutcome, MethodTarget, MonitorMsg,
-    ProviderInfo, QueryResult, SearchIndex, Subscription, SubscriptionReport, WmiWorker,
-    DEFAULT_EVENT_QUERY,
+    ClassBrief, ClassSchema, Connection, Credential, EventMonitor, MethodOutcome, MethodTarget,
+    MonitorMsg, ProviderInfo, QueryResult, SearchIndex, Subscription, SubscriptionReport,
+    WmiWorker, DEFAULT_EVENT_QUERY,
 };
 
 pub(crate) const ROOT_NAMESPACE: &str = "root";
@@ -99,7 +100,7 @@ pub struct VmiScopeApp {
     /// Persisted query history + saved queries.
     pub(crate) config: Config,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
-    pub(crate) class_cache: HashMap<String, Vec<String>>,
+    pub(crate) class_cache: HashMap<String, Vec<ClassBrief>>,
     // --- connection ---
     pub(crate) conn_host: String,
     pub(crate) conn_status: ConnStatus,
@@ -117,6 +118,13 @@ pub struct VmiScopeApp {
     pub(crate) net_external_only: bool,
     /// (column index, ascending). `None` = default (grouped by process).
     pub(crate) net_sort: Option<(usize, bool)>,
+
+    // --- process tab ---
+    /// The live start/stop monitor, the log it retains, and the filters over
+    /// it. One struct rather than a dozen fields, because unlike the older tabs
+    /// this view owns a subscription with a lifetime of its own; see
+    /// `views::process`.
+    pub(crate) proc: ProcessView,
 
     // --- persistence tab ---
     pub(crate) events_report: Option<SubscriptionReport>,
@@ -145,7 +153,7 @@ pub struct VmiScopeApp {
     pub(crate) active_ns: String,
 
     // --- class list (for the active namespace) ---
-    pub(crate) classes: Vec<String>,
+    pub(crate) classes: Vec<ClassBrief>,
     pub(crate) classes_ns: String,
     pub(crate) classes_loading: bool,
     pub(crate) class_filter: String,
@@ -255,6 +263,7 @@ impl VmiScopeApp {
             net_paused: false,
             net_external_only: false,
             net_sort: None,
+            proc: ProcessView::default(),
             events_report: None,
             events_loading: false,
             events_sort: None,
@@ -528,6 +537,11 @@ impl VmiScopeApp {
                     self.ui_central(ui);
                 });
             }
+            View::Process => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    self.ui_process(ui, now);
+                });
+            }
             View::Network => {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.ui_network(ui, now);
@@ -610,6 +624,12 @@ impl eframe::App for VmiScopeApp {
             }
         }
 
+        // Drain the process monitor. Unlike the event log above, this one is
+        // filled whatever view is on screen: the question it answers is "what
+        // ran while I wasn't watching", which cannot be answered by a
+        // subscription that only collects while its own tab is visible.
+        self.drain_processes(now);
+
         // Drive the live network refresh from the frame clock. `live_polling` is
         // the Settings-level switch for all live views; `net_paused` is the
         // Network view's own per-visit pause on top of it.
@@ -679,6 +699,13 @@ impl eframe::App for VmiScopeApp {
         }
         // Keep events flowing in while the monitor runs.
         if self.monitor.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        // Same interval, and for a sharper reason: the process log stamps each
+        // event with the frame clock, so a frame that never comes is an event
+        // that lands late carrying the wrong time. It also keeps the ended
+        // rows' fade moving while the view is open.
+        if self.proc_running() {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
     }

@@ -176,6 +176,7 @@ fn main() {
                         }
                         Enrichment::Found(_) => "<empty>".into(),
                         Enrichment::Unavailable => "<gone or pid reused>".into(),
+                        Enrichment::Pending => "<in flight>".into(),
                         Enrichment::Skipped => "<not attempted>".into(),
                     };
                     details.insert(

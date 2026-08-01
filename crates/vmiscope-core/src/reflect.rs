@@ -13,7 +13,9 @@ use windows::Win32::System::Wmi as w;
 use windows::Win32::System::Wmi::{IWbemClassObject, IWbemQualifierSet};
 use wmi::{IWbemClassWrapper, Variant, WMIConnection};
 
-use crate::schema::{ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema};
+use crate::schema::{
+    ClassBrief, ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema,
+};
 use crate::value::{variant_to_string, variant_to_string_vec, variant_to_u32};
 
 /// Map a CIM type code (with the array flag) to a readable name.
@@ -178,6 +180,146 @@ fn read_params(
     }
     params.sort_by_key(|p| p.id);
     params
+}
+
+/// Read one property of an object *by name*.
+///
+/// By name, always, because the enumeration path (`list_properties`, and
+/// `object_to_map` in `crate::remote`) passes `WBEM_FLAG_NONSYSTEM_ONLY` and
+/// therefore never yields a `__`-prefixed property. `__CLASS` and
+/// `__DERIVATION` are invisible to enumeration and free to `Get` — the object
+/// is already in this process, marshalled by value.
+fn property(obj: &IWbemClassObject, name: &str) -> Option<Variant> {
+    let (_h, pcw) = wide(name);
+    unsafe {
+        let mut val = VARIANT::default();
+        obj.Get(pcw, 0, &mut val, None, None).ok()?;
+        Variant::from_variant(&val).ok()
+    }
+}
+
+/// Read one qualifier of a qualifier set by name.
+///
+/// A targeted `Get` rather than the full `BeginEnumeration`/`Next` walk of
+/// [`read_qualifiers`]: a class list wants five specific qualifiers out of the
+/// dozen a class carries, and enumerating all of them 1,400 times over to
+/// discard most is work with nothing to show for it. WMI names are
+/// case-insensitive, which matters here — `root\CIMV2` spells the same
+/// qualifier `dynamic` and `Abstract` and `Association` with no rule to it.
+fn qualifier(qs: &IWbemQualifierSet, name: &str) -> Option<Variant> {
+    let (_h, pcw) = wide(name);
+    unsafe {
+        let mut val = VARIANT::default();
+        qs.Get(pcw, 0, &mut val, std::ptr::null_mut()).ok()?;
+        Variant::from_variant(&val).ok()
+    }
+}
+
+/// The qualifiers a [`ClassBrief`] is classified from, and nothing else.
+const BRIEF_QUALIFIERS: [&str; 5] = [
+    "Abstract",
+    "Association",
+    "Dynamic",
+    "Singleton",
+    "provider",
+];
+
+/// Summarize a class-definition object into a [`ClassBrief`].
+///
+/// **Costs no round trip.** Every input — the name, the derivation chain, the
+/// five qualifiers — is read off the object the enumerator already handed over,
+/// and a WMI class object is custom-marshalled *by value*, so it arrives whole.
+/// The plan's cost model assumed a `GetObject` per class would be needed to
+/// learn a class's kind; it is not, and that is the difference between a badge
+/// column that is free and one that costs 1,400 round trips.
+pub fn class_brief(obj: &IWbemClassObject) -> ClassBrief {
+    let name = property(obj, "__CLASS")
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default();
+    let derivation = property(obj, "__DERIVATION")
+        .map(|v| variant_to_string_vec(&v))
+        .unwrap_or_default();
+
+    let mut quals: Vec<(String, String)> = Vec::new();
+    unsafe {
+        if let Ok(qs) = obj.GetQualifierSet() {
+            for q in BRIEF_QUALIFIERS {
+                if let Some(v) = qualifier(&qs, q) {
+                    quals.push((q.to_string(), variant_to_string(&v)));
+                }
+            }
+        }
+    }
+
+    let provider = quals
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("provider"))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+
+    ClassBrief {
+        kind: ClassKind::classify(&name, &quals, &derivation),
+        name,
+        provider,
+    }
+}
+
+/// The `__DERIVATION` chain of a class object, nearest ancestor first.
+pub fn class_derivation(obj: &IWbemClassObject) -> Vec<String> {
+    property(obj, "__DERIVATION")
+        .map(|v| variant_to_string_vec(&v))
+        .unwrap_or_default()
+}
+
+/// The `__CLASS` of an object.
+pub fn class_name(obj: &IWbemClassObject) -> String {
+    property(obj, "__CLASS")
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default()
+}
+
+/// Read a named non-system property as a string — for `__NAMESPACE.Name` and
+/// friends, where the whole object is one column.
+pub fn string_property(obj: &IWbemClassObject, name: &str) -> String {
+    property(obj, name)
+        .map(|v| variant_to_string(&v))
+        .unwrap_or_default()
+}
+
+/// An association class definition reduced to what an association panel needs.
+#[derive(Debug, Clone, Default)]
+pub struct AssocClassDef {
+    pub class: String,
+    /// `(reference property, class it points at)` for every `ref:` property —
+    /// the association's endpoints. Two for almost every association, but the
+    /// count is not guaranteed and nothing here assumes it.
+    pub endpoints: Vec<(String, String)>,
+}
+
+/// Reduce an association class definition to its name and its endpoints.
+///
+/// The endpoint class comes from the `CIMTYPE` qualifier (`ref:Win32_Process`),
+/// not from the CIM type code: `Get` reports `CIM_REFERENCE` for every
+/// reference property alike and drops the target class, which is the only part
+/// worth having.
+pub fn assoc_class_def(obj: &IWbemClassObject) -> AssocClassDef {
+    let class = class_name(obj);
+    let wrapper = IWbemClassWrapper::new(obj.clone());
+    let mut endpoints = Vec::new();
+    for prop in wrapper.list_properties().unwrap_or_default() {
+        let (_h, pcw) = wide(&prop);
+        unsafe {
+            if let Ok(qs) = obj.GetPropertyQualifierSet(pcw) {
+                if let Some(t) = qualifier(&qs, "CIMTYPE") {
+                    let t = variant_to_string(&t);
+                    if let Some(target) = t.strip_prefix("ref:") {
+                        endpoints.push((prop.clone(), target.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    AssocClassDef { class, endpoints }
 }
 
 /// Reflect a class definition into a [`ClassSchema`].

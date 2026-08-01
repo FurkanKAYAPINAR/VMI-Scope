@@ -20,8 +20,36 @@ use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
 use crate::providers::ProviderInfo;
 use crate::remote::{Credential, RemoteConn};
-use crate::schema::{ClassSchema, SearchIndex};
+use crate::schema::{
+    AssocInfo, ClassBrief, ClassKind, ClassSchema, NamespaceStats, SearchIndex, Tally,
+};
 use crate::value::{variant_to_string, variant_to_u32};
+
+/// Wall-clock budget for enumerating one namespace's classes.
+///
+/// Generous because it is paid once and the first call of a session is the
+/// expensive one: measured here, the very first `root\CIMV2` class enumeration
+/// after a boot took 6.1 s while every later one took ~0.2 s. A budget tuned to
+/// the warm case would turn a cold start into a failure.
+pub const CLASS_ENUM_BUDGET: Duration = Duration::from_secs(30);
+
+/// Wall-clock budget for one [`Request::NamespaceStats`], recursion included.
+///
+/// The budget is for the *whole* walk, not per namespace, because a recursive
+/// rollup over `root` visits ~100 namespaces and a per-namespace budget would
+/// multiply into minutes.
+pub const NAMESPACE_STATS_BUDGET: Duration = Duration::from_secs(20);
+
+/// Wall-clock budget for counting one class's instances.
+///
+/// Short on purpose. Counts are fired by a UI walking a class list, so this is
+/// paid per row, and the pathological cases are not rare: `CIM_DataFile`
+/// enumerates the filesystem and yields nothing at all for the first several
+/// seconds, so a partial count is the *only* possible answer for it.
+pub const INSTANCE_COUNT_BUDGET: Duration = Duration::from_secs(3);
+
+/// Wall-clock budget for one [`Request::Associations`] lookup.
+pub const ASSOCIATIONS_BUDGET: Duration = Duration::from_secs(10);
 
 /// A unit of work for the WMI thread. `id` lets the UI correlate the reply
 /// with the widget that asked (namespaces resolve out of order otherwise).
@@ -29,8 +57,49 @@ use crate::value::{variant_to_string, variant_to_u32};
 pub enum Request {
     /// Enumerate the direct child namespaces of `namespace` (via `__NAMESPACE`).
     ListChildNamespaces { id: u64, namespace: String },
-    /// Enumerate the class names defined in `namespace`.
+    /// Enumerate the classes defined in `namespace` as [`ClassBrief`]s.
+    ///
+    /// Each row carries its [`crate::schema::ClassKind`] and provider, read off
+    /// the class-definition object the enumeration already produced — no second
+    /// round trip per class. Cancellable and bounded by [`CLASS_ENUM_BUDGET`].
     ListClasses { id: u64, namespace: String },
+    /// Count the classes in `namespace`, and optionally in its whole subtree.
+    ///
+    /// The count comes from `CreateClassEnum` with every object discarded
+    /// unread — see `enumerate::count`. `recursive` walks
+    /// `SELECT Name FROM __NAMESPACE` depth-first, because WMI has no
+    /// server-side rollup: a subtree total is N enumerations or it is nothing.
+    NamespaceStats {
+        id: u64,
+        namespace: String,
+        recursive: bool,
+    },
+    /// Count the instances of one class.
+    ///
+    /// `deep` includes subclasses (`WBEM_FLAG_DEEP`); false counts only
+    /// instances of `class` itself. Bounded by [`INSTANCE_COUNT_BUDGET`] and
+    /// cancellable, and classes on the skip-list
+    /// ([`ClassKind::count_skip_reason`]) are answered without touching WMI.
+    ///
+    /// Unlike [`Request::Query`] there is no way to ask for an unbounded run.
+    /// A query is something a user typed and is watching; a count is fired by
+    /// the UI, per row, and an unbounded one would be a hang with no author.
+    InstanceCount {
+        id: u64,
+        namespace: String,
+        class: String,
+        deep: bool,
+    },
+    /// List the relationships `class` participates in.
+    ///
+    /// `REFERENCES OF {class} WHERE SchemaOnly` for the association classes,
+    /// `ASSOCIATORS OF {class} WHERE SchemaOnly` for the classes at the far
+    /// end, both through raw `ExecQuery`.
+    Associations {
+        id: u64,
+        namespace: String,
+        class: String,
+    },
     /// Run an arbitrary WQL query in `namespace`.
     ///
     /// `max_rows` caps the result. WQL has no `TOP`/`LIMIT`, so an unbounded
@@ -151,7 +220,32 @@ pub enum Response {
     Classes {
         id: u64,
         namespace: String,
-        classes: Vec<String>,
+        classes: Vec<ClassBrief>,
+        /// Why the enumeration stopped. A class list that was cut short must
+        /// not read as "this namespace has 812 classes".
+        completion: Completion,
+        elapsed_ms: u64,
+    },
+    NamespaceStats {
+        id: u64,
+        namespace: String,
+        stats: NamespaceStats,
+        elapsed_ms: u64,
+    },
+    InstanceCount {
+        id: u64,
+        namespace: String,
+        class: String,
+        /// Counted (exactly or partially), or deliberately skipped.
+        tally: Tally,
+        elapsed_ms: u64,
+    },
+    Associations {
+        id: u64,
+        namespace: String,
+        class: String,
+        associations: Vec<AssocInfo>,
+        completion: Completion,
         elapsed_ms: u64,
     },
     QueryResult {
@@ -333,16 +427,102 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
 
             Request::ListClasses { id, namespace } => {
                 let t0 = Instant::now();
-                let resp = match q_class_names(&namespace, &control) {
-                    Ok(classes) => Response::Classes {
+                let cancel = control.begin(id);
+                let outcome = q_class_briefs(&namespace, &cancel);
+                control.end(id);
+                let resp = match outcome {
+                    Ok((classes, completion)) => {
+                        remember_kinds(&namespace, &classes);
+                        Response::Classes {
+                            id,
+                            namespace,
+                            classes,
+                            completion,
+                            elapsed_ms: ms(t0),
+                        }
+                    }
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("List classes in {namespace}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::NamespaceStats {
+                id,
+                namespace,
+                recursive,
+            } => {
+                let t0 = Instant::now();
+                let cancel = control.begin(id);
+                let outcome = namespace_stats(&namespace, recursive, &cancel);
+                control.end(id);
+                let resp = match outcome {
+                    Ok(stats) => Response::NamespaceStats {
                         id,
                         namespace,
-                        classes,
+                        stats,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
-                        context: format!("List classes in {namespace}"),
+                        context: format!("Count classes in {namespace}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::InstanceCount {
+                id,
+                namespace,
+                class,
+                deep,
+            } => {
+                let t0 = Instant::now();
+                let cancel = control.begin(id);
+                let outcome = instance_count(&namespace, &class, deep, &cancel);
+                control.end(id);
+                let resp = match outcome {
+                    Ok(tally) => Response::InstanceCount {
+                        id,
+                        namespace,
+                        class,
+                        tally,
+                        elapsed_ms: ms(t0),
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("Count instances of {class} in {namespace}"),
+                        message: e.to_string(),
+                    },
+                };
+                let _ = tx.send(resp);
+            }
+
+            Request::Associations {
+                id,
+                namespace,
+                class,
+            } => {
+                let t0 = Instant::now();
+                let cancel = control.begin(id);
+                let outcome = class_associations(&namespace, &class, &cancel);
+                control.end(id);
+                let resp = match outcome {
+                    Ok((associations, completion)) => Response::Associations {
+                        id,
+                        namespace,
+                        class,
+                        associations,
+                        completion,
+                        elapsed_ms: ms(t0),
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        context: format!("Associations of {class} in {namespace}"),
                         message: e.to_string(),
                     },
                 };
@@ -550,6 +730,10 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 HOST.with(|h| *h.borrow_mut() = host.clone());
                 CRED.with(|c| *c.borrow_mut() = cred.clone());
                 REMOTE.with(|m| m.borrow_mut().clear());
+                // A class kind is a fact about a *machine's* repository, not
+                // about a class name. Carrying it across a host switch would
+                // badge the new target with the old one's schema.
+                KIND_CACHE.with(|m| m.borrow_mut().clear());
                 // Verify the target is reachable (this also exercises the
                 // credential path — bogus creds fail here).
                 let probe = q_maps("root\\CIMV2", "SELECT Name FROM Win32_ComputerSystem");
@@ -560,6 +744,10 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                         HOST.with(|h| *h.borrow_mut() = None);
                         CRED.with(|c| *c.borrow_mut() = None);
                         REMOTE.with(|m| m.borrow_mut().clear());
+                        // A class kind is a fact about a *machine's* repository, not
+                        // about a class name. Carrying it across a host switch would
+                        // badge the new target with the old one's schema.
+                        KIND_CACHE.with(|m| m.borrow_mut().clear());
                         Response::Error {
                             id,
                             context: "Connect to host".into(),
@@ -581,6 +769,34 @@ thread_local! {
     static CRED: RefCell<Option<Credential>> = const { RefCell::new(None) };
     /// Per-namespace raw-DCOM connections, used only in alternate-credential mode.
     static REMOTE: RefCell<HashMap<String, RemoteConn>> = RefCell::new(HashMap::new());
+    /// `(namespace, class)` -> kind, both keys lowercased.
+    ///
+    /// The schema cache task 3.9 asks for, in its smallest useful form. It is
+    /// filled wholesale and for free by every [`Request::ListClasses`], and
+    /// read by [`Request::InstanceCount`] to decide whether a class is on the
+    /// skip-list. Without it, deciding "is this abstract?" costs a `GetObject`
+    /// per class — the exact round trip the enumeration already paid for.
+    static KIND_CACHE: RefCell<HashMap<(String, String), ClassKind>> = RefCell::new(HashMap::new());
+}
+
+/// Remember every kind a class enumeration just established.
+fn remember_kinds(namespace: &str, classes: &[ClassBrief]) {
+    let ns = namespace.to_lowercase();
+    KIND_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        for brief in classes {
+            c.insert((ns.clone(), brief.name.to_lowercase()), brief.kind);
+        }
+    });
+}
+
+/// The cached kind of one class, if a class enumeration has already seen it.
+fn cached_kind(namespace: &str, class: &str) -> Option<ClassKind> {
+    KIND_CACHE.with(|c| {
+        c.borrow()
+            .get(&(namespace.to_lowercase(), class.to_lowercase()))
+            .copied()
+    })
 }
 
 /// Connect to a namespace on the current target host. When a host is set the
@@ -647,13 +863,387 @@ fn ensure_remote(namespace: &str) -> anyhow::Result<()> {
     with_remote(namespace, |_| Ok(()))
 }
 
-/// Enumerate class names, dispatching local/SSO vs alternate-credential.
-fn q_class_names(namespace: &str, control: &WorkerControl) -> anyhow::Result<Vec<String>> {
+/// Bind `namespace` for one of the raw-COM explorer operations.
+///
+/// These paths are local/SSO only, and say so instead of silently running as
+/// the wrong principal. The alternate-credential transport reaches WMI through
+/// a `RefCell`-cached [`RemoteConn`] handed out inside a closure
+/// ([`with_remote`]), and a recursive namespace walk would have to nest those
+/// closures — a second `borrow_mut` on the same `RefCell`, which is a panic.
+/// Fixing that properly means one connection registry per host, which is a
+/// Phase 5 refactor; until then an honest error beats a wrong number.
+fn bind_direct(namespace: &str, what: &str) -> anyhow::Result<DirectConn> {
     if is_alt_cred() {
-        with_remote(namespace, |r| r.list_class_names())
-    } else {
-        list_classes_local(namespace, control)
+        anyhow::bail!(
+            "{what} is not available under alternate credentials \
+             (it would run as the current user, not the connected one)"
+        );
     }
+    DirectConn::open(current_host().as_deref(), namespace)
+}
+
+/// Enumerate a namespace's classes as briefs, dispatching local/SSO vs
+/// alternate-credential.
+///
+/// Both transports go through [`enumerate::drain`], so both are cancellable and
+/// both stop at [`CLASS_ENUM_BUDGET`]. Local/SSO additionally skips the query
+/// engine entirely by using `CreateClassEnum` instead of
+/// `SELECT * FROM meta_class`.
+fn q_class_briefs(
+    namespace: &str,
+    cancel: &CancelToken,
+) -> anyhow::Result<(Vec<ClassBrief>, Completion)> {
+    let budget = Some(CLASS_ENUM_BUDGET);
+    let brief = |o: &IWbemClassObject| Ok(crate::reflect::class_brief(o));
+    let (mut classes, completion) = if is_alt_cred() {
+        with_remote(namespace, |r| {
+            // No `CreateClassEnum` on this path: `RemoteConn` has to re-blanket
+            // every proxy it produces, and `exec_enum` is the one place that
+            // does. `meta_class` reaches the same class-definition objects.
+            let en = r.exec_enum("SELECT * FROM meta_class")?;
+            enumerate::drain(&en, None, budget, cancel, brief)
+        })?
+    } else {
+        let conn = DirectConn::open(current_host().as_deref(), namespace)?;
+        let en = conn.class_enum(None, true)?;
+        enumerate::drain(&en, None, budget, cancel, brief)?
+    };
+    classes.retain(|c| !c.name.is_empty());
+    classes.sort_by(|a, b| a.name.cmp(&b.name));
+    classes.dedup_by(|a, b| a.name == b.name);
+    Ok((classes, completion))
+}
+
+/// Count the classes in one namespace without reading a single object.
+fn count_classes(
+    conn: &DirectConn,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> anyhow::Result<(usize, Completion)> {
+    let en = conn.class_enum(None, true)?;
+    enumerate::count(&en, deadline, cancel)
+}
+
+/// The direct child namespaces of `namespace`, fully qualified.
+///
+/// A drained `__NAMESPACE` enumeration rather than [`list_child_namespaces`]'s
+/// `raw_query`, because this one runs inside a recursive walk that has to stay
+/// interruptible between children.
+fn child_namespaces(
+    conn: &DirectConn,
+    namespace: &str,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> anyhow::Result<(Vec<String>, Completion)> {
+    let en = conn.exec_enum("SELECT Name FROM __NAMESPACE")?;
+    let (names, completion) = enumerate::drain(&en, None, deadline, cancel, |o| {
+        Ok(crate::reflect::string_property(o, "Name"))
+    })?;
+    let mut children: Vec<String> = names
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("{namespace}\\{n}"))
+        .collect();
+    children.sort_unstable();
+    children.dedup();
+    Ok((children, completion))
+}
+
+/// Class counts for a namespace, optionally rolled up over its subtree.
+///
+/// The walk is depth-first and iterative, and the budget is checked before
+/// every namespace rather than only between batches: binding a namespace is
+/// itself a round trip, so a rollup over `root` can spend most of its time in
+/// `ConnectServer` calls that [`enumerate::drain`] never sees.
+///
+/// A namespace that cannot be bound or enumerated increments `unreadable`
+/// instead of failing the request. `root\SECURITY` denies access to a normal
+/// token, and a tree that refuses to show any counts because one node is
+/// private would be useless.
+fn namespace_stats(
+    namespace: &str,
+    recursive: bool,
+    cancel: &CancelToken,
+) -> anyhow::Result<NamespaceStats> {
+    let started = Instant::now();
+    let mut stats = NamespaceStats {
+        namespace: namespace.to_string(),
+        recursive,
+        ..Default::default()
+    };
+
+    let mut stack = vec![namespace.to_string()];
+    let mut root = true;
+    while let Some(ns) = stack.pop() {
+        if cancel.is_raised() {
+            stats.completion = Completion::Cancelled;
+            break;
+        }
+        let Some(left) = NAMESPACE_STATS_BUDGET.checked_sub(started.elapsed()) else {
+            stats.completion = Completion::TimedOut {
+                after_ms: started.elapsed().as_millis() as u64,
+                rows: stats.total_classes,
+            };
+            break;
+        };
+
+        let conn = match bind_direct(&ns, "Namespace statistics") {
+            Ok(conn) => conn,
+            // The *root* failing is not a partial result, it is no result —
+            // an alternate-credential session or a bad namespace has to
+            // surface as an error, not as a rollup of zero.
+            Err(e) if root => return Err(e),
+            Err(_) => {
+                stats.unreadable += 1;
+                continue;
+            }
+        };
+
+        match count_classes(&conn, Some(left), cancel) {
+            Ok((n, c)) => {
+                stats.namespaces += 1;
+                stats.total_classes += n;
+                if root {
+                    stats.classes = n;
+                }
+                // A partial count anywhere makes the rollup partial. Keep the
+                // first reason: it is the one that explains the rest.
+                if !c.is_complete() && stats.completion.is_complete() {
+                    stats.completion = c;
+                }
+            }
+            Err(_) => stats.unreadable += 1,
+        }
+
+        // The root's children are counted even for a non-recursive request:
+        // the tree wants to know whether a node is expandable.
+        if recursive || root {
+            let left = NAMESPACE_STATS_BUDGET
+                .checked_sub(started.elapsed())
+                .unwrap_or_default();
+            if let Ok((kids, _)) = child_namespaces(&conn, &ns, Some(left), cancel) {
+                if root {
+                    stats.children = kids.len();
+                }
+                if recursive {
+                    stack.extend(kids);
+                }
+            }
+        }
+        root = false;
+    }
+
+    Ok(stats)
+}
+
+/// The kind of one class, from the cache when a class enumeration has already
+/// established it, else from a single `GetObject`.
+fn class_kind(conn: &DirectConn, namespace: &str, class: &str) -> anyhow::Result<ClassKind> {
+    if let Some(kind) = cached_kind(namespace, class) {
+        return Ok(kind);
+    }
+    let obj = conn.get_object(class)?;
+    let brief = crate::reflect::class_brief(&obj);
+    KIND_CACHE.with(|c| {
+        c.borrow_mut()
+            .insert((namespace.to_lowercase(), class.to_lowercase()), brief.kind)
+    });
+    Ok(brief.kind)
+}
+
+/// Count the instances of one class, or decline to.
+fn instance_count(
+    namespace: &str,
+    class: &str,
+    deep: bool,
+    cancel: &CancelToken,
+) -> anyhow::Result<Tally> {
+    let conn = bind_direct(namespace, "Instance counting")?;
+    if let Some(reason) = class_kind(&conn, namespace, class)?.count_skip_reason() {
+        return Ok(Tally::Skipped(reason));
+    }
+    let en = conn.instance_enum(class, deep)?;
+    let (instances, completion) = enumerate::count(&en, Some(INSTANCE_COUNT_BUDGET), cancel)?;
+    Ok(Tally::Counted {
+        instances,
+        completion,
+    })
+}
+
+/// Decompose the association classes one `REFERENCES OF` returned into rows.
+///
+/// `subject` is the class the query was aimed at; the reference property that
+/// points at it is the role, and every other reference on the association is a
+/// far end. `note` is stamped by the caller, which is the only thing that knows
+/// whether `subject` was the class asked about or one of its ancestors.
+fn assoc_rows(defs: &[crate::reflect::AssocClassDef], subject: &str, note: &str) -> Vec<AssocInfo> {
+    let mut out = Vec::new();
+    for def in defs {
+        if def.class.is_empty() {
+            continue;
+        }
+        let ours: Vec<&(String, String)> = def
+            .endpoints
+            .iter()
+            .filter(|(_, t)| t.eq_ignore_ascii_case(subject))
+            .collect();
+        if ours.is_empty() {
+            // WMI returned an association that references `subject`, but no
+            // reference property names it. Report the endpoints rather than
+            // drop the row: an association we cannot decompose is still one
+            // the class participates in.
+            for (role, target) in &def.endpoints {
+                out.push(AssocInfo {
+                    assoc_class: def.class.clone(),
+                    role: role.clone(),
+                    target_class: target.clone(),
+                    note: join_notes(note, "role not resolved"),
+                });
+            }
+            continue;
+        }
+        for (role, _) in &ours {
+            let far: Vec<&(String, String)> = def
+                .endpoints
+                .iter()
+                .filter(|(name, _)| name != role)
+                .collect();
+            // A degenerate association with a single reference — it points at
+            // us and nowhere else, so we are our own far end.
+            let far = if far.is_empty() { ours.clone() } else { far };
+            for (_, target) in far {
+                // `Win32_SubDirectory` and `CIM_BasedOn` relate a class to
+                // itself. The far end is *not* empty in that case — it is the
+                // other role on the same class — so this has to be decided per
+                // row from the target, never from the shape of the endpoint
+                // list.
+                let self_ref = target.eq_ignore_ascii_case(subject);
+                out.push(AssocInfo {
+                    assoc_class: def.class.clone(),
+                    role: role.clone(),
+                    target_class: target.clone(),
+                    note: join_notes(note, if self_ref { "self-referencing" } else { "" }),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn join_notes(a: &str, b: &str) -> String {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => a.to_string(),
+        (true, false) => b.to_string(),
+        (false, false) => format!("{a}; {b}"),
+    }
+}
+
+/// Every relationship `class` takes part in, inherited ones included.
+///
+/// Three facts about WMI shape this, all measured rather than assumed.
+///
+/// **`REFERENCES OF` does not walk the derivation chain.** Measured on
+/// `root\CIMV2`: `REFERENCES OF {Win32_Process}` returns exactly
+/// `Win32_SessionProcess`, `Win32_NamedJobObjectProcess`,
+/// `Win32_SystemProcesses`, while `REFERENCES OF {CIM_Process}` returns a
+/// disjoint three — `CIM_ProcessThread`, `CIM_ProcessExecutable`,
+/// `CIM_OSProcess`. A `Win32_Process` is a `CIM_Process`, so it can stand at
+/// the end of all six, but only one query per ancestor finds them. Hence the
+/// loop over `__Derivation`; the plan's "≥ 4 associations for `Win32_Process`"
+/// is unreachable without it and correct with it.
+///
+/// **`SchemaOnly` is what makes this affordable.** Without it both forms
+/// enumerate live *instances* — `ASSOCIATORS OF {Win32_Process}` on a busy
+/// machine is thousands of objects to answer a question about the schema.
+///
+/// **The endpoint class lives in the `CIMTYPE` qualifier, not the type code.**
+/// `Get` reports `CIM_REFERENCE` for every reference property alike; only
+/// `CIMTYPE` carries `ref:Win32_LogonSession`.
+///
+/// `ASSOCIATORS OF` runs alongside as a cross-check, so an endpoint WMI reports
+/// but whose association could not be decomposed still appears, labelled.
+///
+/// All of it reads `__CLASS` by name off the raw object. §5.5 of the plan
+/// listed this task as blocked on system properties surviving the query path;
+/// they do not survive it, and this never uses it.
+fn class_associations(
+    namespace: &str,
+    class: &str,
+    cancel: &CancelToken,
+) -> anyhow::Result<(Vec<AssocInfo>, Completion)> {
+    let conn = bind_direct(namespace, "Association lookup")?;
+    let started = Instant::now();
+
+    // The class itself first, then each ancestor nearest-first.
+    let mut lineage = vec![class.to_string()];
+    if let Ok(obj) = conn.get_object(class) {
+        lineage.extend(crate::reflect::class_derivation(&obj));
+    }
+
+    let mut out: Vec<AssocInfo> = Vec::new();
+    let mut completion = Completion::Complete;
+    let mut endpoints: Vec<String> = Vec::new();
+
+    for (depth, subject) in lineage.iter().enumerate() {
+        // One shared budget across every query, so a deep hierarchy cannot
+        // multiply the cost of the request by its own length.
+        let Some(left) = ASSOCIATIONS_BUDGET.checked_sub(started.elapsed()) else {
+            completion = Completion::TimedOut {
+                after_ms: started.elapsed().as_millis() as u64,
+                rows: out.len(),
+            };
+            break;
+        };
+        if cancel.is_raised() {
+            completion = Completion::Cancelled;
+            break;
+        }
+        let note = if depth == 0 {
+            String::new()
+        } else {
+            format!("inherited via {subject}")
+        };
+
+        let en = conn.exec_enum(&format!("REFERENCES OF {{{subject}}} WHERE SchemaOnly"))?;
+        let (defs, c) = enumerate::drain(&en, None, Some(left), cancel, |o| {
+            Ok(crate::reflect::assoc_class_def(o))
+        })?;
+        if !c.is_complete() && completion.is_complete() {
+            completion = c;
+        }
+        out.extend(assoc_rows(&defs, subject, &note));
+
+        let left = ASSOCIATIONS_BUDGET
+            .checked_sub(started.elapsed())
+            .unwrap_or_default();
+        let en = conn.exec_enum(&format!("ASSOCIATORS OF {{{subject}}} WHERE SchemaOnly"))?;
+        if let Ok((names, _)) = enumerate::drain(&en, None, Some(left), cancel, |o| {
+            Ok(crate::reflect::class_name(o))
+        }) {
+            endpoints.extend(names.into_iter().filter(|n| !n.is_empty()));
+        }
+    }
+
+    for endpoint in endpoints {
+        if !out
+            .iter()
+            .any(|a| a.target_class.eq_ignore_ascii_case(&endpoint))
+        {
+            out.push(AssocInfo {
+                assoc_class: String::new(),
+                role: String::new(),
+                target_class: endpoint,
+                note: "reported by ASSOCIATORS OF only".into(),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        (&a.assoc_class, &a.role, &a.target_class).cmp(&(&b.assoc_class, &b.role, &b.target_class))
+    });
+    out.dedup();
+    Ok((out, completion))
 }
 
 fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {
@@ -668,33 +1258,6 @@ fn list_child_namespaces(namespace: &str) -> anyhow::Result<Vec<String>> {
     names.sort_unstable();
     names.dedup();
     Ok(names)
-}
-
-fn list_classes_local(namespace: &str, control: &WorkerControl) -> anyhow::Result<Vec<String>> {
-    let conn = connect(namespace)?;
-    // `meta_class` enumerates class *definitions*. The generic `HashMap` path
-    // hides WMI system properties (`WBEM_FLAG_NONSYSTEM_ONLY`), so we drop to
-    // the low-level `exec_query` and read each object's `__Class` directly via
-    // the reflective wrapper.
-    let mut classes: Vec<String> = Vec::new();
-    for item in conn.exec_query("SELECT * FROM meta_class")? {
-        // This iterator is the `wmi` crate's, which pulls one object per
-        // `Next(WBEM_INFINITE, ..)`, so it cannot be chunked from here. It is
-        // bounded (~1,400 classes in `root\CIMV2`) but not instant, and exit
-        // should not wait for it either.
-        if control.is_shutdown() {
-            anyhow::bail!("worker is shutting down");
-        }
-        let obj = item?;
-        if let Ok(name) = obj.class() {
-            if !name.is_empty() {
-                classes.push(name);
-            }
-        }
-    }
-    classes.sort_unstable();
-    classes.dedup();
-    Ok(classes)
 }
 
 /// Run a WQL query as a chunked, cancellable enumeration.
@@ -1083,6 +1646,105 @@ fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::reflect::AssocClassDef;
+
+    fn def(class: &str, endpoints: &[(&str, &str)]) -> AssocClassDef {
+        AssocClassDef {
+            class: class.to_string(),
+            endpoints: endpoints
+                .iter()
+                .map(|(r, t)| (r.to_string(), t.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The shape almost every association has: two references, one of them
+    /// ours. Copied from the live `root\CIMV2` definition.
+    #[test]
+    fn an_association_resolves_our_role_and_the_far_end() {
+        let rows = assoc_rows(
+            &[def(
+                "Win32_SessionProcess",
+                &[
+                    ("Antecedent", "Win32_LogonSession"),
+                    ("Dependent", "Win32_Process"),
+                ],
+            )],
+            "Win32_Process",
+            "",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].assoc_class, "Win32_SessionProcess");
+        assert_eq!(rows[0].role, "Dependent");
+        assert_eq!(rows[0].target_class, "Win32_LogonSession");
+        assert!(rows[0].note.is_empty());
+    }
+
+    /// An association reached through an ancestor says so, because the user is
+    /// looking at `Win32_Process` and the relationship is declared on
+    /// `CIM_Process`.
+    #[test]
+    fn an_inherited_association_carries_its_provenance() {
+        let rows = assoc_rows(
+            &[def(
+                "CIM_ProcessExecutable",
+                &[("Antecedent", "CIM_DataFile"), ("Dependent", "CIM_Process")],
+            )],
+            "CIM_Process",
+            "inherited via CIM_Process",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_class, "CIM_DataFile");
+        assert_eq!(rows[0].note, "inherited via CIM_Process");
+    }
+
+    /// Both ends the same class: there is no "other" end, and dropping the row
+    /// would hide the relationship entirely.
+    #[test]
+    fn a_self_referencing_association_still_produces_rows() {
+        let rows = assoc_rows(
+            &[def(
+                "Win32_SubDirectory",
+                &[
+                    ("GroupComponent", "Win32_Directory"),
+                    ("PartComponent", "Win32_Directory"),
+                ],
+            )],
+            "Win32_Directory",
+            "",
+        );
+        // One row per role, each pointing back at the same class.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.target_class == "Win32_Directory"));
+        assert!(rows.iter().all(|r| r.note == "self-referencing"));
+        let roles: Vec<&str> = rows.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(roles, vec!["GroupComponent", "PartComponent"]);
+    }
+
+    /// WMI returned an association that references us, but no reference
+    /// property names us. Report it rather than silently drop it.
+    #[test]
+    fn an_unresolved_role_is_reported_not_dropped() {
+        let rows = assoc_rows(
+            &[def(
+                "Odd_Association",
+                &[("Left", "A_Class"), ("Right", "B_Class")],
+            )],
+            "Win32_Process",
+            "",
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.note == "role not resolved"));
+    }
+
+    #[test]
+    fn notes_join_without_stray_separators() {
+        assert_eq!(join_notes("", ""), "");
+        assert_eq!(join_notes("a", ""), "a");
+        assert_eq!(join_notes("", "b"), "b");
+        assert_eq!(join_notes("a", "b"), "a; b");
+    }
 
     #[test]
     fn to_table_unions_columns_and_aligns_sparse_rows() {

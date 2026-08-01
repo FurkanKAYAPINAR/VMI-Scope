@@ -34,7 +34,7 @@ pub struct ClassSchema {
 ///
 /// Hand-rolled rather than pulled in from `bitflags`: seven flags do not
 /// justify a dependency. Combine with `|`, test with [`ClassKind::contains`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ClassKind(u8);
 
 impl ClassKind {
@@ -134,6 +134,35 @@ impl ClassKind {
             .map(|(_, label)| *label)
             .collect()
     }
+
+    /// Why counting this class's instances would be wrong, or `None` if it is
+    /// a fair thing to ask.
+    ///
+    /// The three cases are not an optimization, they are a correctness rule.
+    /// An abstract class has no instances *of its own* by definition; an
+    /// association's "instances" are relationship tuples, so a count of them
+    /// answers a question nobody asked in a column headed "instances"; and an
+    /// `__Event`-derived class is a message shape, not a population — there is
+    /// nothing for `CreateInstanceEnum` to return, ever.
+    ///
+    /// The order is most-informative-first, because the reason becomes a
+    /// tooltip. Classes are routinely more than one of these: measured on
+    /// `root\CIMV2`, **every** `__Event`-derived class also reports
+    /// `abstract = TRUE`, propagated down from `__Event` itself with
+    /// `PropagatesToSubclass` set — so ranking abstract first would mean the
+    /// event reason never appeared at all. `CIM_Dependency` is likewise an
+    /// abstract association.
+    pub fn count_skip_reason(self) -> Option<SkipReason> {
+        if self.contains(Self::EVENT) {
+            Some(SkipReason::Event)
+        } else if self.contains(Self::ASSOCIATION) {
+            Some(SkipReason::Association)
+        } else if self.contains(Self::ABSTRACT) {
+            Some(SkipReason::Abstract)
+        } else {
+            None
+        }
+    }
 }
 
 impl std::ops::BitOr for ClassKind {
@@ -147,6 +176,168 @@ impl std::ops::BitOrAssign for ClassKind {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
+}
+
+/// One row of the class list: everything the list itself can render, and
+/// nothing that would cost a second round trip to learn.
+///
+/// Deliberately *not* a trimmed [`ClassSchema`]. The class list shows ~1,400
+/// rows in `root\CIMV2`, and the moment a row needs a property list it needs a
+/// `GetObject` per row. Everything here is read off the class-definition object
+/// the enumeration already handed over — see `crate::reflect::class_brief`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ClassBrief {
+    pub name: String,
+    pub kind: ClassKind,
+    /// The `provider` qualifier — which provider DLL answers for this class,
+    /// e.g. `CIMWin32`. `None` for a repository-backed (static) class, which
+    /// is most of them.
+    pub provider: Option<String>,
+}
+
+impl ClassBrief {
+    /// A brief carrying only what a name alone can tell you.
+    ///
+    /// The fallback for a transport that hands over names and nothing else.
+    /// `__`-prefixed means system; every other flag stays unset, which reads as
+    /// "plain static class" and would be a lie if it were presented as final.
+    pub fn from_name(name: impl Into<String>) -> Self {
+        let name = name.into();
+        let kind = ClassKind::classify(&name, &[], &[]);
+        Self {
+            name,
+            kind,
+            provider: None,
+        }
+    }
+}
+
+/// Why a class was left uncounted. See [`ClassKind::count_skip_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum SkipReason {
+    /// Abstract: a schema-only class, no instances of its own.
+    Abstract,
+    /// An association class: its instances are relationships, not objects.
+    Association,
+    /// Derived from `__Event`: a message shape, with no population to count.
+    Event,
+}
+
+impl SkipReason {
+    /// A short phrase for a tooltip.
+    pub fn note(self) -> &'static str {
+        match self {
+            SkipReason::Abstract => "abstract class: no instances of its own",
+            SkipReason::Association => "association class: instances are relationships",
+            SkipReason::Event => "event class: not instantiated",
+        }
+    }
+}
+
+/// The result of asking how many instances a class has.
+///
+/// An enum rather than an `Option<usize>` plus a flag, because the two states
+/// have to be impossible to confuse. "We counted zero" and "we did not count"
+/// render differently, and a `0` standing in for the second is the kind of
+/// quiet lie a tool like this exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum Tally {
+    /// A real enumeration happened. `completion` says whether the number is
+    /// final: anything but [`crate::enumerate::Completion::Complete`] makes
+    /// `instances` a lower bound, not a total.
+    Counted {
+        instances: usize,
+        completion: crate::enumerate::Completion,
+    },
+    /// Deliberately not counted — see [`SkipReason`].
+    Skipped(SkipReason),
+}
+
+impl Tally {
+    /// The exact instance count, or `None` when there isn't one — because the
+    /// class was skipped, or because the enumeration was cut short.
+    pub fn exact(&self) -> Option<usize> {
+        match self {
+            Tally::Counted {
+                instances,
+                completion,
+            } if completion.is_complete() => Some(*instances),
+            _ => None,
+        }
+    }
+
+    /// The badge text for the class list.
+    ///
+    /// An em dash means "not counted"; a trailing `+` means "at least this
+    /// many" — the enumeration hit its budget, was cancelled, or was capped.
+    /// Neither is ever rendered as a bare number, because a bare number in this
+    /// column is a promise that it is the whole population.
+    pub fn badge(&self) -> String {
+        match self {
+            Tally::Skipped(_) => "\u{2014}".to_string(),
+            Tally::Counted {
+                instances,
+                completion,
+            } => {
+                if completion.is_complete() {
+                    instances.to_string()
+                } else {
+                    format!("{instances}+")
+                }
+            }
+        }
+    }
+
+    /// Why this tally is partial or absent, or `None` when it is an exact total.
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Tally::Skipped(reason) => Some(reason.note().to_string()),
+            Tally::Counted { completion, .. } => completion.note(),
+        }
+    }
+}
+
+/// Class and namespace counts for one node of the namespace tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NamespaceStats {
+    pub namespace: String,
+    /// Was the rollup asked for? When false, `total_classes == classes` and
+    /// `namespaces == 1`.
+    pub recursive: bool,
+    /// Classes defined in this namespace itself.
+    pub classes: usize,
+    /// Direct child namespaces (`SELECT Name FROM __NAMESPACE`).
+    pub children: usize,
+    /// How many namespaces the rollup actually reached, this one included.
+    pub namespaces: usize,
+    /// Classes across every namespace the rollup reached.
+    pub total_classes: usize,
+    /// Namespaces that could not be bound or enumerated — almost always
+    /// access denied. Counted rather than swallowed: a rollup that quietly
+    /// omits `root\SECURITY` is a wrong number presented as a right one.
+    pub unreadable: usize,
+    /// Why the walk stopped.
+    pub completion: crate::enumerate::Completion,
+}
+
+/// One relationship a class participates in.
+///
+/// Produced from `REFERENCES OF {Class} WHERE SchemaOnly` (which names the
+/// association classes) cross-checked against `ASSOCIATORS OF {Class} WHERE
+/// SchemaOnly` (which names the classes at the far end).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AssocInfo {
+    /// The association class itself, e.g. `Win32_SessionProcess`. Empty when
+    /// only `ASSOCIATORS OF` reported the relationship.
+    pub assoc_class: String,
+    /// The reference property on `assoc_class` that points back at *our*
+    /// class, e.g. `Dependent`. This is WMI's notion of a role.
+    pub role: String,
+    /// The class at the other end, e.g. `Win32_LogonSession`.
+    pub target_class: String,
+    /// Anything that qualifies the row: inheritance, self-reference, or which
+    /// query it came from. Empty when the row is a plain direct relationship.
+    pub note: String,
 }
 
 /// A single property and its qualifiers.
@@ -382,6 +573,98 @@ mod tests {
             &[],
         );
         assert_eq!(k, ClassKind::NONE);
+    }
+
+    /// The skip-list, stated against the six classes it has to get right.
+    #[test]
+    fn the_skip_list_picks_the_most_informative_reason() {
+        use SkipReason::*;
+        let k = |flags: ClassKind| flags.count_skip_reason();
+
+        // Countable: a plain dynamic class, and a singleton.
+        assert_eq!(k(ClassKind::DYNAMIC), None);
+        assert_eq!(k(ClassKind::DYNAMIC | ClassKind::SINGLETON), None);
+        // System-ness alone is not a reason -- `__Win32Provider` has instances
+        // and counting them is exactly what the Providers view does.
+        assert_eq!(k(ClassKind::SYSTEM | ClassKind::DYNAMIC), None);
+        // Perf classes are dynamic and very much countable.
+        assert_eq!(k(ClassKind::DYNAMIC | ClassKind::PERF), None);
+
+        // CIM_Process.
+        assert_eq!(k(ClassKind::ABSTRACT), Some(Abstract));
+        // Win32_SessionProcess.
+        assert_eq!(
+            k(ClassKind::DYNAMIC | ClassKind::ASSOCIATION),
+            Some(Association)
+        );
+        // CIM_Dependency: an abstract association reads as an association.
+        assert_eq!(
+            k(ClassKind::ABSTRACT | ClassKind::ASSOCIATION),
+            Some(Association)
+        );
+        // Win32_ProcessStartTrace and __InstanceCreationEvent: every event
+        // class in root\CIMV2 inherits `abstract`, so event must outrank it or
+        // the reason would never be seen.
+        assert_eq!(k(ClassKind::EVENT | ClassKind::ABSTRACT), Some(Event));
+        assert_eq!(
+            k(ClassKind::EVENT | ClassKind::ABSTRACT | ClassKind::SYSTEM),
+            Some(Event)
+        );
+    }
+
+    #[test]
+    fn a_skipped_tally_is_an_em_dash_and_never_a_zero() {
+        let skipped = Tally::Skipped(SkipReason::Abstract);
+        assert_eq!(skipped.badge(), "—");
+        assert_eq!(skipped.exact(), None);
+        assert!(skipped.note().is_some());
+
+        let none_found = Tally::Counted {
+            instances: 0,
+            completion: crate::enumerate::Completion::Complete,
+        };
+        assert_eq!(none_found.badge(), "0");
+        assert_eq!(none_found.exact(), Some(0));
+        assert!(none_found.note().is_none());
+        // The two must never render the same: one is a fact, the other is the
+        // absence of one.
+        assert_ne!(skipped.badge(), none_found.badge());
+    }
+
+    /// A partial count is a lower bound and has to look like one.
+    #[test]
+    fn a_partial_tally_is_marked_as_a_lower_bound() {
+        let timed_out = Tally::Counted {
+            instances: 0,
+            completion: crate::enumerate::Completion::TimedOut {
+                after_ms: 3007,
+                rows: 0,
+            },
+        };
+        // CIM_DataFile, measured: nothing at all in three seconds.
+        assert_eq!(timed_out.badge(), "0+");
+        assert_eq!(timed_out.exact(), None);
+        assert!(timed_out.note().unwrap().contains("timed out"));
+
+        let cancelled = Tally::Counted {
+            instances: 91,
+            completion: crate::enumerate::Completion::Cancelled,
+        };
+        assert_eq!(cancelled.badge(), "91+");
+        assert_eq!(cancelled.exact(), None);
+    }
+
+    #[test]
+    fn a_brief_from_a_name_alone_knows_only_that_much() {
+        let sys = ClassBrief::from_name("__InstanceCreationEvent");
+        assert_eq!(sys.kind, ClassKind::SYSTEM);
+        assert!(sys.provider.is_none());
+        // Nothing a name can tell you makes a class abstract or an event, and
+        // the fallback must not pretend otherwise.
+        assert!(!sys.kind.contains(ClassKind::EVENT));
+
+        let ordinary = ClassBrief::from_name("Win32_Process");
+        assert_eq!(ordinary.kind, ClassKind::NONE);
     }
 
     #[test]

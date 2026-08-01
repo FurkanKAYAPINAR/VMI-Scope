@@ -2,6 +2,8 @@
 
 use eframe::egui;
 
+use vmiscope_core::ClassBrief;
+
 use crate::app::VmiScopeApp;
 use crate::widgets::field::filter_box;
 use crate::widgets::loading::spinner;
@@ -32,10 +34,10 @@ impl VmiScopeApp {
         let mut clicked: Option<String> = None;
         {
             let filter = self.class_filter.to_lowercase();
-            let filtered: Vec<&String> = self
+            let filtered: Vec<&ClassBrief> = self
                 .classes
                 .iter()
-                .filter(|c| filter.is_empty() || c.to_lowercase().contains(&filter))
+                .filter(|c| filter.is_empty() || c.name.to_lowercase().contains(&filter))
                 .collect();
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
             egui::ScrollArea::vertical()
@@ -44,9 +46,12 @@ impl VmiScopeApp {
                 .show_rows(ui, row_h, filtered.len(), |ui, range| {
                     for i in range {
                         let class = filtered[i];
-                        let selected = self.selected_class.as_deref() == Some(class.as_str());
-                        if ui.selectable_label(selected, class).clicked() {
-                            clicked = Some(class.clone());
+                        let selected = self.selected_class.as_deref() == Some(class.name.as_str());
+                        // The kind badge and the instance count that
+                        // `ClassBrief` now carries arrive with the Phase 3
+                        // rebuild; this row still shows only the name.
+                        if ui.selectable_label(selected, &class.name).clicked() {
+                            clicked = Some(class.name.clone());
                         }
                     }
                 });

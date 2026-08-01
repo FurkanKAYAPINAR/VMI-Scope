@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoSetProxyBlanket, CLSCTX_INPROC_SERVER, COAUTHIDENTITY, EOAC_NONE,
     RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
@@ -28,8 +28,6 @@ use windows::Win32::System::Wmi::{
     WBEM_FLAG_NONSYSTEM_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE,
 };
 use wmi::{Variant, WMIConnection};
-
-use crate::value::variant_to_string;
 
 /// Alternate credentials for a remote WMI connection. Password is redacted in
 /// its `Debug` output so it never lands in a log.
@@ -152,13 +150,6 @@ pub(crate) unsafe fn object_to_map(
     Ok(map)
 }
 
-unsafe fn get_string_prop(obj: &IWbemClassObject, prop: &str) -> Option<String> {
-    let h = HSTRING::from(prop);
-    let mut val = VARIANT::default();
-    obj.Get(PCWSTR(h.as_ptr()), 0, &mut val, None, None).ok()?;
-    Some(variant_to_string(&Variant::from_variant(&val).ok()?))
-}
-
 impl RemoteConn {
     /// Connect to `\\host\namespace` with alternate credentials.
     pub fn connect(host: &str, namespace: &str, cred: &Credential) -> anyhow::Result<RemoteConn> {
@@ -228,30 +219,5 @@ impl RemoteConn {
             }
         }
         Ok(out)
-    }
-
-    /// Enumerate class names via `meta_class`.
-    pub fn list_class_names(&self) -> anyhow::Result<Vec<String>> {
-        let en = self.exec_enum("SELECT * FROM meta_class")?;
-        let mut names = Vec::new();
-        unsafe {
-            loop {
-                let mut objs: [Option<IWbemClassObject>; 1] = [None];
-                let mut returned = 0u32;
-                if en.Next(WBEM_INFINITE, &mut objs, &mut returned).is_err() || returned == 0 {
-                    break;
-                }
-                if let Some(obj) = objs[0].take() {
-                    if let Some(name) = get_string_prop(&obj, "__CLASS") {
-                        if !name.is_empty() {
-                            names.push(name);
-                        }
-                    }
-                }
-            }
-        }
-        names.sort_unstable();
-        names.dedup();
-        Ok(names)
     }
 }

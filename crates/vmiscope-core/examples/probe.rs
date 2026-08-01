@@ -154,11 +154,31 @@ fn main() {
                     }
                 }
                 Response::Classes {
-                    namespace, classes, ..
+                    namespace,
+                    classes,
+                    completion,
+                    elapsed_ms,
+                    ..
                 } => {
-                    println!("\n== classes in {namespace} ({}) ==", classes.len());
-                    for c in classes.iter().filter(|c| c.starts_with("Win32_")).take(15) {
-                        println!("  {c}");
+                    println!(
+                        "\n== classes in {namespace} ({}, {elapsed_ms} ms{}) ==",
+                        classes.len(),
+                        completion
+                            .note()
+                            .map(|n| format!(", {n}"))
+                            .unwrap_or_default()
+                    );
+                    for c in classes
+                        .iter()
+                        .filter(|c| c.name.starts_with("Win32_"))
+                        .take(15)
+                    {
+                        println!(
+                            "  {:<44} {:<24} {}",
+                            c.name,
+                            c.kind.labels().join("|"),
+                            c.provider.clone().unwrap_or_default()
+                        );
                     }
                 }
                 Response::QueryResult { result, wql, .. } => {

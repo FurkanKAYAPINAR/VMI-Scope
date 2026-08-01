@@ -43,7 +43,11 @@ pub use procmon::{
 pub use providers::ProviderInfo;
 pub use remote::{Credential, RemoteConn};
 pub use schema::{
-    ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema, SearchHit, SearchIndex,
+    AssocInfo, ClassBrief, ClassKind, ClassSchema, MethodSchema, NamespaceStats, ParamSchema,
+    PropertySchema, SearchHit, SearchIndex, SkipReason, Tally,
 };
 pub use sid::{resolve_sid, SidResolver};
-pub use worker::{QueryResult, Request, Response, WmiWorker};
+pub use worker::{
+    QueryResult, Request, Response, WmiWorker, ASSOCIATIONS_BUDGET, CLASS_ENUM_BUDGET,
+    INSTANCE_COUNT_BUDGET, NAMESPACE_STATS_BUDGET,
+};

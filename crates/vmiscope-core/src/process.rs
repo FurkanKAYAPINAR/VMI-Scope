@@ -174,9 +174,11 @@ pub struct ProcInfo {
 
 /// The outcome of enrichment for one event.
 ///
-/// Three states, not two, because "we asked and the answer was no" and "we
-/// never asked" lead to different UI: the first is final, the second is not.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Four states, not two, because "we asked and the answer was no", "we never
+/// asked" and "we are still asking" lead to different UI -- the first is final,
+/// the others are not, and a view whose job is telling you what ran must not
+/// collapse them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub enum Enrichment {
     /// A `Win32_Process` row answered and every identity check passed.
     Found(ProcInfo),
@@ -186,6 +188,18 @@ pub enum Enrichment {
     /// Not attempted: a stop event (the process is gone by definition), or the
     /// enrichment queue was too deep to be worth joining.
     Skipped,
+    /// Asked for, no answer yet.
+    ///
+    /// The default, so a freshly built row starts here rather than in a state
+    /// that claims something was decided.
+    ///
+    /// Distinct from [`Enrichment::Skipped`] because a row that is *about* to
+    /// have a command line and a row that will never have one look identical
+    /// to a reader otherwise -- and in a view whose whole job is telling you
+    /// what ran, "we haven't looked yet" and "we looked and could not see"
+    /// are not the same claim.
+    #[default]
+    Pending,
 }
 
 /// The `Win32_Process` columns used to confirm identity and add detail.

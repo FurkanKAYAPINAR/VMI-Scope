@@ -142,6 +142,14 @@ impl VmiScopeApp {
                     };
                     self.reset_and_reseed();
                 }
+                // Phase 3's Explorer consumes these; until its rebuild lands
+                // they are acknowledged so the request is cleared, rather than
+                // left pending -- an unhandled reply reads as a hung spinner.
+                Response::NamespaceStats { id, .. }
+                | Response::InstanceCount { id, .. }
+                | Response::Associations { id, .. } => {
+                    self.pending.remove(&id);
+                }
                 Response::Error {
                     id,
                     context,

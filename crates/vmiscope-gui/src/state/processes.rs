@@ -91,7 +91,7 @@ impl TrackedProc {
 type Key = (u32, u64);
 
 /// Every process the view knows about, in arrival order.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ProcessLog {
     rows: Vec<TrackedProc>,
     /// Key -> index into `rows`.
@@ -104,12 +104,26 @@ pub(crate) struct ProcessLog {
     pub(crate) dropped: usize,
 }
 
+/// Hand-written rather than derived, because a derived `Default` leaves
+/// `max_rows` at 0 -- and a zero cap evicts every ended row the instant it
+/// arrives, which is the exact opposite of what this module exists to do. The
+/// failure would be silent and would look like "the monitor isn't catching
+/// exits".
+impl Default for ProcessLog {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            index: HashMap::new(),
+            by_seq: HashMap::new(),
+            max_rows: DEFAULT_MAX_ROWS,
+            dropped: 0,
+        }
+    }
+}
+
 impl ProcessLog {
     pub(crate) fn new() -> Self {
-        Self {
-            max_rows: DEFAULT_MAX_ROWS,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     pub(crate) fn rows(&self) -> &[TrackedProc] {
@@ -145,7 +159,7 @@ impl ProcessLog {
             name: event.name.clone(),
             session_id: event.session_id,
             user: String::new(),
-            command_line: Enrichment::Skipped,
+            command_line: Enrichment::Pending,
             started_at: now,
             ended_at: None,
             exit_status: None,
@@ -394,6 +408,20 @@ mod tests {
         assert_eq!(row.user, "CORP\\a.demir");
         assert!(matches!(row.command_line, Enrichment::Found(_)));
         assert!(!row.is_alive(), "attaching must not revive the row");
+    }
+
+    /// A derived `Default` would leave the cap at zero, and a zero cap drops
+    /// every ended row the moment it ends -- silently, and looking exactly like
+    /// a monitor that never sees exits.
+    #[test]
+    fn a_default_log_keeps_history() {
+        let mut log = ProcessLog::default();
+        assert_eq!(log.max_rows, DEFAULT_MAX_ROWS);
+
+        log.apply(1, &ev(ProcKind::Start, 1, 1), 0.0);
+        log.apply(2, &ev(ProcKind::Stop, 1, 2), 1.0);
+        assert_eq!(log.len(), 1, "the default cap threw the history away");
+        assert_eq!(log.dropped, 0);
     }
 
     /// A duplicate delivery of the same start is not a second process.

@@ -142,6 +142,8 @@ fn context_line(app: &VmiScopeApp) -> String {
             Some(providers) => format!("{} providers", providers.len()),
             None => "Not loaded".to_string(),
         },
+        // Composed in `views::process`, which owns the state it counts.
+        View::Process => app.proc_status(),
         // The rail shows these; the status bar should agree rather than going
         // blank and implying the view simply has nothing to say.
         other => format!("{} \u{2014} not built yet", other.title()),

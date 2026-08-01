@@ -6,5 +6,6 @@ pub(crate) mod explorer;
 pub(crate) mod nav;
 pub(crate) mod network;
 pub(crate) mod persistence;
+pub(crate) mod process;
 pub(crate) mod providers;
 pub(crate) mod settings;

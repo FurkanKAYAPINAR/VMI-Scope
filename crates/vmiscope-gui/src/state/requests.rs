@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::app::{CentralView, ConnStatus, VmiScopeApp, DEFAULT_NAMESPACE, ROOT_NAMESPACE};
+use crate::app::{ConnStatus, VmiScopeApp, DEFAULT_NAMESPACE, ROOT_NAMESPACE};
 use crate::state::ids::PendingKind;
 
 use vmiscope_core::{Credential, MethodArg, Request};
@@ -62,6 +62,103 @@ impl VmiScopeApp {
         self.worker.send(Request::ListProviders { id });
     }
 
+    /// Class/child counts for one namespace node of the tree, fired lazily the
+    /// first time a node is shown. Non-recursive: a per-node rollup over the
+    /// whole subtree would be minutes of binds for a number the row cannot show.
+    /// Deduped against both the cache and the in-flight set.
+    pub(crate) fn request_namespace_stats(&mut self, namespace: String) {
+        if self.ns_stats.contains_key(&namespace)
+            || self.ns_stats_pending.contains(&namespace)
+            // A namespace that denied us once will deny us every frame; trying
+            // again on each repaint is an error-log loop, not a retry.
+            || self.ns_stats_failed.contains(&namespace)
+        {
+            return;
+        }
+        let id = self.alloc_id();
+        self.ns_stats_pending.insert(namespace.clone());
+        self.pending
+            .insert(id, PendingKind::NamespaceStats(namespace.clone()));
+        self.worker.send(Request::NamespaceStats {
+            id,
+            namespace,
+            recursive: false,
+        });
+    }
+
+    /// Count one class's instances. Fired only for the selected class or by the
+    /// explicit "Count" action -- never for a whole namespace on arrival, which
+    /// is the rule task 3.11/3.19 exists to keep: a count is expensive, per-row,
+    /// and `CIM_DataFile` never finishes. The core skips abstract/association/
+    /// event classes without touching WMI and bounds the rest by a deadline.
+    pub(crate) fn request_instance_count(&mut self, class: String) {
+        if class.is_empty()
+            || self.instance_counts.contains_key(&class)
+            || self.counting.contains(&class)
+        {
+            return;
+        }
+        let id = self.alloc_id();
+        self.counting.insert(class.clone());
+        self.pending
+            .insert(id, PendingKind::InstanceCount(class.clone()));
+        self.worker.send(Request::InstanceCount {
+            id,
+            namespace: self.active_ns.clone(),
+            class,
+            // Shallow: the count is of this class's own instances, matching the
+            // `SELECT * FROM <class>` the Instances tab shows.
+            deep: false,
+        });
+    }
+
+    /// The relationships a class takes part in, for the Schema sub-tab. Bounded
+    /// by `ASSOCIATIONS_BUDGET` in the core. Deduped against the class already
+    /// held or being fetched.
+    pub(crate) fn request_associations(&mut self, class: String) {
+        if class.is_empty() {
+            return;
+        }
+        if self.assoc_class == class && (self.associations.is_some() || self.assoc_loading) {
+            return;
+        }
+        let id = self.alloc_id();
+        self.assoc_class = class.clone();
+        self.associations = None;
+        self.assoc_loading = true;
+        self.pending.insert(id, PendingKind::Associations);
+        self.worker.send(Request::Associations {
+            id,
+            namespace: self.active_ns.clone(),
+            class,
+        });
+    }
+
+    /// Fetch a class's MOF for inline display in the Schema sub-tab.
+    ///
+    /// Deliberately does not raise `mof_open`: the floating MOF window is
+    /// superseded by the inline panel (task 3.28), so the same `mof_*` state is
+    /// reused but the window stays closed.
+    pub(crate) fn request_class_mof_inline(&mut self, class: String) {
+        if class.is_empty() {
+            return;
+        }
+        if self.mof_object_path == class && (self.mof_text.is_some() || self.mof_loading) {
+            return;
+        }
+        let id = self.alloc_id();
+        self.mof_loading = true;
+        self.mof_title = class.clone();
+        self.mof_object_path = class.clone();
+        self.mof_text = None;
+        self.pending.insert(id, PendingKind::Mof);
+        self.worker.send(Request::ClassMof {
+            id,
+            namespace: self.active_ns.clone(),
+            object_path: class,
+        });
+    }
+
     pub(crate) fn request_schema(&mut self, class: String) {
         if class.is_empty() {
             return;
@@ -97,7 +194,14 @@ impl VmiScopeApp {
         let id = self.alloc_id();
         self.conn_status = ConnStatus::Connecting;
         self.pending.insert(id, PendingKind::Connect);
-        self.worker.send(Request::SetHost { id, host, cred });
+        // `impersonation` is a Phase-5 core addition (multi-host); this pre-Phase-5
+        // call site keeps WMI's usual Impersonate level via the field default.
+        self.worker.send(Request::SetHost {
+            id,
+            host,
+            cred,
+            impersonation: Default::default(),
+        });
     }
 
     /// Wipe host-scoped state and re-seed the tree/query for a new target.
@@ -113,6 +217,14 @@ impl VmiScopeApp {
         self.selected_row = None;
         self.schema = None;
         self.schema_class.clear();
+        self.instance_counts.clear();
+        self.counting.clear();
+        self.ns_stats.clear();
+        self.ns_stats_pending.clear();
+        self.ns_stats_failed.clear();
+        self.last_ns_stats_ms = None;
+        self.associations = None;
+        self.assoc_class.clear();
         self.search_index = None;
         self.net_conns.clear();
         self.providers = None;
@@ -174,27 +286,22 @@ impl VmiScopeApp {
         });
     }
 
-    pub(crate) fn request_mof(&mut self, object_path: String, title: String) {
-        let id = self.alloc_id();
-        self.mof_open = true;
-        self.mof_loading = true;
-        self.mof_title = title;
-        self.mof_object_path = object_path.clone();
-        self.mof_text = None;
-        self.pending.insert(id, PendingKind::Mof);
-        self.worker.send(Request::ClassMof {
-            id,
-            namespace: self.active_ns.clone(),
-            object_path,
-        });
-    }
+    // `request_mof` (which raised `mof_open` to show the floating MOF window)
+    // was removed with the Explorer rebuild: the Schema sub-tab loads MOF inline
+    // via `request_class_mof_inline`, and nothing else opened the window. The
+    // window itself lives in `overlays::mof` (not owned here) and is now dormant.
 
     pub(crate) fn run_query(&mut self) {
         let wql = self.query_text.trim().to_string();
         if wql.is_empty() {
             return;
         }
-        self.config.push_history(&wql);
+        // The namespace goes in with the text: a history entry that only knows
+        // the WQL cannot be replayed, because the same query means different
+        // things in different namespaces. The run's timings are attached later,
+        // by `note_query_run`, when the reply that measured them arrives.
+        let namespace = self.active_ns.clone();
+        self.config.push_history(&wql, &namespace);
         let id = self.alloc_id();
         self.latest_query_id = id;
         self.query_loading = true;
@@ -202,12 +309,21 @@ impl VmiScopeApp {
         self.pending.insert(id, PendingKind::Query);
         self.worker.send(Request::Query {
             id,
-            namespace: self.active_ns.clone(),
+            namespace,
             wql,
             // From Settings, not from the constants: those are only the
             // defaults a fresh config starts at.
             max_rows: Some(self.config.row_limit),
             timeout: Some(Duration::from_secs(self.config.operation_timeout_secs)),
+            // Identity columns off: `__RELPATH`/`__PATH`/`__CLASS` are noise in
+            // a plain result table. The Compare view (task 6.5) is what asks for
+            // them, and it is not built yet.
+            //
+            // NOTE: this field arrived in the core in another agent's in-flight
+            // Phase 6 work and left this -- the GUI's only `Request::Query` call
+            // site -- uncompilable. Filled in here with the behaviour the table
+            // has always had, not designed here.
+            include_system: false,
         });
     }
 
@@ -223,6 +339,12 @@ impl VmiScopeApp {
         self.selected_class = None;
         self.schema = None;
         self.schema_class.clear();
+        // Instance counts are a fact about a namespace's population, not about a
+        // class name, so they cannot survive a namespace switch.
+        self.instance_counts.clear();
+        self.counting.clear();
+        self.associations = None;
+        self.assoc_class.clear();
         self.request_classes(namespace);
     }
 
@@ -239,8 +361,11 @@ impl VmiScopeApp {
         self.query_text = format!("SELECT * FROM {class}");
         self.selected_class = Some(class.clone());
         self.run_query();
-        if self.central_view == CentralView::Schema {
-            self.request_schema(class);
-        }
+        // The detail header ("N properties · M methods · derives from X") needs
+        // the schema whatever the active sub-tab is, and it is a single class
+        // read; fetch it on selection rather than only when the Schema tab opens.
+        self.request_schema(class.clone());
+        // The one expensive per-class request, fired only for this selection.
+        self.request_instance_count(class);
     }
 }

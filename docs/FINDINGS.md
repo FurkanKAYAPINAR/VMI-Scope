@@ -171,12 +171,196 @@ static-capable. Keyless non-abstract classes really exist (`CIM_USBDevice`,
 `CIM_USBHub`, `CIM_StorageVolume`) and are class-path-only, because WMI cannot
 address an instance of a keyless class at all.
 
+### A wrong-credential bug does not look like an error, and there were seven
+
+The two known ones were `list_connections` and the `__EventConsumer` guard. The
+way to count the rest is to make the wrong path *fail*: put the worker in
+alternate-credential mode with credentials that cannot connect, fire every
+request shape at it, and see which ones still answer. Anything that answers did
+so over a connection built as the current user.
+
+Measured on the pre-Phase-5 tree (with its revert-to-local disabled, so the
+worker stays on the target), 14 request shapes:
+
+| still answered | with what |
+|---|---|
+| `ClassSchema` | 45 properties — of the local `Win32_Process` |
+| `ClassMof` | 6,779 characters of local MOF |
+| `ListInstances` | 309 local services |
+| `BuildSearchIndex` | 1,494 local classes |
+| `NetworkSnapshot` | `Ok` with **0 endpoints** |
+| `ListEventSubscriptions` | `Ok` with **0 subscriptions** |
+| `InvokeMethod` | **`ReturnValue=0` — it really ran, locally** |
+
+The last row is the one that matters. A read that answers about the wrong
+computer is a wrong answer; a *method invocation* that lands on the wrong
+computer is an action taken somewhere nobody asked for. Nothing in the code
+said so — the caller had set a host and credentials, and got a success.
+
+`NetworkSnapshot`'s row is the shape of the original bug, visible: the function
+returned `Ok` because its `Win32_Process` half succeeded over SSO while both
+endpoint queries failed on the credentialed transport, and the endpoint failures
+were swallowed by `if let Ok(..)`. One function, two transports, and the local
+one silently won.
+
+After routing everything through a single `bind`, all 15 shapes refuse.
+
+The general lesson is about the *fix*, not the bugs: patching the two known call
+sites would have left five. What removed the class was deleting the second door
+— `wmi::WMIConnection` is the only transport that cannot carry a credential, and
+it is no longer reachable from the worker at all.
+
+### An empty security report and an unreadable one are not the same answer
+
+`list_event_subscriptions` wrapped every query in `if let Ok(..)` and returned
+`Ok(SubscriptionReport { subscriptions: vec![] })` when *nothing* could be read.
+A persistence hunt that cannot reach `root\subscription` then reports the same
+thing as a clean machine. This was found by the experiment above — it was the
+one request out of fourteen that answered without touching WMI successfully at
+all.
+
+### `CoSetProxyBlanket`'s impersonation level reaches WMI, and gates *providers*
+
+Measured locally through the ordinary request path, varying only the level:
+
+| request | `Identify` | `Impersonate` | `Delegate` |
+|---|---|---|---|
+| connect probe (`Win32_OperatingSystem`) | `WBEM_E_ACCESS_DENIED` | ok | ok |
+| `SELECT … FROM Win32_ComputerSystem` | `WBEM_E_ACCESS_DENIED` | 1 row | 1 row |
+| reflect `Win32_Process` schema | **ok, 45 properties** | ok | ok |
+| `StdRegProv.EnumKey` | `WBEM_E_PROVIDER_NOT_CAPABLE` | `ReturnValue=0` | `ReturnValue=0` |
+
+Two things follow. The level is honoured on the **local/SSO** path, which
+`docs/REDESIGN.md` said it could not be (that claim was true when the SSO path
+went through the `wmi` crate and stale once it moved to `DirectConn`). And what
+it gates is the *provider*: a class definition comes out of the repository and
+needs no impersonation, so schema reflection works at `Identify` while every
+provider-served call is refused. `Delegate` is indistinguishable from
+`Impersonate` on one machine, as expected — there is no second hop to differ on.
+
+### A credentialed *local* connection is refused before the blanket is set
+
+`ConnectServer` returns `WBEM_E_LOCAL_CREDENTIALS (0x80041064)` in 2–13 ms for
+`\\<this machine>\root\cimv2` with any credential. It is refused at the connect,
+which means `CoSetProxyBlanket` is never reached — so the three impersonation
+levels are **indistinguishable** on the alternate-credential path on a single
+machine, and any claim about that path's blanket rests on the code, not on a
+measurement.
+
+### `Msft_Providers` has no `HostingModel` and no `Result`
+
+Task 5.11 asked for four columns. Two of them do not exist on that class.
+`SELECT HostingModel FROM Msft_Providers` and `SELECT Result FROM
+Msft_Providers` are both rejected with **Invalid query** on Windows 11 26200,
+and `Get-CimClass` confirms it: the class declares `provider`, `Namespace`,
+`HostProcessIdentifier`, `HostingGroup`, `HostingSpecification`, `Locale`,
+`TransactionIdentifier`, `User` and 20 `ProviderOperation_*` counters. Nothing
+else.
+
+`HostingModel` is real, one class over: `__Win32Provider` in the provider's
+*own* namespace, joined by `Name`. That join produces `NetworkServiceHost`,
+`LocalSystemHost`, `LocalServiceHost`, `WmiCore` and `Decoupled:NonCOM` for the
+providers on this machine, and it is worth the extra query — it is what
+explains why a provider sits in the host it sits in. Two providers here
+(`DelegatorProvider`, in `root\Microsoft\Windows\Storage\PT` and `…\PT\Alt`)
+have **no** `__Win32Provider` registration at all, so an empty string there is a
+real state and not a lookup failure.
+
+`Result` has no queryable home. The closest thing is `ResultCode` on the
+`Msft_WmiProvider_*_Post` classes, which are **extrinsic events** — they exist
+only while something is subscribed to provider instrumentation, and cannot be
+selected as a column of a provider list. It was left out rather than added as a
+field that is always empty.
+
+`HostingSpecification` is undocumented as an enumeration, so it is passed
+through as the `uint32` it is. Observed here it tracks `HostingModel`
+one-for-one — 1 = `WmiCore`, 5 = `LocalSystemHost`, 10 = `Decoupled:NonCOM`,
+12 = `NetworkServiceHost`, 13 = `LocalServiceHost` — but that is eight rows on
+one build, which is an observation and not a mapping table.
+
+### Two of eight providers are not hosted in a `WmiPrvSE` at all
+
+The plan's perf filter is `WHERE Name LIKE 'WmiPrvSE%'`. Measured on this
+machine, `Msft_ProviderSubSystem` and `SCM Event Provider` are hosted in PID
+2788 — the WMI service itself, whose perf counter instance is `svchost#13`. The
+name filter returns nothing for them, so a quarter of the provider list would
+have shown blank stats with no indication why.
+
+Filtering by the host PIDs the provider list actually names costs nothing:
+`WHERE IDProcess=…` over five PIDs took 347–476 ms, and enumerating **all** 393
+process instances took 380–388 ms. The perf provider materialises every counter
+instance regardless of the `WHERE`; the clause saves marshalling and nothing
+else.
+
+### `PercentProcessorTime` is summed over every logical processor
+
+`Win32_PerfFormattedData_PerfProc_Process.PercentProcessorTime` ranges
+`0..=100 × logical CPUs`, not `0..=100`. On this 24-CPU machine the `_Total`
+instance reads 2414 and a single busy `find` reads 102. Rendering a provider
+host's 5 as "5 %" overstates it by 24×; the honest figure is 0.21 % and it needs
+`Win32_ComputerSystem.NumberOfLogicalProcessors` to compute, which for a remote
+target has to come from the target rather than from `available_parallelism`.
+
+### The perf instance suffix is a reusable slot, not an identity
+
+`WmiPrvSE#3` was PID 43468. That host exited, and `WmiPrvSE#3` came back as PID
+37048 — measured across samples minutes apart, with the intervening mapping
+observed stable for 14 samples over 3 minutes. So the `#n` suffix is not a key
+across samples either, quite apart from being useless as a join key: the perf
+class calls the four live hosts `WmiPrvSE`, `WmiPrvSE#1`, `WmiPrvSE#2`,
+`WmiPrvSE#3` while `Win32_Process` calls all of them `WmiPrvSE.exe`. Joining on
+the `Win32_Process` name folds three distinct processes into one row.
+`IDProcess` is the only join.
+
 ### `[in, out]` parameters are real but rare
 
 3 in `root\CIMV2` (all `*USBHub`/`*USBDevice.GetDescriptor`), 4 in
 `root\Microsoft\Windows\Storage`, 4 in `root\wmi`, 0 in `root\StandardCimv2`.
 Reading the in- and out-signature objects separately duplicates them with no
 marker. `Win32_Process.Create` alone would never have exposed this.
+
+### WQL does not evaluate `ORDER BY` locally. It refuses to run the query at all.
+
+The redesign plan (§ "Design elements that are invented") called *"ORDER BY is
+evaluated locally by the client"* a **true statement about WQL**, worth keeping
+as a status-strip note. It is not true here. Measured on this machine through
+`Get-CimInstance -Query` — the same `IWbemServices::ExecQuery` the app uses:
+
+| query | result |
+|---|---|
+| `SELECT Name FROM Win32_Process` | 369 rows |
+| `SELECT Name, ProcessId FROM Win32_Process ORDER BY Name` | **Invalid query** (0x80041017) |
+| `SELECT Name FROM Win32_Process ORDER BY Name ASC` | **Invalid query** |
+| `SELECT Name FROM Win32_Service ORDER BY Name` | **Invalid query** |
+| `SELECT * FROM Win32_OperatingSystem ORDER BY Caption` | **Invalid query** |
+| `SELECT Name, ProcessId\n  FROM Win32_Process` (multi-line, no clause) | 369 rows |
+| `…\n ORDER BY Name` (multi-line, with clause) | **Invalid query** |
+
+`WBEM_E_INVALID_QUERY` comes from the query *parser*, before a single object is
+produced, so there is nothing for a client to sort. Confirmed a second time from
+inside the app: the Query view run with an `ORDER BY` shows no rows and the
+status bar carries `0x80041017`. Nothing in this codebase sorts a WQL clause
+either — the result table sorts on a **column-header click**, which is a
+different thing the user asks for explicitly.
+
+So task 4.3's derivation stands (scan for `ORDER BY` outside a string literal —
+that is the right trigger), but the sentence it triggers had to change. The view
+now says *"ORDER BY is not valid WQL — sort by clicking a column"*, which is both
+true and more actionable: the plan's wording implies the query runs and is merely
+slow.
+
+**Not measured:** whether any provider or namespace outside `root\CIMV2` accepts
+the clause. Three classes were tried; the failure is in the parser, so a
+provider-specific exception is unlikely but untested.
+
+### Query wall time is not stable enough to ever be a constant
+
+Four consecutive runs of the *same* query
+(`SELECT Name, ProcessId, ThreadCount, WorkingSetSize FROM Win32_Process WHERE
+WorkingSetSize > 40000000`, `root\CIMV2`) reported `elapsed_ms` of **65, 100, 54,
+62** for 146–147 rows. `SELECT * FROM Win32_OperatingSystem` reported 79 ms for
+1 row. Nothing about a hard-coded figure in a status strip would survive contact
+with this; the mock's "412 ms" is a mock.
 
 ---
 

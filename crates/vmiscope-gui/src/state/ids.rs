@@ -7,6 +7,13 @@ use crate::app::VmiScopeApp;
 pub(crate) enum PendingKind {
     Namespaces(String),
     Classes,
+    /// Per-namespace class-count rollup for the tree; carries the namespace so
+    /// an error clears the right node's pending flag.
+    NamespaceStats(String),
+    /// Per-class instance count; carries the class name for the same reason.
+    InstanceCount(String),
+    /// Association lookup for the selected class.
+    Associations,
     Query,
     Network,
     Events,

@@ -6,9 +6,8 @@ use crate::theme::tokens::{BAD, R_MD};
 use crate::widgets::button::focus_ring;
 use crate::widgets::rule::HAIRLINE;
 
-pub(crate) mod actions;
-pub(crate) mod confirm;
 pub(crate) mod errorlog;
+pub(crate) mod invoke;
 pub(crate) mod mof;
 pub(crate) mod palette;
 pub(crate) mod save_query;
@@ -19,9 +18,9 @@ pub(crate) mod save_query;
 // This is the one button in the app that is filled, and deliberately so. Every
 // other control in the kit is an outline on transparent, which is what makes an
 // outline the *unremarkable* shape here -- so rendering "Invoke Terminate" as
-// one would put a system-changing call at the same visual weight as "CSV". The
-// two call sites (the Actions panel's Invoke, the confirm dialog's Yes) are the
-// only ones that reach for it.
+// one would put a system-changing call at the same visual weight as "CSV". Both
+// call sites (the invoke modal's Review and its Yes) sit inside the one gate in
+// `overlays::invoke`.
 //
 // It lives here rather than in `widgets/button.rs` because a danger button that
 // any view can reach for stops being a gate: the kit deliberately offers no way

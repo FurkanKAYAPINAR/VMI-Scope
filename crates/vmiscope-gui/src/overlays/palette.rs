@@ -728,14 +728,14 @@ impl VmiScopeApp {
     /// Close the overlay nearest the front.
     ///
     /// The order is the stacking order, front to back: the palette is a
-    /// foreground modal, the confirm dialog opens over the Actions panel, and
-    /// the error log is the one you leave open while you work. Escape must
-    /// close exactly one of them -- closing the lot would be a single keystroke
-    /// undoing several decisions.
+    /// foreground modal, the invoke gate is the modal behind it, and the error
+    /// log is the one you leave open while you work. Escape must close exactly
+    /// one of them -- closing the lot would be a single keystroke undoing several
+    /// decisions.
     fn close_topmost_overlay(&mut self) {
         for open in [
             &mut self.palette_open,
-            &mut self.confirm_open,
+            &mut self.invoke_open,
             &mut self.save_query_open,
             &mut self.mof_open,
             &mut self.error_log_open,

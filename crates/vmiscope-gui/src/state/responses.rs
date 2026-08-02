@@ -40,9 +40,24 @@ impl VmiScopeApp {
                     self.class_cache.insert(namespace, classes);
                 }
                 Response::QueryResult {
-                    id, wql, result, ..
+                    id,
+                    namespace,
+                    wql,
+                    result,
+                    ..
                 } => {
                     self.pending.remove(&id);
+                    // The history entry this run created gets its measured
+                    // timings, and so does any saved query with the same text in
+                    // the same namespace. Done outside the staleness gate below:
+                    // a superseded result is still a real measurement of the
+                    // query that produced it.
+                    self.config.note_query_run(
+                        &wql,
+                        &namespace,
+                        result.elapsed_ms,
+                        result.rows.len(),
+                    );
                     // Ignore stale results from superseded queries.
                     if id == self.latest_query_id {
                         self.result = Some(result);
@@ -107,6 +122,7 @@ impl VmiScopeApp {
                     id,
                     object_path,
                     mof,
+                    ..
                 } => {
                     self.pending.remove(&id);
                     if object_path == self.mof_object_path {
@@ -134,7 +150,7 @@ impl VmiScopeApp {
                     self.search_loading = false;
                     self.search_index = Some(index);
                 }
-                Response::HostConnected { id, host } => {
+                Response::HostConnected { id, host, .. } => {
                     self.pending.remove(&id);
                     self.conn_status = match &host {
                         Some(h) => ConnStatus::Remote(h.clone()),
@@ -142,26 +158,68 @@ impl VmiScopeApp {
                     };
                     self.reset_and_reseed();
                 }
-                // Phase 3's Explorer consumes these; until its rebuild lands
-                // they are acknowledged so the request is cleared, rather than
-                // left pending -- an unhandled reply reads as a hung spinner.
-                Response::NamespaceStats { id, .. }
-                | Response::InstanceCount { id, .. }
-                | Response::Associations { id, .. } => {
+                Response::NamespaceStats {
+                    id,
+                    namespace,
+                    stats,
+                    elapsed_ms,
+                    ..
+                } => {
                     self.pending.remove(&id);
+                    self.ns_stats_pending.remove(&namespace);
+                    self.ns_stats.insert(namespace, stats);
+                    self.last_ns_stats_ms = Some(elapsed_ms);
+                }
+                Response::InstanceCount {
+                    id, class, tally, ..
+                } => {
+                    self.pending.remove(&id);
+                    self.counting.remove(&class);
+                    self.instance_counts.insert(class, tally);
+                }
+                Response::Associations {
+                    id,
+                    class,
+                    associations,
+                    completion,
+                    ..
+                } => {
+                    self.pending.remove(&id);
+                    // Ignore a reply for a class we have since moved off.
+                    if class == self.assoc_class {
+                        self.associations = Some(associations);
+                        self.assoc_completion = completion;
+                        self.assoc_loading = false;
+                    }
                 }
                 Response::Error {
                     id,
                     context,
                     message,
+                    ..
                 } => {
                     let kind = self.pending.remove(&id);
+                    // A background, lazy count the user never triggered should not
+                    // raise an error banner -- a denied namespace (root\SECURITY)
+                    // is expected, and the tree just shows no number for it.
+                    let mut suppress = false;
                     match kind {
                         Some(PendingKind::Namespaces(ns)) => {
                             self.ns_loading.remove(&ns);
                         }
                         Some(PendingKind::Classes) => {
                             self.classes_loading = false;
+                        }
+                        Some(PendingKind::NamespaceStats(ns)) => {
+                            self.ns_stats_pending.remove(&ns);
+                            self.ns_stats_failed.insert(ns);
+                            suppress = true;
+                        }
+                        Some(PendingKind::InstanceCount(class)) => {
+                            self.counting.remove(&class);
+                        }
+                        Some(PendingKind::Associations) => {
+                            self.assoc_loading = false;
                         }
                         Some(PendingKind::Query) => {
                             if id == self.latest_query_id {
@@ -197,7 +255,9 @@ impl VmiScopeApp {
                         }
                         None => {}
                     }
-                    self.push_error(format!("{context}\n{message}"));
+                    if !suppress {
+                        self.push_error(format!("{context}\n{message}"));
+                    }
                 }
             }
         }

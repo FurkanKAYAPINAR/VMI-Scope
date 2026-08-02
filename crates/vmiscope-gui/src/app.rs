@@ -18,6 +18,7 @@ use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, S2, S6, SURFACE};
 use crate::views::nav::View;
 use crate::views::network::NET_REFRESH_SECS;
 use crate::views::process::ProcessView;
+use crate::views::saved::SavedView;
 use crate::widgets::button::{btn_primary, focus_ring};
 use crate::widgets::card::card;
 use crate::widgets::chip::dot_chip;
@@ -26,9 +27,9 @@ use crate::widgets::loading::spinner;
 use crate::widgets::rule::vrule;
 
 use vmiscope_core::{
-    ClassBrief, ClassSchema, Connection, Credential, EventMonitor, MethodOutcome, MethodTarget,
-    MonitorMsg, ProviderInfo, QueryResult, SearchIndex, Subscription, SubscriptionReport,
-    WmiWorker, DEFAULT_EVENT_QUERY,
+    AssocInfo, ClassBrief, ClassSchema, Completion, Connection, Credential, EventMonitor,
+    MethodOutcome, MethodTarget, MonitorMsg, NamespaceStats, ProviderInfo, QueryResult,
+    SearchIndex, Subscription, SubscriptionReport, Tally, WmiWorker, DEFAULT_EVENT_QUERY,
 };
 
 pub(crate) const ROOT_NAMESPACE: &str = "root";
@@ -53,11 +54,19 @@ pub(crate) struct TrackedConn {
     pub(crate) alive: bool,
 }
 
-/// Which view the Explorer central panel shows for the selected class.
+/// Which sub-tab the Explorer detail pane shows for the selected class.
+///
+/// Named `CentralView` for continuity: the command palette (`overlays::palette`)
+/// and the global search (`views::explorer::search`) both reach for
+/// `CentralView::Instances` by name, so the type keeps it. The three tabs added
+/// by the Phase 3 rebuild sit alongside the original two.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub(crate) enum CentralView {
     Instances,
+    Properties,
+    Methods,
     Schema,
+    Code,
 }
 
 /// Connection status shown in the top bar.
@@ -126,6 +135,11 @@ pub struct VmiScopeApp {
     /// `views::process`.
     pub(crate) proc: ProcessView,
 
+    // --- saved library view ---
+    /// The Saved view's own filters. One struct rather than four fields, for the
+    /// same reason `proc` is one: they mean nothing outside that view.
+    pub(crate) saved_view: SavedView,
+
     // --- persistence tab ---
     pub(crate) events_report: Option<SubscriptionReport>,
     pub(crate) events_loading: bool,
@@ -158,6 +172,29 @@ pub struct VmiScopeApp {
     pub(crate) classes_loading: bool,
     pub(crate) class_filter: String,
     pub(crate) selected_class: Option<String>,
+    /// The active class-list facet chip (All / Dynamic / Association / Event /
+    /// System), matched against each row's `ClassKind`.
+    pub(crate) class_chip: crate::views::explorer::ClassChip,
+
+    // --- explorer counts (per active namespace) ---
+    /// Per-class instance counts, keyed by class name. A `Tally` rather than a
+    /// number so a skipped class shows an em dash and a timed-out one shows a
+    /// lower bound -- a zero that means "we did not look" is a lie the core's
+    /// own type exists to prevent.
+    pub(crate) instance_counts: HashMap<String, Tally>,
+    /// Classes with an instance count in flight: a row shows a spinner and a
+    /// second request is not queued.
+    pub(crate) counting: HashSet<String>,
+    /// Per-namespace class/child stats for the tree, keyed by namespace path.
+    pub(crate) ns_stats: HashMap<String, NamespaceStats>,
+    /// Namespaces with a stats request in flight (dedupe + one lazy fire).
+    pub(crate) ns_stats_pending: HashSet<String>,
+    /// Namespaces whose stats request failed (almost always access-denied, e.g.
+    /// `root\SECURITY`). Kept so the tree does not re-request them every repaint
+    /// -- a lazy count that can never succeed must be tried once, not forever.
+    pub(crate) ns_stats_failed: HashSet<String>,
+    /// Elapsed ms of the most recent namespace-stats reply, for the tree footer.
+    pub(crate) last_ns_stats_ms: Option<u64>,
 
     // --- query + results ---
     pub(crate) query_text: String,
@@ -169,14 +206,33 @@ pub struct VmiScopeApp {
     pub(crate) schema_class: String,
     pub(crate) schema_loading: bool,
     pub(crate) schema_filter: String,
+    // --- associations (Schema sub-tab) ---
+    /// The class whose associations `associations` holds.
+    pub(crate) assoc_class: String,
+    pub(crate) associations: Option<Vec<AssocInfo>>,
+    pub(crate) assoc_loading: bool,
+    /// Why an association lookup was partial, if it was.
+    pub(crate) assoc_completion: Completion,
+    // --- Code sub-tab ---
+    /// The Code sub-tab's language. Four-way, unlike the two-way `script_lang`
+    /// that Settings persists; PowerShell and VBScript delegate to
+    /// `util::generate_script` through `script_lang`, C# and WQL are generated
+    /// in `views::explorer::code`.
+    pub(crate) code_tab: crate::views::explorer::CodeTab,
     // --- MOF viewer (floating window) ---
     pub(crate) mof_open: bool,
     pub(crate) mof_title: String,
     pub(crate) mof_object_path: String,
     pub(crate) mof_text: Option<String>,
     pub(crate) mof_loading: bool,
-    // --- Actions (method execution) panel ---
+    // --- Actions (method execution) ---
+    /// Raised by the explorer's Invoke triggers, which still open the old
+    /// `Panel::right`; the `ui_actions` trampoline in `overlays::invoke` hands
+    /// that across to `invoke_open`. Retained only until the explorer view opens
+    /// the modal directly and drops the panel (task 3.32).
     pub(crate) actions_open: bool,
+    /// The method-invocation modal's open flag. See `overlays::invoke`.
+    pub(crate) invoke_open: bool,
     pub(crate) act_method: Option<String>,
     pub(crate) act_args: HashMap<String, String>,
     pub(crate) act_bools: HashMap<String, bool>,
@@ -185,7 +241,13 @@ pub struct VmiScopeApp {
     pub(crate) act_instances_loading: bool,
     pub(crate) act_invoking: bool,
     pub(crate) act_outcome: Option<(String, MethodOutcome)>,
-    pub(crate) confirm_open: bool,
+    /// The modal's confirm step is armed (Review clicked); the next Yes fires.
+    pub(crate) act_armed: bool,
+    /// Frame time the invoke was sent, and the measured round trip once the reply
+    /// lands -- `MethodOutcome` carries no timing of its own, so the modal times
+    /// it here.
+    pub(crate) act_invoke_started: Option<f64>,
+    pub(crate) act_elapsed_ms: Option<u64>,
     // --- global search ---
     pub(crate) search_index: Option<SearchIndex>,
     pub(crate) search_loading: bool,
@@ -226,6 +288,14 @@ impl VmiScopeApp {
             crate::config::CodeLang::PowerShell => ScriptLang::PowerShell,
             crate::config::CodeLang::VbScript => ScriptLang::VbScript,
         };
+        // The Code sub-tab starts on the same language Settings persists; the two
+        // stay in step because the tab writes PowerShell/VBScript back through
+        // `script_lang`. Read here (rather than from `config` in the struct
+        // literal) because `config` is moved into the struct below.
+        let code_tab = match config.default_lang {
+            crate::config::CodeLang::PowerShell => crate::views::explorer::CodeTab::PowerShell,
+            crate::config::CodeLang::VbScript => crate::views::explorer::CodeTab::VbScript,
+        };
 
         // Windows 11 rounds a decorated window itself; an undecorated one keeps
         // square corners unless DWM is told otherwise, and the shell frame's
@@ -264,6 +334,7 @@ impl VmiScopeApp {
             net_external_only: false,
             net_sort: None,
             proc: ProcessView::default(),
+            saved_view: SavedView::default(),
             events_report: None,
             events_loading: false,
             events_sort: None,
@@ -285,6 +356,13 @@ impl VmiScopeApp {
             classes_loading: false,
             class_filter: String::new(),
             selected_class: None,
+            class_chip: crate::views::explorer::ClassChip::All,
+            instance_counts: HashMap::new(),
+            counting: HashSet::new(),
+            ns_stats: HashMap::new(),
+            ns_stats_pending: HashSet::new(),
+            ns_stats_failed: HashSet::new(),
+            last_ns_stats_ms: None,
             query_text: DEFAULT_QUERY.to_string(),
             script_lang,
             save_query_open: false,
@@ -294,12 +372,18 @@ impl VmiScopeApp {
             schema_class: String::new(),
             schema_loading: false,
             schema_filter: String::new(),
+            assoc_class: String::new(),
+            associations: None,
+            assoc_loading: false,
+            assoc_completion: Completion::Complete,
+            code_tab,
             mof_open: false,
             mof_title: String::new(),
             mof_object_path: String::new(),
             mof_text: None,
             mof_loading: false,
             actions_open: false,
+            invoke_open: false,
             act_method: None,
             act_args: HashMap::new(),
             act_bools: HashMap::new(),
@@ -308,7 +392,9 @@ impl VmiScopeApp {
             act_instances_loading: false,
             act_invoking: false,
             act_outcome: None,
-            confirm_open: false,
+            act_armed: false,
+            act_invoke_started: None,
+            act_elapsed_ms: None,
             search_index: None,
             search_loading: false,
             search_text: String::new(),
@@ -350,6 +436,8 @@ impl VmiScopeApp {
             View::Network => self.request_network(now),
             View::Persistence => self.request_events(),
             View::Providers => self.request_providers(),
+            // Saved has nothing to re-fetch: the library is a file, not a WMI
+            // query, and it is written by this process alone.
             View::Events
             | View::Process
             | View::Saved
@@ -501,40 +589,18 @@ impl VmiScopeApp {
     fn ui_view(&mut self, ui: &mut egui::Ui, now: f64) {
         match self.view {
             View::Explorer => {
-                egui::Panel::left("vs_browser")
-                    .resizable(true)
-                    .default_size(300.0)
-                    .size_range(egui::Rangef::new(200.0, 520.0))
-                    .show(ui, |ui| {
-                        self.ui_namespace_tree(ui);
-                        ui.add_space(6.0);
-                        self.ui_search(ui);
-                        ui.add_space(6.0);
-                        self.ui_class_list(ui);
-                    });
-
-                if self.actions_open {
-                    egui::Panel::right("vs_actions")
-                        .resizable(true)
-                        .default_size(360.0)
-                        .size_range(egui::Rangef::new(260.0, 620.0))
-                        .show(ui, |ui| {
-                            self.ui_actions(ui);
-                        });
-                }
-
-                if self.selected_row.is_some() {
-                    egui::Panel::right("vs_detail")
-                        .resizable(true)
-                        .default_size(340.0)
-                        .size_range(egui::Rangef::new(220.0, 560.0))
-                        .show(ui, |ui| {
-                            self.ui_detail(ui);
-                        });
-                }
-
+                // The whole three-column layout (tree 224 · classes 290 · detail)
+                // plus the sub-tab strip lives in `views::explorer`.
+                self.ui_explorer(ui);
+            }
+            View::Query => {
+                // Owns its own panels (the 262px history rail and the row-detail
+                // reveal), so it takes the `Ui` rather than a central panel.
+                self.ui_query(ui);
+            }
+            View::Saved => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_central(ui);
+                    self.ui_saved(ui);
                 });
             }
             View::Process => {
@@ -682,13 +748,23 @@ impl eframe::App for VmiScopeApp {
         // MOF viewer, method-invocation confirmation, and save-query dialog float
         // above the views.
         self.ui_mof_window(ui.ctx());
-        self.ui_confirm_window(ui.ctx());
+        self.ui_invoke_modal(ui.ctx());
         self.ui_save_query_window(ui.ctx());
         self.ui_error_log_window(ui.ctx());
 
         // The palette is last, and a `Modal` rather than a `Window`: it is the
         // frontmost thing in the app and it dims what it covers.
         self.ui_palette(ui, now);
+
+        // Coalesced config write (task 4.7). `push_history` used to serialize and
+        // write the whole file on every query run; it now only marks the config
+        // dirty, and the write happens here at most once per debounce window.
+        // The returned wait keeps the frame loop alive long enough to perform
+        // it -- an app that went idle with a pending write would leave the last
+        // query out of the history until the next keystroke.
+        if let Some(wait) = self.config.poll_save() {
+            ui.ctx().request_repaint_after(wait);
+        }
 
         // Repaint while work is in flight, and continuously on the live views.
         if !self.pending.is_empty() {

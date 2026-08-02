@@ -8,4 +8,6 @@ pub(crate) mod network;
 pub(crate) mod persistence;
 pub(crate) mod process;
 pub(crate) mod providers;
+pub(crate) mod query;
+pub(crate) mod saved;
 pub(crate) mod settings;

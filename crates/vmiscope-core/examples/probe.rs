@@ -34,6 +34,7 @@ fn main() {
         wql: "SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem".into(),
         max_rows: None,
         timeout: None,
+        include_system: false,
     });
     worker.send(Request::NetworkSnapshot { id: id() });
     worker.send(Request::ListEventSubscriptions { id: id() });

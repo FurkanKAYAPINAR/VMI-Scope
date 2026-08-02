@@ -7,7 +7,7 @@
 //! works even for classes that have zero instances.
 
 /// Everything we can learn about one class by reflection.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ClassSchema {
     pub class: String,
     pub super_class: Option<String>,
@@ -341,7 +341,7 @@ pub struct AssocInfo {
 }
 
 /// A single property and its qualifiers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PropertySchema {
     pub name: String,
     /// CIM type name, e.g. `uint32`, `string[]`, `ref:Win32_Foo`.
@@ -356,7 +356,7 @@ pub struct PropertySchema {
 }
 
 /// A method signature.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MethodSchema {
     pub name: String,
     pub description: Option<String>,
@@ -377,7 +377,7 @@ pub struct MethodSchema {
 }
 
 /// One method parameter.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ParamSchema {
     pub name: String,
     pub cim_type: String,
@@ -403,7 +403,7 @@ impl ParamSchema {
 
 /// A searchable index of a namespace: class names, and each class's property
 /// (and optionally method) names. Built on demand for the global search box.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SearchIndex {
     pub namespace: String,
     pub classes: Vec<String>,

@@ -1,17 +1,29 @@
 //! Dynamic WMI method execution.
 //!
 //! Introspection (method + parameter signatures) comes from the reflected
-//! [`crate::schema::ClassSchema`]; *execution* uses the `wmi` crate's public
-//! API only — `get_object` → `get_method` → `spawn_instance` → `put_property`
-//! → `exec_method` — so no raw COM is needed here.
+//! [`crate::schema::ClassSchema`]; *execution* is the raw COM sequence
+//! `GetObject` → `GetMethod` → `SpawnInstance` → `Put` → `ExecMethod`.
+//!
+//! It used to be the `wmi` crate's equivalent, which was shorter and wrong for
+//! this crate's purpose: a `WMIConnection` cannot carry alternate credentials,
+//! so an invocation configured to run on a remote host as `DOMAIN\admin` ran on
+//! that host as the *current* user instead. Silently mutating state as the
+//! wrong principal is the worst outcome this crate has, so execution now goes
+//! through [`crate::enumerate::Bound`] like everything else.
 //!
 //! This is the one place VMI-Scope can change system state, so the GUI gates
 //! every invocation behind an explicit confirmation.
 
-use anyhow::{bail, Result};
-use wmi::{Variant, WMIConnection, WMIError};
+use std::time::Duration;
 
-use crate::value::variant_to_string;
+use anyhow::{bail, Result};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Wmi::{
+    IWbemClassObject, IWbemContext, IWbemServices, WBEM_GENERIC_FLAG_TYPE,
+};
+use wmi::{IWbemClassWrapper, Variant};
+
+use crate::enumerate::{drain, Bound, CancelToken, Completion};
 
 /// `WBEM_E_ILLEGAL_OPERATION` — the documented "you cannot do that here" code.
 const WBEM_E_ILLEGAL_OPERATION: i32 = 0x8004_101Eu32 as i32;
@@ -56,14 +68,14 @@ pub struct MethodArg {
 }
 
 /// An instance a method can be invoked against.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MethodTarget {
     pub path: String,
     pub label: String,
 }
 
 /// The result of a method invocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct MethodOutcome {
     pub return_value: Option<String>,
     pub outputs: Vec<(String, String)>,
@@ -90,32 +102,38 @@ fn build_variant(arg: &MethodArg) -> Result<Variant> {
     })
 }
 
-/// List instances of `class` as invocation targets (capped for responsiveness).
-pub fn list_instances(conn: &WMIConnection, class: &str) -> Result<Vec<MethodTarget>> {
-    let mut targets = Vec::new();
-    let wql = format!("SELECT * FROM {class}");
-    for (i, item) in conn.exec_query(&wql)?.enumerate() {
-        if i >= 500 {
-            break;
-        }
-        let Ok(obj) = item else { continue };
-        let path = obj.path().unwrap_or_default();
-        if path.is_empty() {
-            continue;
-        }
+/// List instances of `class` as invocation targets.
+///
+/// Bounded three ways, because "list the instances of a class" is a request a
+/// user can aim at `CIM_DataFile`: `cap` rows, `deadline` wall-clock, and the
+/// cancellation flag. The old version pulled the `wmi` iterator with an
+/// `if i >= 500 { break }` inside, which bounds nothing — that provider yields
+/// no rows at all for the first several seconds, so there was never a count to
+/// break on.
+pub(crate) fn list_instances(
+    conn: &Bound,
+    class: &str,
+    cap: Option<usize>,
+    deadline: Option<Duration>,
+    cancel: &CancelToken,
+) -> Result<(Vec<MethodTarget>, Completion)> {
+    // `CreateInstanceEnum` rather than `SELECT * FROM {class}`: same objects,
+    // no query parser, and a class name cannot smuggle a WQL clause in.
+    let en = conn.instance_enum(class, true)?;
+    let (mut targets, completion) = drain(&en, cap, deadline, cancel, |obj| {
+        let path = crate::reflect::string_property(obj, "__PATH");
         let label = ["Name", "Caption", "DeviceID", "__RELPATH"]
             .into_iter()
-            .find_map(|k| {
-                obj.get_property(k)
-                    .ok()
-                    .map(|v| variant_to_string(&v))
-                    .filter(|s| !s.is_empty())
-            })
+            .map(|k| crate::reflect::string_property(obj, k))
+            .find(|s| !s.is_empty())
             .unwrap_or_else(|| path.clone());
-        targets.push(MethodTarget { path, label });
-    }
+        Ok(MethodTarget { path, label })
+    })?;
+    // An object with no `__PATH` cannot be invoked against, so it is not a
+    // target -- dropped here rather than offered as a row that always fails.
+    targets.retain(|t| !t.path.is_empty());
     targets.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
-    Ok(targets)
+    Ok((targets, completion))
 }
 
 /// Did an invocation fail *because it was aimed at the wrong kind of path*?
@@ -123,12 +141,74 @@ pub fn list_instances(conn: &WMIConnection, class: &str) -> Result<Vec<MethodTar
 /// Both codes mean "this method does not exist on that object", which is how
 /// WMI reports a static method reached through an instance path. Nothing ran,
 /// so retrying elsewhere is safe.
-fn wrong_target<T>(result: &std::result::Result<T, WMIError>) -> bool {
+fn wrong_target<T>(result: &windows::core::Result<T>) -> bool {
     matches!(
         result,
-        Err(WMIError::HResultError { hres })
-            if *hres == WBEM_E_INVALID_METHOD || *hres == WBEM_E_ILLEGAL_OPERATION
+        Err(e) if e.code().0 == WBEM_E_INVALID_METHOD || e.code().0 == WBEM_E_ILLEGAL_OPERATION
     )
+}
+
+/// `IWbemServices::ExecMethod`, with the out-parameters object kept.
+///
+/// Returns `Ok(None)` for a `void` method with no out parameters — WMI
+/// produces no object at all in that case, and that is a success, not a
+/// missing result.
+fn exec_method_raw(
+    svc: &IWbemServices,
+    target: &str,
+    method: &str,
+    in_params: Option<&IWbemClassObject>,
+) -> windows::core::Result<Option<IWbemClassObject>> {
+    let mut out: Option<IWbemClassObject> = None;
+    unsafe {
+        svc.ExecMethod(
+            &windows::core::BSTR::from(target),
+            &windows::core::BSTR::from(method),
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None::<&IWbemContext>,
+            in_params,
+            Some(&mut out),
+            None,
+        )?;
+    }
+    Ok(out)
+}
+
+/// Build the in-parameters object for `method`, or `None` when it takes none.
+fn spawn_in_params(
+    class_def: &IWbemClassObject,
+    method: &str,
+    args: &[MethodArg],
+) -> Result<Option<IWbemClassObject>> {
+    let name = windows::core::HSTRING::from(method);
+    let mut in_sig: Option<IWbemClassObject> = None;
+    unsafe {
+        class_def.GetMethod(
+            windows::core::PCWSTR(name.as_ptr()),
+            0,
+            &mut in_sig,
+            std::ptr::null_mut(),
+        )?;
+    }
+    // A method with no input parameters has no in-signature object at all.
+    let Some(sig) = in_sig else { return Ok(None) };
+    let inst = unsafe { sig.SpawnInstance(0)? };
+    for a in args {
+        if a.value.trim().is_empty() {
+            continue; // leave unset -> provider default
+        }
+        // `wmi`'s conversion, not a hand-rolled one: it encodes the WMI
+        // numeric quirks (sint8 travels as VT_I2, uint64 as a decimal
+        // *string*), and getting those wrong is a silently truncated argument.
+        let variant: VARIANT = build_variant(a)?
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("parameter '{}': {e}", a.name))?;
+        let pname = windows::core::HSTRING::from(a.name.as_str());
+        unsafe {
+            inst.Put(windows::core::PCWSTR(pname.as_ptr()), 0, &variant, 0)?;
+        }
+    }
+    Ok(Some(inst))
 }
 
 /// Invoke `method` on `class` (static) or on `object_path` (instance).
@@ -138,28 +218,20 @@ fn wrong_target<T>(result: &std::result::Result<T, WMIError>) -> bool {
 /// static methods, so an invocation with no instance falls back to the class
 /// path, and an instance-path invocation that WMI rejects as static is retried
 /// there too.
-pub fn invoke_method(
-    conn: &WMIConnection,
+pub(crate) fn invoke_method(
+    conn: &Bound,
     class: &str,
     object_path: &str,
     method: &str,
     is_static: bool,
     args: &[MethodArg],
 ) -> Result<MethodOutcome> {
+    // `GetMethod` works on a class *definition* only, never on an instance —
+    // so the signature always comes from the class even when the call will be
+    // aimed at an instance path.
     let class_def = conn.get_object(class)?;
-    let in_params = match class_def.get_method(method)? {
-        Some(sig) => {
-            let inst = sig.spawn_instance()?;
-            for a in args {
-                if a.value.trim().is_empty() {
-                    continue; // leave unset -> provider default
-                }
-                inst.put_property(&a.name, build_variant(a)?)?;
-            }
-            Some(inst)
-        }
-        None => None,
-    };
+    let in_params = spawn_in_params(&class_def, method, args)?;
+    let svc = conn.services();
 
     // An instance path always contains a key assignment (`Class.Key="x"`);
     // anything else means the caller has no instance to offer.
@@ -171,9 +243,9 @@ pub fn invoke_method(
         instance
     };
 
-    let mut result = conn.exec_method(target, method, in_params.as_ref());
+    let mut result = exec_method_raw(svc, target, method, in_params.as_ref());
     if target != class && wrong_target(&result) {
-        result = conn.exec_method(class, method, in_params.as_ref());
+        result = exec_method_raw(svc, class, method, in_params.as_ref());
     }
     let out = match result {
         Ok(out) => out,
@@ -187,12 +259,11 @@ pub fn invoke_method(
 
     let mut outcome = MethodOutcome::default();
     if let Some(o) = out {
-        for name in o.list_properties().unwrap_or_default() {
-            let value = o
-                .get_property(&name)
-                .ok()
-                .map(|v| variant_to_string(&v))
-                .unwrap_or_default();
+        for name in IWbemClassWrapper::new(o.clone())
+            .list_properties()
+            .unwrap_or_default()
+        {
+            let value = crate::reflect::string_property(&o, &name);
             if name.eq_ignore_ascii_case("ReturnValue") {
                 outcome.return_value = Some(value);
             } else {
@@ -244,8 +315,10 @@ mod tests {
 
     #[test]
     fn only_wrong_path_errors_trigger_the_class_path_retry() {
-        let hres = |h: u32| -> std::result::Result<(), WMIError> {
-            Err(WMIError::HResultError { hres: h as i32 })
+        let hres = |h: u32| -> windows::core::Result<()> {
+            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                h as i32,
+            )))
         };
         // The code WMI really returns for a static method on an instance path.
         assert!(wrong_target(&hres(0x8004_102E)));

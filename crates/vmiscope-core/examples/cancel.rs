@@ -27,6 +27,7 @@ fn run(
         wql: wql.into(),
         max_rows,
         timeout,
+        include_system: false,
     });
     let mut cancelled_at: Option<Instant> = None;
     loop {
@@ -126,6 +127,7 @@ fn main() {
             wql: "SELECT * FROM CIM_DataFile".into(),
             max_rows: None,
             timeout: None,
+            include_system: false,
         });
         std::thread::sleep(Duration::from_millis(500));
     }

@@ -85,7 +85,7 @@ impl Connection {
 }
 
 /// One point-in-time reading of the whole connection table.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct NetworkSnapshot {
     pub connections: Vec<Connection>,
 }

@@ -1,29 +1,65 @@
-//! Background WMI worker.
+//! Background WMI worker: one thread, one COM apartment, **one target**.
 //!
-//! COM apartments are thread-affine, so all WMI work happens on a single
-//! dedicated thread that owns the [`COMLibrary`]. The UI talks to it purely
-//! through channels: it pushes [`Request`]s and drains [`Response`]s each
-//! frame without ever blocking on WMI.
+//! COM apartments are thread-affine, so all WMI work happens on a dedicated
+//! thread. The UI talks to it purely through channels: it pushes [`Request`]s
+//! and drains [`Response`]s each frame without ever blocking on WMI.
+//!
+//! One target, because the host and credentials live in thread-locals here and
+//! [`Request::SetHost`] flushes every cached connection when they change.
+//! Talking to two machines therefore means two workers, which is what
+//! [`crate::registry::WorkerRegistry`] is.
+//!
+//! Two rules hold everywhere below, and both are answers to bugs that were
+//! measured rather than reasoned about:
+//!
+//! - **One door.** [`bind`] is the only way to reach WMI, so an operation
+//!   cannot accidentally take a transport that ignores the configured
+//!   credentials. Seven of them used to.
+//! - **Every reply says where it came from.** Each carries the host it ran
+//!   against and the namespace it read, stamped at execution time, so nothing
+//!   downstream has to remember what was current when it asked.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::Win32::System::Wmi::IWbemClassObject;
-use wmi::{Variant, WMIConnection};
+use wmi::Variant;
 
-use crate::enumerate::{self, CancelToken, Completion, DirectConn, WorkerControl};
+use crate::enumerate::{self, Bound, CancelToken, Completion, DirectConn, WorkerControl};
 use crate::events::{assess, first_quoted, Risk, Subscription, SubscriptionReport};
+use crate::host::{HostInfo, Impersonation};
 use crate::method::{MethodArg, MethodOutcome, MethodTarget};
 use crate::network::{tcp_state_name, Connection, NetworkSnapshot, Protocol};
-use crate::providers::ProviderInfo;
+use crate::providers::{host_pids, HostQuota, HostStats, ProviderHosts, ProviderInfo};
 use crate::remote::{Credential, RemoteConn};
 use crate::schema::{
     AssocInfo, ClassBrief, ClassKind, ClassSchema, NamespaceStats, SearchIndex, Tally,
 };
-use crate::value::{variant_to_string, variant_to_u32};
+use crate::value::{variant_to_string, variant_to_u32, variant_to_u64};
+
+/// `root\CIMV2` — where the OS, process and provider classes live.
+pub const CIMV2: &str = "root\\CIMV2";
+
+/// `root\StandardCimv2` — where the TCP/UDP endpoint classes live.
+pub const NET_NAMESPACE: &str = "root\\StandardCimv2";
+
+/// `root` — where `__ProviderHostQuotaConfiguration` lives.
+///
+/// Not `root\CIMV2`, where the provider list itself comes from. The quota is a
+/// property of the WMI installation, so it is a singleton one level up, and a
+/// query for it in `CIMV2` returns nothing at all rather than an error.
+pub const ROOT_NAMESPACE: &str = "root";
+
+/// Every namespace a permanent-subscription scan visits.
+///
+/// `root\subscription` is the documented home; `root\default` is a classic
+/// hiding spot, and a scan that only reads the documented one is a scan an
+/// attacker has already read the documentation for.
+pub const SUBSCRIPTION_NAMESPACES: [&str; 2] = ["root\\subscription", "root\\default"];
 
 /// Wall-clock budget for enumerating one namespace's classes.
 ///
@@ -50,6 +86,42 @@ pub const INSTANCE_COUNT_BUDGET: Duration = Duration::from_secs(3);
 
 /// Wall-clock budget for one [`Request::Associations`] lookup.
 pub const ASSOCIATIONS_BUDGET: Duration = Duration::from_secs(10);
+
+/// Wall-clock budget for the fixed-shape queries the worker issues on its own
+/// behalf — the connection table, the provider list, a subscription scan.
+///
+/// These have no user watching a spinner and no cancel button of their own, so
+/// they need a ceiling; 30 s because they are all small on a healthy machine
+/// and the ceiling exists for the unhealthy one.
+pub const HELPER_QUERY_BUDGET: Duration = Duration::from_secs(30);
+
+/// Row cap and wall-clock budget for [`Request::ListInstances`].
+///
+/// The cap was always here; the budget was not, and the cap alone cannot bound
+/// this. `CIM_DataFile` is a legal argument to "list the instances I could
+/// invoke a method on", and it yields *zero* rows for its first several seconds
+/// — so a row cap never fires and the worker sits inside the enumeration.
+pub const INSTANCE_LIST_CAP: usize = 500;
+pub const INSTANCE_LIST_BUDGET: Duration = Duration::from_secs(10);
+
+/// Wall-clock budget for the whole provider-registration enrichment.
+///
+/// The `HostingModel` lookup is one bind plus one small query *per distinct
+/// namespace in the provider list*, and that list is not bounded by anything we
+/// control — a machine with decoupled providers scattered across the tree pays
+/// per namespace. So the loop is bounded as a whole and degrades to an empty
+/// `hosting_model` rather than delaying the rows that are already in hand.
+/// Measured here: four namespaces, 4–18 ms each.
+pub const PROVIDER_ENRICH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Above this many distinct host PIDs, ask the perf class for everything and
+/// filter locally instead of building a WQL `OR` chain that long.
+///
+/// The cap is about the query text, not about cost: measured on this machine,
+/// a five-PID filter takes 347–476 ms and the *unfiltered* enumeration of all
+/// 393 processes takes 380–388 ms. The perf provider materialises every counter
+/// instance either way, so the `WHERE` saves marshalling and nothing else.
+pub const PERF_PID_FILTER_CAP: usize = 64;
 
 /// A unit of work for the WMI thread. `id` lets the UI correlate the reply
 /// with the widget that asked (namespaces resolve out of order otherwise).
@@ -116,12 +188,20 @@ pub enum Request {
     /// A partial result always says why -- [`Completion::Truncated`],
     /// [`Completion::TimedOut`] or [`Completion::Cancelled`] -- rather than
     /// pretending to be whole.
+    ///
+    /// `include_system` folds the object's identity columns (`__RELPATH`,
+    /// `__PATH`, `__CLASS`) into every row. They are stripped by default because
+    /// the enumeration flag hides them and they are noise for a plain table, but
+    /// a snapshot diff needs `__RELPATH` as the stable key for classes with no
+    /// key property of their own — without it a diff can only compare whole
+    /// rows, which is useless.
     Query {
         id: u64,
         namespace: String,
         wql: String,
         max_rows: Option<usize>,
         timeout: Option<Duration>,
+        include_system: bool,
     },
     /// Take a snapshot of the live TCP/UDP connection table.
     NetworkSnapshot { id: u64 },
@@ -166,10 +246,20 @@ pub enum Request {
     /// Point all subsequent connections at `host`, back to the local machine
     /// with `None`. With `cred`, authenticate using alternate credentials
     /// (raw DCOM); without, connect as the current user (SSO).
+    ///
+    /// `impersonation` reaches WMI on **both** transports, because both set
+    /// their proxy blanket by hand. It is a real setting with real
+    /// consequences — `Identify` refuses nearly everything a provider serves;
+    /// see [`crate::host::Impersonation`] for the measurements.
+    ///
+    /// One worker now serves one host ([`crate::registry::WorkerRegistry`]), so
+    /// this is normally sent once, immediately after the thread is spawned,
+    /// rather than used to steer a shared worker between machines.
     SetHost {
         id: u64,
         host: Option<String>,
         cred: Option<Credential>,
+        impersonation: Impersonation,
     },
     /// Stop the enumeration running under `id`.
     ///
@@ -190,6 +280,15 @@ pub enum Request {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// The subset of `columns` that forms this class's key, when the WQL targets
+    /// a single class and that class declares `key` properties.
+    ///
+    /// Empty when the query spans no single class (a meta or `ASSOCIATORS OF`
+    /// query), when the class is keyless (`StdRegProv`, `Win32_OperatingSystem`),
+    /// or when the class could not be reflected. A diff falls back to `__RELPATH`
+    /// (present only when the query was run with `include_system`) and then to
+    /// whole-row identity in that order.
+    pub key_columns: Vec<String>,
     /// Milliseconds spent binding the namespace.
     ///
     /// Reported apart from `elapsed_ms` because the bind happens on *every*
@@ -209,16 +308,27 @@ pub struct QueryResult {
 /// splits the two, because only the query path has a single bind to attribute
 /// the cost to — the security scans bind several namespaces each, so one
 /// "connect" figure would be meaningless.
-#[derive(Debug, Clone)]
+///
+/// **Every variant carries `host`, and every variant whose result belongs to a
+/// namespace names that too** — stamped where the work happened rather than
+/// remembered by the caller. (`SearchIndex` is the exception only in shape: its
+/// namespace is a field of the index itself.) A UI that
+/// tracked "the current host" alongside the reply would be describing the host
+/// that is current *now*, not the one that answered — and the gap between those
+/// two is exactly one `SetHost`. The rule this encodes: a result must be able
+/// to say what it is a result *of*, without help.
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum Response {
     ChildNamespaces {
         id: u64,
+        host: Option<String>,
         namespace: String,
         children: Vec<String>,
         elapsed_ms: u64,
     },
     Classes {
         id: u64,
+        host: Option<String>,
         namespace: String,
         classes: Vec<ClassBrief>,
         /// Why the enumeration stopped. A class list that was cut short must
@@ -228,12 +338,14 @@ pub enum Response {
     },
     NamespaceStats {
         id: u64,
+        host: Option<String>,
         namespace: String,
         stats: NamespaceStats,
         elapsed_ms: u64,
     },
     InstanceCount {
         id: u64,
+        host: Option<String>,
         namespace: String,
         class: String,
         /// Counted (exactly or partially), or deliberately skipped.
@@ -242,6 +354,7 @@ pub enum Response {
     },
     Associations {
         id: u64,
+        host: Option<String>,
         namespace: String,
         class: String,
         associations: Vec<AssocInfo>,
@@ -250,6 +363,7 @@ pub enum Response {
     },
     QueryResult {
         id: u64,
+        host: Option<String>,
         namespace: String,
         wql: String,
         /// Carries its own `connect_ms` / `elapsed_ms` / `completion`.
@@ -257,21 +371,41 @@ pub enum Response {
     },
     Network {
         id: u64,
+        host: Option<String>,
+        /// Where the endpoint rows came from ([`NET_NAMESPACE`]). The process
+        /// names joined onto them come from [`CIMV2`] on the same host.
+        namespace: String,
         snapshot: NetworkSnapshot,
         elapsed_ms: u64,
     },
     EventSubscriptions {
         id: u64,
+        host: Option<String>,
+        /// The primary namespace scanned. The scan also covers the rest of
+        /// [`SUBSCRIPTION_NAMESPACES`]; this names where a subscription is
+        /// *supposed* to live.
+        namespace: String,
         report: SubscriptionReport,
         elapsed_ms: u64,
     },
     Providers {
         id: u64,
+        host: Option<String>,
+        /// Where the provider rows came from ([`CIMV2`]). Their `HostingModel`
+        /// comes from each provider's *own* namespace and the quota from
+        /// [`ROOT_NAMESPACE`], both on the same host.
+        namespace: String,
         providers: Vec<ProviderInfo>,
+        /// Live load of the processes hosting them, and the quota they run
+        /// against. Separate from `providers` because several providers share
+        /// one host: folding the stats into each row would report the same
+        /// 58 MB three times and make a baseline diff flap on CPU noise.
+        hosts: ProviderHosts,
         elapsed_ms: u64,
     },
     Schema {
         id: u64,
+        host: Option<String>,
         namespace: String,
         class: String,
         schema: ClassSchema,
@@ -279,37 +413,105 @@ pub enum Response {
     },
     Mof {
         id: u64,
+        host: Option<String>,
+        namespace: String,
         object_path: String,
         mof: String,
     },
     Instances {
         id: u64,
+        host: Option<String>,
+        namespace: String,
         class: String,
         targets: Vec<MethodTarget>,
+        /// Why the listing stopped — it is capped and deadline-bounded, and a
+        /// picker showing 500 of 40,000 instances must not imply there are 500.
+        completion: Completion,
     },
     MethodDone {
         id: u64,
+        host: Option<String>,
+        namespace: String,
         class: String,
         method: String,
         outcome: MethodOutcome,
     },
     SearchIndex {
         id: u64,
+        host: Option<String>,
         index: SearchIndex,
         elapsed_ms: u64,
     },
+    /// The target answered. `connect_ms` is the bind, `probe_ms` the two
+    /// identity queries — reported apart because they fail for different
+    /// reasons: a bad name or a firewall shows up in the first, a namespace ACL
+    /// in the second.
     HostConnected {
         id: u64,
         host: Option<String>,
+        connect_ms: u64,
+        probe_ms: u64,
+        info: HostInfo,
     },
     Error {
         id: u64,
+        host: Option<String>,
         context: String,
         message: String,
     },
 }
 
+impl Response {
+    /// The id of the request this answers.
+    pub fn id(&self) -> u64 {
+        match self {
+            Response::ChildNamespaces { id, .. }
+            | Response::Classes { id, .. }
+            | Response::NamespaceStats { id, .. }
+            | Response::InstanceCount { id, .. }
+            | Response::Associations { id, .. }
+            | Response::QueryResult { id, .. }
+            | Response::Network { id, .. }
+            | Response::EventSubscriptions { id, .. }
+            | Response::Providers { id, .. }
+            | Response::Schema { id, .. }
+            | Response::Mof { id, .. }
+            | Response::Instances { id, .. }
+            | Response::MethodDone { id, .. }
+            | Response::SearchIndex { id, .. }
+            | Response::HostConnected { id, .. }
+            | Response::Error { id, .. } => *id,
+        }
+    }
+
+    /// The host this result was produced on, `None` for the local machine.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Response::ChildNamespaces { host, .. }
+            | Response::Classes { host, .. }
+            | Response::NamespaceStats { host, .. }
+            | Response::InstanceCount { host, .. }
+            | Response::Associations { host, .. }
+            | Response::QueryResult { host, .. }
+            | Response::Network { host, .. }
+            | Response::EventSubscriptions { host, .. }
+            | Response::Providers { host, .. }
+            | Response::Schema { host, .. }
+            | Response::Mof { host, .. }
+            | Response::Instances { host, .. }
+            | Response::MethodDone { host, .. }
+            | Response::SearchIndex { host, .. }
+            | Response::HostConnected { host, .. }
+            | Response::Error { host, .. } => host.as_deref(),
+        }
+    }
+}
+
 /// Handle to the background WMI thread. Dropping it shuts the thread down.
+///
+/// A fresh worker targets the local machine as the current user. Point it
+/// somewhere else with [`Request::SetHost`] — or let
+/// [`crate::registry::WorkerRegistry`] own one per host and do that for you.
 pub struct WmiWorker {
     tx: Sender<Request>,
     rx: Receiver<Response>,
@@ -386,9 +588,11 @@ fn ms(start: Instant) -> u64 {
 
 /// The worker thread's main loop.
 ///
-/// `wmi` 0.18 initializes COM implicitly (an MTA via `CoIncrementMTAUsage`)
-/// the first time a connection is created. [`WMIConnection`] is `!Send`, so
-/// all connections are created and used here, never handed to another thread.
+/// COM is still bootstrapped through the `wmi` crate (an MTA via
+/// `CoIncrementMTAUsage` plus the default `CoInitializeSecurity`, once per
+/// thread — see `enumerate::create_locator`), but no request travels on one of
+/// its connections any more. Every interface here is thread-affine, so all
+/// connections are created and used on this thread and never handed to another.
 fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
     for req in rx {
         // The flag, not the message, is what makes shutdown prompt: by the
@@ -397,6 +601,14 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
         if control.is_shutdown() {
             break;
         }
+
+        // The host stamp, read *here* — after every earlier request in the
+        // queue has finished, and therefore after any `SetHost` among them, but
+        // before this one runs. Reading it in the UI when the reply arrives
+        // would name whichever host is current by then; reading it when the
+        // request was *sent* would name the host the user had selected at the
+        // time. Only this point is the host the answer actually came from.
+        let host = current_host();
 
         match req {
             Request::Shutdown => break,
@@ -412,12 +624,14 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match list_child_namespaces(&namespace) {
                     Ok(children) => Response::ChildNamespaces {
                         id,
+                        host,
                         namespace,
                         children,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("List namespaces under {namespace}"),
                         message: e.to_string(),
                     },
@@ -435,6 +649,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                         remember_kinds(&namespace, &classes);
                         Response::Classes {
                             id,
+                            host,
                             namespace,
                             classes,
                             completion,
@@ -443,6 +658,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                     }
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("List classes in {namespace}"),
                         message: e.to_string(),
                     },
@@ -462,12 +678,14 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match outcome {
                     Ok(stats) => Response::NamespaceStats {
                         id,
+                        host,
                         namespace,
                         stats,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Count classes in {namespace}"),
                         message: e.to_string(),
                     },
@@ -488,6 +706,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match outcome {
                     Ok(tally) => Response::InstanceCount {
                         id,
+                        host,
                         namespace,
                         class,
                         tally,
@@ -495,6 +714,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Count instances of {class} in {namespace}"),
                         message: e.to_string(),
                     },
@@ -514,6 +734,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match outcome {
                     Ok((associations, completion)) => Response::Associations {
                         id,
+                        host,
                         namespace,
                         class,
                         associations,
@@ -522,6 +743,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Associations of {class} in {namespace}"),
                         message: e.to_string(),
                     },
@@ -535,19 +757,23 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 wql,
                 max_rows,
                 timeout,
+                include_system,
             } => {
                 let cancel = control.begin(id);
-                let outcome = run_query(&namespace, &wql, max_rows, timeout, &cancel);
+                let outcome =
+                    run_query(&namespace, &wql, max_rows, timeout, include_system, &cancel);
                 control.end(id);
                 let resp = match outcome {
                     Ok(result) => Response::QueryResult {
                         id,
+                        host,
                         namespace,
                         wql,
                         result,
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Query in {namespace}: {wql}"),
                         message: e.to_string(),
                     },
@@ -560,11 +786,14 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match list_connections() {
                     Ok(snapshot) => Response::Network {
                         id,
+                        host,
+                        namespace: NET_NAMESPACE.into(),
                         snapshot,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: "Network snapshot".into(),
                         message: e.to_string(),
                     },
@@ -577,11 +806,14 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let resp = match list_event_subscriptions() {
                     Ok(report) => Response::EventSubscriptions {
                         id,
+                        host,
+                        namespace: SUBSCRIPTION_NAMESPACES[0].into(),
                         report,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: "Enumerate event subscriptions".into(),
                         message: e.to_string(),
                     },
@@ -591,14 +823,25 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
 
             Request::ListProviders { id } => {
                 let t0 = Instant::now();
-                let resp = match list_providers() {
-                    Ok(providers) => Response::Providers {
+                // Cancellable since 5.11: this used to be one fixed query and
+                // is now a walk over every namespace that registers a provider,
+                // plus a perf enumeration. Anything that grows with the target
+                // machine needs a way out.
+                let cancel = control.begin(id);
+                let outcome = list_providers(&cancel);
+                control.end(id);
+                let resp = match outcome {
+                    Ok((providers, hosts)) => Response::Providers {
                         id,
+                        host,
+                        namespace: CIMV2.into(),
                         providers,
+                        hosts,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: "Enumerate WMI providers".into(),
                         message: e.to_string(),
                     },
@@ -612,11 +855,13 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 class,
             } => {
                 let t0 = Instant::now();
-                let resp = match connect(&namespace)
-                    .and_then(|c| crate::reflect::read_class_schema(&c, &class))
+                let resp = match bind(&namespace)
+                    .and_then(|c| c.get_object(&class))
+                    .and_then(|o| crate::reflect::read_class_schema(&o, &class))
                 {
                     Ok(schema) => Response::Schema {
                         id,
+                        host,
                         namespace,
                         class,
                         schema,
@@ -624,6 +869,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Reflect schema of {class}"),
                         message: e.to_string(),
                     },
@@ -636,16 +882,20 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 namespace,
                 object_path,
             } => {
-                let resp = match connect(&namespace)
-                    .and_then(|c| crate::reflect::class_mof(&c, &object_path))
+                let resp = match bind(&namespace)
+                    .and_then(|c| c.get_object(&object_path))
+                    .and_then(|o| crate::reflect::object_mof(&o))
                 {
                     Ok(mof) => Response::Mof {
                         id,
+                        host,
+                        namespace,
                         object_path,
                         mof,
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("MOF of {object_path}"),
                         message: e.to_string(),
                     },
@@ -658,12 +908,29 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 namespace,
                 class,
             } => {
-                let resp = match connect(&namespace)
-                    .and_then(|c| crate::method::list_instances(&c, &class))
-                {
-                    Ok(targets) => Response::Instances { id, class, targets },
+                let cancel = control.begin(id);
+                let outcome = bind(&namespace).and_then(|c| {
+                    crate::method::list_instances(
+                        &c,
+                        &class,
+                        Some(INSTANCE_LIST_CAP),
+                        Some(INSTANCE_LIST_BUDGET),
+                        &cancel,
+                    )
+                });
+                control.end(id);
+                let resp = match outcome {
+                    Ok((targets, completion)) => Response::Instances {
+                        id,
+                        host,
+                        namespace,
+                        class,
+                        targets,
+                        completion,
+                    },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("List instances of {class}"),
                         message: e.to_string(),
                     },
@@ -680,7 +947,7 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 is_static,
                 args,
             } => {
-                let resp = match connect(&namespace).and_then(|c| {
+                let resp = match bind(&namespace).and_then(|c| {
                     crate::method::invoke_method(
                         &c,
                         &class,
@@ -692,12 +959,15 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 }) {
                     Ok(outcome) => Response::MethodDone {
                         id,
+                        host,
+                        namespace,
                         class,
                         method,
                         outcome,
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Invoke {class}.{method}"),
                         message: e.to_string(),
                     },
@@ -711,14 +981,19 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 include_methods,
             } => {
                 let t0 = Instant::now();
-                let resp = match build_search_index(&namespace, include_methods, &control) {
+                let cancel = control.begin(id);
+                let outcome = build_search_index(&namespace, include_methods, &cancel);
+                control.end(id);
+                let resp = match outcome {
                     Ok(index) => Response::SearchIndex {
                         id,
+                        host,
                         index,
                         elapsed_ms: ms(t0),
                     },
                     Err(e) => Response::Error {
                         id,
+                        host,
                         context: format!("Build search index for {namespace}"),
                         message: e.to_string(),
                     },
@@ -726,34 +1001,36 @@ fn run(rx: Receiver<Request>, tx: Sender<Response>, control: WorkerControl) {
                 let _ = tx.send(resp);
             }
 
-            Request::SetHost { id, host, cred } => {
-                HOST.with(|h| *h.borrow_mut() = host.clone());
-                CRED.with(|c| *c.borrow_mut() = cred.clone());
-                REMOTE.with(|m| m.borrow_mut().clear());
-                // A class kind is a fact about a *machine's* repository, not
-                // about a class name. Carrying it across a host switch would
-                // badge the new target with the old one's schema.
-                KIND_CACHE.with(|m| m.borrow_mut().clear());
-                // Verify the target is reachable (this also exercises the
-                // credential path — bogus creds fail here).
-                let probe = q_maps("root\\CIMV2", "SELECT Name FROM Win32_ComputerSystem");
-                let resp = match probe {
-                    Ok(_) => Response::HostConnected { id, host },
-                    Err(e) => {
-                        // Revert to local so the app stays usable.
-                        HOST.with(|h| *h.borrow_mut() = None);
-                        CRED.with(|c| *c.borrow_mut() = None);
-                        REMOTE.with(|m| m.borrow_mut().clear());
-                        // A class kind is a fact about a *machine's* repository, not
-                        // about a class name. Carrying it across a host switch would
-                        // badge the new target with the old one's schema.
-                        KIND_CACHE.with(|m| m.borrow_mut().clear());
-                        Response::Error {
-                            id,
-                            context: "Connect to host".into(),
-                            message: e.to_string(),
-                        }
-                    }
+            // A failed connect leaves the worker pointed at the target it
+            // failed to reach, on purpose. Falling back to the local machine
+            // would leave a worker that answers — plausibly, and about the
+            // wrong computer — after the connection it exists for did not
+            // happen. Every later request now fails with the same connection
+            // error until the caller says otherwise, and `SetHost` with no host
+            // is always the way back.
+            Request::SetHost {
+                id,
+                host,
+                cred,
+                impersonation,
+            } => {
+                set_target(host.clone(), cred, impersonation);
+                let resp = match connect_and_probe() {
+                    Ok((connect_ms, probe_ms, info)) => Response::HostConnected {
+                        id,
+                        // The *new* host: this reply is about the switch, so it
+                        // is stamped with what was switched to.
+                        host,
+                        connect_ms,
+                        probe_ms,
+                        info,
+                    },
+                    Err(e) => Response::Error {
+                        id,
+                        host,
+                        context: "Connect to host".into(),
+                        message: e.to_string(),
+                    },
                 };
                 let _ = tx.send(resp);
             }
@@ -767,8 +1044,16 @@ thread_local! {
     static HOST: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Alternate credentials for the remote host, if any (else current-user SSO).
     static CRED: RefCell<Option<Credential>> = const { RefCell::new(None) };
+    /// Impersonation level for the alternate-credential transport.
+    static IMP: RefCell<Impersonation> = const { RefCell::new(Impersonation::Impersonate) };
     /// Per-namespace raw-DCOM connections, used only in alternate-credential mode.
-    static REMOTE: RefCell<HashMap<String, RemoteConn>> = RefCell::new(HashMap::new());
+    ///
+    /// `Rc` so a binding can be handed out and the cache's borrow released
+    /// immediately. Holding the `RefCell` borrow for the length of an operation
+    /// was what made a recursive namespace walk impossible under alternate
+    /// credentials: the second `bind` was a second `borrow_mut`, which is a
+    /// panic, so those requests had to refuse to run at all.
+    static REMOTE: RefCell<HashMap<String, Rc<RemoteConn>>> = RefCell::new(HashMap::new());
     /// `(namespace, class)` -> kind, both keys lowercased.
     ///
     /// The schema cache task 3.9 asks for, in its smallest useful form. It is
@@ -799,17 +1084,16 @@ fn cached_kind(namespace: &str, class: &str) -> Option<ClassKind> {
     })
 }
 
-/// Connect to a namespace on the current target host. When a host is set the
-/// connection is made as the *current user* (SSO) — see [`Request::SetHost`].
-/// Kept per-request for simplicity; connections are cheap relative to the
-/// user-driven cadence of an explorer.
-fn connect(namespace: &str) -> anyhow::Result<WMIConnection> {
-    match current_host() {
-        Some(server) => Ok(WMIConnection::with_credentials_and_namespace(
-            &server, namespace, None, None, None,
-        )?),
-        None => Ok(WMIConnection::with_namespace_path(namespace)?),
-    }
+/// Point this worker at a target. Clears everything cached about the old one.
+fn set_target(host: Option<String>, cred: Option<Credential>, imp: Impersonation) {
+    HOST.with(|h| *h.borrow_mut() = host);
+    CRED.with(|c| *c.borrow_mut() = cred);
+    IMP.with(|i| *i.borrow_mut() = imp);
+    REMOTE.with(|m| m.borrow_mut().clear());
+    // A class kind is a fact about a *machine's* repository, not about a class
+    // name. Carrying it across a host switch would badge the new target with
+    // the old one's schema.
+    KIND_CACHE.with(|m| m.borrow_mut().clear());
 }
 
 /// The host all connections currently target, or `None` for this machine.
@@ -817,97 +1101,161 @@ fn current_host() -> Option<String> {
     HOST.with(|h| h.borrow().clone())
 }
 
-/// Are we in alternate-credential mode (raw DCOM), or local/SSO (`wmi` crate)?
+/// Are we in alternate-credential mode (raw DCOM), or local/SSO?
 fn is_alt_cred() -> bool {
     CRED.with(|c| c.borrow().is_some())
 }
 
-/// Run a closure against the cached raw-DCOM connection for `namespace`.
-fn with_remote<T>(
-    namespace: &str,
-    f: impl FnOnce(&RemoteConn) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    REMOTE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if !cache.contains_key(namespace) {
-            let host = HOST
-                .with(|h| h.borrow().clone())
-                .ok_or_else(|| anyhow::anyhow!("alternate credentials require a host"))?;
-            let cred = CRED
-                .with(|c| c.borrow().clone())
-                .ok_or_else(|| anyhow::anyhow!("no credentials set"))?;
-            cache.insert(
-                namespace.to_string(),
-                RemoteConn::connect(&host, namespace, &cred)?,
-            );
-        }
-        f(cache.get(namespace).unwrap())
-    })
+/// The cached raw-DCOM connection for `namespace`, opening one if needed.
+///
+/// The cache borrow is released before the connection is returned, so a caller
+/// may hold one binding while asking for another.
+fn remote_conn(namespace: &str) -> anyhow::Result<Rc<RemoteConn>> {
+    if let Some(existing) = REMOTE.with(|c| c.borrow().get(namespace).cloned()) {
+        return Ok(existing);
+    }
+    let host =
+        current_host().ok_or_else(|| anyhow::anyhow!("alternate credentials require a host"))?;
+    let cred = CRED
+        .with(|c| c.borrow().clone())
+        .ok_or_else(|| anyhow::anyhow!("no credentials set"))?;
+    let imp = IMP.with(|i| *i.borrow());
+    let conn = Rc::new(RemoteConn::connect(&host, namespace, &cred, imp)?);
+    REMOTE.with(|c| c.borrow_mut().insert(namespace.to_string(), conn.clone()));
+    Ok(conn)
 }
 
-/// Run a WQL query, returning raw property maps. Dispatches local/SSO
-/// (`wmi` crate) vs alternate-credential (raw DCOM).
-fn q_maps(namespace: &str, wql: &str) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
+/// **The** credential dispatcher: bind `namespace` on the transport this
+/// worker's credentials require.
+///
+/// Every WMI operation this module performs starts here. That is a structural
+/// claim, not a stylistic one. What it replaced was a set of paths that called
+/// the `wmi` crate directly — the one transport that cannot carry a credential
+/// — so under alternate credentials they ran as the current user and said
+/// nothing about it. Two were known when this was written. Counting them by
+/// making the wrong path fail found **seven**, one of which invoked a method:
+/// see `docs/FINDINGS.md` and `examples/altcred.rs`.
+///
+/// One door is what makes that a closed class rather than seven fixes. A path
+/// added tomorrow cannot pick the wrong transport, because there is no other
+/// transport to pick.
+fn bind(namespace: &str) -> anyhow::Result<Bound> {
     if is_alt_cred() {
-        with_remote(namespace, |r| r.exec_maps(wql))
+        Ok(Bound::Remote(remote_conn(namespace)?))
     } else {
-        Ok(connect(namespace)?.raw_query(wql)?)
+        Ok(Bound::Direct(DirectConn::open_with(
+            current_host().as_deref(),
+            namespace,
+            IMP.with(|i| *i.borrow()),
+        )?))
     }
 }
 
-/// Make sure the raw-DCOM connection for `namespace` exists.
+/// Bind the target and ask it who it is: `(connect_ms, probe_ms, info)`.
 ///
-/// Called before timing an alternate-credential query so the cost of building
-/// the connection lands in `connect_ms` instead of being charged to the query.
-fn ensure_remote(namespace: &str) -> anyhow::Result<()> {
-    with_remote(namespace, |_| Ok(()))
-}
+/// The two timings are separate because they answer different questions and
+/// fail for different reasons. `connect_ms` is the DCOM bind — the round trip a
+/// "test connection" button is really measuring, and where a wrong name, a
+/// closed port or a rejected credential surfaces. `probe_ms` is two ordinary
+/// queries on top of it, which is what a *usable* connection costs and where a
+/// namespace ACL surfaces instead.
+///
+/// The probe result used to be discarded — the connect ran
+/// `SELECT Name FROM Win32_ComputerSystem` purely to see whether it would throw.
+/// The same round trip can answer which OS, which build and which machine, so
+/// it does.
+fn connect_and_probe() -> anyhow::Result<(u64, u64, HostInfo)> {
+    let t_connect = Instant::now();
+    let conn = bind(CIMV2)?;
+    let connect_ms = ms(t_connect);
 
-/// Bind `namespace` for one of the raw-COM explorer operations.
-///
-/// These paths are local/SSO only, and say so instead of silently running as
-/// the wrong principal. The alternate-credential transport reaches WMI through
-/// a `RefCell`-cached [`RemoteConn`] handed out inside a closure
-/// ([`with_remote`]), and a recursive namespace walk would have to nest those
-/// closures — a second `borrow_mut` on the same `RefCell`, which is a panic.
-/// Fixing that properly means one connection registry per host, which is a
-/// Phase 5 refactor; until then an honest error beats a wrong number.
-fn bind_direct(namespace: &str, what: &str) -> anyhow::Result<DirectConn> {
-    if is_alt_cred() {
-        anyhow::bail!(
-            "{what} is not available under alternate credentials \
-             (it would run as the current user, not the connected one)"
-        );
+    let t_probe = Instant::now();
+    let mut info = HostInfo::default();
+    // The OS query is the one that must succeed: it is the reachability proof
+    // the connect step used to stand on.
+    let en = conn.exec_enum(
+        "SELECT Caption, Version, BuildNumber, OSArchitecture, LastBootUpTime \
+         FROM Win32_OperatingSystem",
+    )?;
+    let (rows, _) = enumerate::drain(
+        &en,
+        Some(1),
+        Some(HELPER_QUERY_BUDGET),
+        &CancelToken::never(),
+        |o| unsafe { crate::remote::object_to_map(o, false) },
+    )?;
+    if let Some(os) = rows.first() {
+        let get = |k: &str| os.get(k).map(variant_to_string).unwrap_or_default();
+        info.caption = get("Caption");
+        info.version = get("Version");
+        info.build_number = get("BuildNumber");
+        info.architecture = get("OSArchitecture");
+        info.last_boot = get("LastBootUpTime");
     }
-    DirectConn::open(current_host().as_deref(), namespace)
+    // The machine UUID is a nice-to-have from a *different* provider, so a
+    // failure here is not a failure to connect. Two hosts with the same name
+    // are a real situation and this is what tells them apart, but a host that
+    // will not answer it is still a host we are connected to.
+    if let Ok(rows) = q_maps(CIMV2, "SELECT UUID FROM Win32_ComputerSystemProduct") {
+        if let Some(p) = rows.first() {
+            info.uuid = p.get("UUID").map(variant_to_string).unwrap_or_default();
+        }
+    }
+    Ok((connect_ms, ms(t_probe), info))
 }
 
-/// Enumerate a namespace's classes as briefs, dispatching local/SSO vs
-/// alternate-credential.
+/// Run one of the worker's own fixed-shape queries and flatten the rows.
 ///
-/// Both transports go through [`enumerate::drain`], so both are cancellable and
-/// both stop at [`CLASS_ENUM_BUDGET`]. Local/SSO additionally skips the query
-/// engine entirely by using `CreateClassEnum` instead of
-/// `SELECT * FROM meta_class`.
+/// A partial answer to one of these is worse than an error: half a connection
+/// table, read as the whole one, is a hunt that misses the connection it was
+/// looking for. So the deadline and the cancellation flag are reported as
+/// failures here, unlike on [`Request::Query`] where the user asked for the
+/// query, is watching it, and is told exactly how it ended.
+fn q_maps(namespace: &str, wql: &str) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
+    q_maps_within(namespace, wql, HELPER_QUERY_BUDGET, &CancelToken::never())
+}
+
+/// [`q_maps`] with the caller's own deadline and cancellation flag.
+///
+/// Exists for the loops: a request that issues one query per namespace cannot
+/// hand each of them the full [`HELPER_QUERY_BUDGET`], or its own ceiling
+/// becomes that budget multiplied by however many namespaces the target
+/// machine happens to have.
+fn q_maps_within(
+    namespace: &str,
+    wql: &str,
+    budget: Duration,
+    cancel: &CancelToken,
+) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
+    let conn = bind(namespace)?;
+    let en = conn.exec_enum(wql)?;
+    let (rows, completion) = enumerate::drain(&en, None, Some(budget), cancel, |o| unsafe {
+        crate::remote::object_to_map(o, false)
+    })?;
+    match completion.note() {
+        None => Ok(rows),
+        Some(why) => anyhow::bail!("{wql} in {namespace}: {why}"),
+    }
+}
+
+/// Enumerate a namespace's classes as briefs.
+///
+/// `CreateClassEnum` on both transports, not `SELECT * FROM meta_class`: it
+/// reaches the same class-definition objects without the query engine parsing
+/// WQL, building a projection and evaluating a trivial filter to get there. The
+/// alternate-credential path used the query form only because it was the one
+/// call that re-blanketed its enumerator; [`RemoteConn::class_enum`] does that
+/// too now.
 fn q_class_briefs(
     namespace: &str,
     cancel: &CancelToken,
 ) -> anyhow::Result<(Vec<ClassBrief>, Completion)> {
-    let budget = Some(CLASS_ENUM_BUDGET);
-    let brief = |o: &IWbemClassObject| Ok(crate::reflect::class_brief(o));
-    let (mut classes, completion) = if is_alt_cred() {
-        with_remote(namespace, |r| {
-            // No `CreateClassEnum` on this path: `RemoteConn` has to re-blanket
-            // every proxy it produces, and `exec_enum` is the one place that
-            // does. `meta_class` reaches the same class-definition objects.
-            let en = r.exec_enum("SELECT * FROM meta_class")?;
-            enumerate::drain(&en, None, budget, cancel, brief)
-        })?
-    } else {
-        let conn = DirectConn::open(current_host().as_deref(), namespace)?;
-        let en = conn.class_enum(None, true)?;
-        enumerate::drain(&en, None, budget, cancel, brief)?
-    };
+    let conn = bind(namespace)?;
+    let en = conn.class_enum(None, true)?;
+    let (mut classes, completion) =
+        enumerate::drain(&en, None, Some(CLASS_ENUM_BUDGET), cancel, |o| {
+            Ok(crate::reflect::class_brief(o))
+        })?;
     classes.retain(|c| !c.name.is_empty());
     classes.sort_by(|a, b| a.name.cmp(&b.name));
     classes.dedup_by(|a, b| a.name == b.name);
@@ -916,7 +1264,7 @@ fn q_class_briefs(
 
 /// Count the classes in one namespace without reading a single object.
 fn count_classes(
-    conn: &DirectConn,
+    conn: &Bound,
     deadline: Option<Duration>,
     cancel: &CancelToken,
 ) -> anyhow::Result<(usize, Completion)> {
@@ -926,11 +1274,12 @@ fn count_classes(
 
 /// The direct child namespaces of `namespace`, fully qualified.
 ///
-/// A drained `__NAMESPACE` enumeration rather than [`list_child_namespaces`]'s
-/// `raw_query`, because this one runs inside a recursive walk that has to stay
-/// interruptible between children.
+/// Separate from [`list_child_namespaces`] because this one runs inside a
+/// recursive walk: it takes a binding the caller already holds and a share of
+/// the walk's remaining budget, so a rollup over `root` cannot spend a fresh
+/// full budget on each of its ~100 namespaces.
 fn child_namespaces(
-    conn: &DirectConn,
+    conn: &Bound,
     namespace: &str,
     deadline: Option<Duration>,
     cancel: &CancelToken,
@@ -987,11 +1336,11 @@ fn namespace_stats(
             break;
         };
 
-        let conn = match bind_direct(&ns, "Namespace statistics") {
+        let conn = match bind(&ns) {
             Ok(conn) => conn,
             // The *root* failing is not a partial result, it is no result —
-            // an alternate-credential session or a bad namespace has to
-            // surface as an error, not as a rollup of zero.
+            // a bad namespace has to surface as an error, not as a rollup of
+            // zero.
             Err(e) if root => return Err(e),
             Err(_) => {
                 stats.unreadable += 1;
@@ -1038,7 +1387,7 @@ fn namespace_stats(
 
 /// The kind of one class, from the cache when a class enumeration has already
 /// established it, else from a single `GetObject`.
-fn class_kind(conn: &DirectConn, namespace: &str, class: &str) -> anyhow::Result<ClassKind> {
+fn class_kind(conn: &Bound, namespace: &str, class: &str) -> anyhow::Result<ClassKind> {
     if let Some(kind) = cached_kind(namespace, class) {
         return Ok(kind);
     }
@@ -1058,7 +1407,7 @@ fn instance_count(
     deep: bool,
     cancel: &CancelToken,
 ) -> anyhow::Result<Tally> {
-    let conn = bind_direct(namespace, "Instance counting")?;
+    let conn = bind(namespace)?;
     if let Some(reason) = class_kind(&conn, namespace, class)?.count_skip_reason() {
         return Ok(Tally::Skipped(reason));
     }
@@ -1172,7 +1521,7 @@ fn class_associations(
     class: &str,
     cancel: &CancelToken,
 ) -> anyhow::Result<(Vec<AssocInfo>, Completion)> {
-    let conn = bind_direct(namespace, "Association lookup")?;
+    let conn = bind(namespace)?;
     let started = Instant::now();
 
     // The class itself first, then each ancestor nearest-first.
@@ -1275,40 +1624,79 @@ fn run_query(
     wql: &str,
     max_rows: Option<usize>,
     deadline: Option<Duration>,
+    include_system: bool,
     cancel: &CancelToken,
 ) -> anyhow::Result<QueryResult> {
     // Both transports flatten an object identically; only the way the
-    // enumerator is obtained differs.
-    let to_map = |obj: &IWbemClassObject| unsafe { crate::remote::object_to_map(obj) };
-    let alt_cred = is_alt_cred();
+    // enumerator is obtained differs. `include_system` rides through the closure
+    // so the identity columns are read on the same object, without a second
+    // pass.
+    let to_map =
+        |obj: &IWbemClassObject| unsafe { crate::remote::object_to_map(obj, include_system) };
 
     let t_connect = Instant::now();
-    let direct = if alt_cred {
-        ensure_remote(namespace)?;
-        None
-    } else {
-        Some(DirectConn::open(current_host().as_deref(), namespace)?)
-    };
+    let conn = bind(namespace)?;
     let connect_ms = ms(t_connect);
 
     let t_exec = Instant::now();
-    let (rows, completion) = match &direct {
-        Some(conn) => {
-            let en = conn.exec_enum(wql)?;
-            enumerate::drain(&en, max_rows, deadline, cancel, to_map)?
-        }
-        None => with_remote(namespace, |r| {
-            let en = r.exec_enum(wql)?;
-            enumerate::drain(&en, max_rows, deadline, cancel, to_map)
-        })?,
-    };
+    let en = conn.exec_enum(wql)?;
+    let (rows, completion) = enumerate::drain(&en, max_rows, deadline, cancel, to_map)?;
     let elapsed_ms = ms(t_exec);
 
     let mut table = to_table(rows);
     table.connect_ms = connect_ms;
     table.elapsed_ms = elapsed_ms;
     table.completion = completion;
+    // Key columns are a fact about the *class*, not the rows, so they are read
+    // after the timed enumeration and never counted against `elapsed_ms`. A
+    // failure to reflect them is not a failure of the query: the table is still
+    // whole, it just has no declared key, and the diff falls back accordingly.
+    table.key_columns = single_class_from_wql(wql)
+        .and_then(|class| class_key_columns(&conn, &class).ok())
+        .unwrap_or_default();
     Ok(table)
+}
+
+/// The single class a WQL `SELECT` targets, or `None` for anything else.
+///
+/// WMI has no joins, so a data query names exactly one class after `FROM`; that
+/// token is the class. Everything else — `ASSOCIATORS OF`, `REFERENCES OF`, a
+/// subquery, `meta_class` reflection — has no single instance class to key on,
+/// and returns `None` rather than a guess. The parse is deliberately strict:
+/// the token after `FROM` must be a bare identifier, so a quoted object path or
+/// a parenthesised subquery is rejected instead of mistaken for a class name.
+fn single_class_from_wql(wql: &str) -> Option<String> {
+    let tokens: Vec<&str> = wql.split_whitespace().collect();
+    let from = tokens.iter().position(|t| t.eq_ignore_ascii_case("from"))?;
+    let raw = tokens.get(from + 1)?;
+    // A class butting straight against a clause with no space ("Win32_Service"
+    // is fine, but be defensive about "Win32_Service;") is trimmed to its
+    // identifier core.
+    let name = raw.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    // `meta_class` is the reflection pseudo-class, not an instance class.
+    if name.eq_ignore_ascii_case("meta_class") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// The `key`-qualified property names of `class`, in declared order.
+///
+/// One `GetObject` plus the reflection the schema panel already does — no
+/// enumeration, so it is bounded by nothing but that single round trip. Keyless
+/// classes (`StdRegProv`, singletons) legitimately return an empty list.
+fn class_key_columns(conn: &Bound, class: &str) -> anyhow::Result<Vec<String>> {
+    let obj = conn.get_object(class)?;
+    let schema = crate::reflect::read_class_schema(&obj, class)?;
+    Ok(schema
+        .properties
+        .iter()
+        .filter(|p| p.is_key)
+        .map(|p| p.name.clone())
+        .collect())
 }
 
 /// Flatten a list of property maps into a column-aligned table. Columns are
@@ -1342,77 +1730,86 @@ fn to_table(rows: Vec<HashMap<String, Variant>>) -> QueryResult {
     }
 }
 
+/// Turn one endpoint row into a [`Connection`], joining the owning process by
+/// **PID**.
+///
+/// Two things here are load-bearing. The join key is `OwningProcess`, never a
+/// name, and the ports come back as `uint16` widened to `u32` by the variant
+/// layer, so they have to be narrowed again rather than parsed. A row whose
+/// PID is absent from the map keeps an empty process name — the endpoint is
+/// real either way, and dropping it would hide exactly the connection whose
+/// owner could not be read.
+fn to_connection(
+    r: &HashMap<String, Variant>,
+    proto: Protocol,
+    pid_name: &HashMap<u32, String>,
+) -> Connection {
+    let pid = r.get("OwningProcess").map(variant_to_u32).unwrap_or(0);
+    let text = |k: &str| r.get(k).map(variant_to_string).unwrap_or_default();
+    let port = |k: &str| r.get(k).map(variant_to_u32).unwrap_or(0) as u16;
+    let tcp = proto == Protocol::Tcp;
+    Connection {
+        proto,
+        local_addr: text("LocalAddress"),
+        local_port: port("LocalPort"),
+        // UDP is connectionless: it has no peer and no state, and inventing
+        // `0.0.0.0:0` for one would put a fake row in a hunt.
+        remote_addr: if tcp {
+            text("RemoteAddress")
+        } else {
+            String::new()
+        },
+        remote_port: if tcp { port("RemotePort") } else { 0 },
+        state: if tcp {
+            tcp_state_name(r.get("State").map(variant_to_u32).unwrap_or(0)).to_string()
+        } else {
+            String::new()
+        },
+        pid,
+        process: pid_name.get(&pid).cloned().unwrap_or_default(),
+    }
+}
+
 /// Snapshot the TCP/UDP connection table and resolve owning process names.
 ///
-/// TCP/UDP tables live in `root\StandardCimv2`; process names come from
-/// `Win32_Process` in `root\CIMV2`. A missing endpoint class (older Windows)
+/// TCP/UDP tables live in [`NET_NAMESPACE`]; process names come from
+/// `Win32_Process` in [`CIMV2`]. A missing endpoint class (older Windows)
 /// degrades gracefully rather than failing the whole snapshot.
+///
+/// **Both halves go through the credential dispatcher.** The process-name half
+/// used to call the `wmi` crate directly, which cannot carry a credential: on a
+/// credentialed remote the endpoint rows came from the target while the PID→name
+/// join ran against *this* machine's process table. The visible symptom was an
+/// empty process column, which reads as "WMI didn't tell us" rather than "we
+/// asked the wrong computer"; the invisible one was worse, since a PID that
+/// happened to exist locally would have joined a wrong name onto a remote
+/// connection.
 fn list_connections() -> anyhow::Result<NetworkSnapshot> {
-    // PID -> process name.
-    let cimv2 = connect("root\\CIMV2")?;
-    let procs: Vec<HashMap<String, Variant>> =
-        cimv2.raw_query("SELECT ProcessId, Name FROM Win32_Process")?;
-    let mut pid_name: HashMap<u32, String> = HashMap::new();
-    for p in procs {
-        let pid = p.get("ProcessId").map(variant_to_u32).unwrap_or(0);
-        if pid != 0 {
-            let name = p.get("Name").map(variant_to_string).unwrap_or_default();
-            pid_name.insert(pid, name);
-        }
-    }
-    let name_of = |pid: u32| pid_name.get(&pid).cloned().unwrap_or_default();
-
+    // `Request::NetworkSnapshot` has no cancellation of its own yet, so this
+    // path keeps the behaviour it had; the parameter exists for the provider
+    // list, which does.
+    let pid_name = process_names(&CancelToken::never())?;
     let mut connections = Vec::new();
 
-    // TCP connections.
     if let Ok(rows) = q_maps(
-        "root\\StandardCimv2",
+        NET_NAMESPACE,
         "SELECT LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess \
          FROM MSFT_NetTCPConnection",
     ) {
-        for r in rows {
-            let pid = r.get("OwningProcess").map(variant_to_u32).unwrap_or(0);
-            let state = tcp_state_name(r.get("State").map(variant_to_u32).unwrap_or(0)).to_string();
-            connections.push(Connection {
-                proto: Protocol::Tcp,
-                local_addr: r
-                    .get("LocalAddress")
-                    .map(variant_to_string)
-                    .unwrap_or_default(),
-                local_port: r.get("LocalPort").map(variant_to_u32).unwrap_or(0) as u16,
-                remote_addr: r
-                    .get("RemoteAddress")
-                    .map(variant_to_string)
-                    .unwrap_or_default(),
-                remote_port: r.get("RemotePort").map(variant_to_u32).unwrap_or(0) as u16,
-                state,
-                pid,
-                process: name_of(pid),
-            });
-        }
+        connections.extend(
+            rows.iter()
+                .map(|r| to_connection(r, Protocol::Tcp, &pid_name)),
+        );
     }
 
-    // UDP endpoints (connectionless: no remote/state).
     if let Ok(rows) = q_maps(
-        "root\\StandardCimv2",
+        NET_NAMESPACE,
         "SELECT LocalAddress,LocalPort,OwningProcess FROM MSFT_NetUDPEndpoint",
     ) {
-        for r in rows {
-            let pid = r.get("OwningProcess").map(variant_to_u32).unwrap_or(0);
-            connections.push(Connection {
-                proto: Protocol::Udp,
-                local_addr: r
-                    .get("LocalAddress")
-                    .map(variant_to_string)
-                    .unwrap_or_default(),
-                local_port: r.get("LocalPort").map(variant_to_u32).unwrap_or(0) as u16,
-                remote_addr: String::new(),
-                remote_port: 0,
-                state: String::new(),
-                pid,
-                process: name_of(pid),
-            });
-        }
+        connections.extend(
+            rows.iter()
+                .map(|r| to_connection(r, Protocol::Udp, &pid_name)),
+        );
     }
 
     Ok(NetworkSnapshot { connections })
@@ -1426,59 +1823,98 @@ fn list_connections() -> anyhow::Result<NetworkSnapshot> {
 /// known evasion against binding-only tools.
 fn list_event_subscriptions() -> anyhow::Result<SubscriptionReport> {
     let mut subscriptions = Vec::new();
-    for ns in ["root\\subscription", "root\\default"] {
-        subscriptions.extend(scan_subscriptions_in(ns));
+    let mut unreadable = Vec::new();
+    for ns in SUBSCRIPTION_NAMESPACES {
+        match scan_subscriptions_in(ns) {
+            Ok(subs) => subscriptions.extend(subs),
+            Err(e) => unreadable.push(format!("{ns}: {e}")),
+        }
+    }
+    // Nothing scanned is not a clean bill of health, and this is the exact
+    // shape the mistake takes: every namespace refused, every error swallowed
+    // by an `if let Ok`, and an empty report handed back as a *successful*
+    // scan. "No persistence found" and "we could not look" are opposite
+    // answers, and a responder reading a green panel cannot tell them apart.
+    // Measured, not imagined: with the worker on a credentialed target it
+    // could not reach, this was the one request out of fourteen that still
+    // answered (see `examples/altcred.rs`).
+    if subscriptions.is_empty() && unreadable.len() == SUBSCRIPTION_NAMESPACES.len() {
+        anyhow::bail!(
+            "no subscription namespace could be scanned ({})",
+            unreadable.join("; ")
+        );
     }
     // Most-suspicious first.
     subscriptions.sort_by(|a, b| b.risk.cmp(&a.risk));
-    Ok(SubscriptionReport { subscriptions })
+    Ok(SubscriptionReport {
+        subscriptions,
+        unreadable,
+    })
 }
 
-fn scan_subscriptions_in(namespace: &str) -> Vec<Subscription> {
+/// Scan one namespace, or say why it could not be scanned.
+///
+/// All three enumerations are load-bearing, so any of them failing fails the
+/// namespace rather than degrading a row. A scan that read the bindings but not
+/// the consumers is worse than no scan: it produces rows with an empty
+/// `consumer_type`, which [`assess`] can only score **Low** — a report full of
+/// reassuring entries that describe nothing.
+fn scan_subscriptions_in(namespace: &str) -> anyhow::Result<Vec<Subscription>> {
+    let conn = bind(namespace)?;
+
     // Filters: Name -> query.
     let mut filters: HashMap<String, String> = HashMap::new();
-    if let Ok(rows) = q_maps(namespace, "SELECT Name, Query FROM __EventFilter") {
-        for r in rows {
-            let name = r.get("Name").map(variant_to_string).unwrap_or_default();
-            if !name.is_empty() {
-                let query = r.get("Query").map(variant_to_string).unwrap_or_default();
-                filters.insert(name, query);
-            }
+    for r in scan_query(&conn, namespace, "SELECT Name, Query FROM __EventFilter")? {
+        let name = r.get("Name").map(variant_to_string).unwrap_or_default();
+        if !name.is_empty() {
+            let query = r.get("Query").map(variant_to_string).unwrap_or_default();
+            filters.insert(name, query);
         }
     }
 
-    // Consumers: Name -> (concrete class, best-effort action). Read via the
-    // reflective wrapper (the class is a system property). Local/SSO only.
+    // Consumers: Name -> (concrete class, best-effort action).
+    //
+    // This walk was skipped entirely under alternate credentials, and the
+    // consequence was not a missing column — it was a wrong verdict. Every
+    // subscription came back with an empty `consumer_type` and an empty
+    // `action`, and `assess("", query, "")` has nothing left to fire on, so it
+    // returns **Low**. A `CommandLineEventConsumer` running an encoded
+    // PowerShell payload — the textbook T1546.003 — was reported as low risk on
+    // exactly the credentialed remote scan a responder would run during an
+    // incident. A silent false negative on the flagship feature.
+    //
+    // The fix is to read the objects instead of flattened maps: `__CLASS` is a
+    // system property and the enumeration flags hide it, so a map-returning
+    // query cannot answer "which kind of consumer is this?" on either
+    // transport. Both now take the same path.
     let mut consumers: HashMap<String, (String, String)> = HashMap::new();
-    if !is_alt_cred() {
-        if let Ok(conn) = connect(namespace) {
-            if let Ok(iter) = conn.exec_query("SELECT * FROM __EventConsumer") {
-                for item in iter.flatten() {
-                    let class = item.class().unwrap_or_default();
-                    let get = |p: &str| {
-                        item.get_property(p)
-                            .ok()
-                            .map(|v| variant_to_string(&v))
-                            .unwrap_or_default()
-                    };
-                    let name = get("Name");
-                    if name.is_empty() {
-                        continue;
-                    }
-                    let action = [
-                        "CommandLineTemplate",
-                        "ExecutablePath",
-                        "ScriptFileName",
-                        "ScriptText",
-                    ]
-                    .into_iter()
-                    .map(&get)
-                    .find(|s| !s.is_empty())
-                    .unwrap_or_default();
-                    consumers.insert(name, (class, action));
-                }
-            }
+    let (objects, completion) = conn.exec_objects(
+        "SELECT * FROM __EventConsumer",
+        None,
+        Some(HELPER_QUERY_BUDGET),
+        &CancelToken::never(),
+    )?;
+    if let Some(why) = completion.note() {
+        anyhow::bail!("__EventConsumer in {namespace}: {why}");
+    }
+    for obj in &objects {
+        let get = |p: &str| crate::reflect::string_property(obj, p);
+        let name = get("Name");
+        if name.is_empty() {
+            continue;
         }
+        let class = crate::reflect::class_name(obj);
+        let action = [
+            "CommandLineTemplate",
+            "ExecutablePath",
+            "ScriptFileName",
+            "ScriptText",
+        ]
+        .into_iter()
+        .map(&get)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+        consumers.insert(name, (class, action));
     }
 
     let mut subs = Vec::new();
@@ -1486,32 +1922,29 @@ fn scan_subscriptions_in(namespace: &str) -> Vec<Subscription> {
     let mut bound_consumers = std::collections::HashSet::new();
 
     // Bindings.
-    if let Ok(rows) = q_maps(
+    for r in scan_query(
+        &conn,
         namespace,
         "SELECT Filter, Consumer FROM __FilterToConsumerBinding",
-    ) {
-        for r in rows {
-            let filter_name =
-                first_quoted(&r.get("Filter").map(variant_to_string).unwrap_or_default());
-            let consumer_name =
-                first_quoted(&r.get("Consumer").map(variant_to_string).unwrap_or_default());
-            bound_filters.insert(filter_name.clone());
-            bound_consumers.insert(consumer_name.clone());
-            let filter_query = filters.get(&filter_name).cloned().unwrap_or_default();
-            let (consumer_type, action) =
-                consumers.get(&consumer_name).cloned().unwrap_or_default();
-            let (risk, reasons) = assess(&consumer_type, &filter_query, &action);
-            subs.push(Subscription {
-                filter_name,
-                filter_query,
-                consumer_type,
-                consumer_name,
-                action,
-                risk,
-                reasons,
-                bound: true,
-            });
-        }
+    )? {
+        let filter_name = first_quoted(&r.get("Filter").map(variant_to_string).unwrap_or_default());
+        let consumer_name =
+            first_quoted(&r.get("Consumer").map(variant_to_string).unwrap_or_default());
+        bound_filters.insert(filter_name.clone());
+        bound_consumers.insert(consumer_name.clone());
+        let filter_query = filters.get(&filter_name).cloned().unwrap_or_default();
+        let (consumer_type, action) = consumers.get(&consumer_name).cloned().unwrap_or_default();
+        let (risk, reasons) = assess(&consumer_type, &filter_query, &action);
+        subs.push(Subscription {
+            filter_name,
+            filter_query,
+            consumer_type,
+            consumer_name,
+            action,
+            risk,
+            reasons,
+            bound: true,
+        });
     }
 
     // Orphan consumers — staged code with no binding (evasion signal).
@@ -1548,12 +1981,40 @@ fn scan_subscriptions_in(namespace: &str) -> Vec<Subscription> {
         }
     }
 
-    subs
+    Ok(subs)
 }
 
-/// PID → process name, from `Win32_Process`.
-fn process_names() -> anyhow::Result<HashMap<u32, String>> {
-    let procs = q_maps("root\\CIMV2", "SELECT ProcessId, Name FROM Win32_Process")?;
+/// One query of a subscription scan, on a binding the caller already holds.
+///
+/// Separate from [`q_maps`] only because it reuses that binding: a scan issues
+/// three queries per namespace, and `q_maps` opens a connection per call.
+fn scan_query(
+    conn: &Bound,
+    namespace: &str,
+    wql: &str,
+) -> anyhow::Result<Vec<HashMap<String, Variant>>> {
+    let en = conn.exec_enum(wql)?;
+    let (rows, completion) = enumerate::drain(
+        &en,
+        None,
+        Some(HELPER_QUERY_BUDGET),
+        &CancelToken::never(),
+        |o| unsafe { crate::remote::object_to_map(o, false) },
+    )?;
+    match completion.note() {
+        None => Ok(rows),
+        Some(why) => anyhow::bail!("{wql} in {namespace}: {why}"),
+    }
+}
+
+/// PID → process name, from `Win32_Process` **on the connected host**.
+fn process_names(cancel: &CancelToken) -> anyhow::Result<HashMap<u32, String>> {
+    let procs = q_maps_within(
+        CIMV2,
+        "SELECT ProcessId, Name FROM Win32_Process",
+        HELPER_QUERY_BUDGET,
+        cancel,
+    )?;
     let mut map = HashMap::new();
     for p in procs {
         let pid = p.get("ProcessId").map(variant_to_u32).unwrap_or(0);
@@ -1568,50 +2029,79 @@ fn process_names() -> anyhow::Result<HashMap<u32, String>> {
 }
 
 /// Build a class/property(/method) name index for a namespace (for search).
+///
+/// The longest-running request that is not a user's query — it reflects every
+/// class in a namespace — so it is drained in batches like the rest rather than
+/// pulled through an iterator that can only be checked one object at a time.
 fn build_search_index(
     namespace: &str,
     include_methods: bool,
-    control: &WorkerControl,
+    cancel: &CancelToken,
 ) -> anyhow::Result<SearchIndex> {
-    let conn = connect(namespace)?;
+    let conn = bind(namespace)?;
     let mut index = SearchIndex {
         namespace: namespace.to_string(),
         has_methods: include_methods,
         ..Default::default()
     };
-    for item in conn.exec_query("SELECT * FROM meta_class")? {
-        // The longest-running request that is not a query: reflecting every
-        // class in a namespace. Same caveat as `list_classes_local` -- the
-        // `wmi` iterator cannot be chunked, so the check is per object.
-        if control.is_shutdown() {
-            anyhow::bail!("worker is shutting down");
-        }
-        let Ok(obj) = item else { continue };
-        let class = obj.class().unwrap_or_default();
+    let en = conn.class_enum(None, true)?;
+    let (entries, _) = enumerate::drain(&en, None, Some(CLASS_ENUM_BUDGET), cancel, |obj| {
+        let class = crate::reflect::class_name(obj);
+        let properties = wmi::IWbemClassWrapper::new(obj.clone())
+            .list_properties()
+            .unwrap_or_default();
+        let methods = if include_methods {
+            crate::reflect::enum_method_names(obj)
+        } else {
+            Vec::new()
+        };
+        Ok((class, properties, methods))
+    })?;
+    for (class, properties, methods) in entries {
         if class.is_empty() {
             continue;
         }
-        index
-            .properties
-            .insert(class.clone(), obj.list_properties().unwrap_or_default());
-        if include_methods {
-            let methods = crate::reflect::enum_method_names(&obj.inner);
-            if !methods.is_empty() {
-                index.methods.insert(class.clone(), methods);
-            }
+        index.properties.insert(class.clone(), properties);
+        if !methods.is_empty() {
+            index.methods.insert(class.clone(), methods);
         }
         index.classes.push(class);
     }
     index.classes.sort_unstable();
+    index.classes.dedup();
     Ok(index)
 }
 
+/// Read a property under either the case WMI declares it or the case the plan
+/// wrote it — `Msft_Providers` declares `provider` lowercase and `User` upper,
+/// which is not a pattern anyone will remember correctly at every call site.
+fn prop<'a>(row: &'a HashMap<String, Variant>, a: &str, b: &str) -> Option<&'a Variant> {
+    row.get(a).or_else(|| row.get(b))
+}
+
 /// List WMI providers (`Msft_Providers`) and the processes hosting them.
-fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
-    let names = process_names().unwrap_or_default();
-    let rows = q_maps(
-        "root\\CIMV2",
-        "SELECT provider, Namespace, HostProcessIdentifier, HostingGroup FROM Msft_Providers",
+///
+/// Four sources, because the answer is not in one class:
+///
+/// 1. `Msft_Providers` in [`CIMV2`] — which provider, in which namespace, in
+///    which PID, under which account.
+/// 2. `Win32_Process` — the PID's image name.
+/// 3. `__Win32Provider` in each provider's *own* namespace — the
+///    `HostingModel` string. §5.11 of the plan places this on `Msft_Providers`;
+///    it is not there (see [`ProviderInfo::hosting_model`]).
+/// 4. [`provider_hosts`] — the live load and the quota bounding it.
+///
+/// Only the first is allowed to fail the request. A provider list without image
+/// names or hosting models is degraded; a provider list that is not the
+/// provider list is wrong.
+fn list_providers(cancel: &CancelToken) -> anyhow::Result<(Vec<ProviderInfo>, ProviderHosts)> {
+    let names = process_names(cancel).unwrap_or_default();
+    let rows = q_maps_within(
+        CIMV2,
+        "SELECT provider, Namespace, HostProcessIdentifier, HostingGroup, \
+         HostingSpecification, User FROM Msft_Providers",
+        HELPER_QUERY_BUDGET,
+        cancel,
     )?;
     let mut providers: Vec<ProviderInfo> = rows
         .into_iter()
@@ -1621,9 +2111,7 @@ fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
                 .map(variant_to_u32)
                 .unwrap_or(0);
             ProviderInfo {
-                provider: r
-                    .get("provider")
-                    .or_else(|| r.get("Provider"))
+                provider: prop(&r, "provider", "Provider")
                     .map(variant_to_string)
                     .unwrap_or_default(),
                 namespace: r
@@ -1636,11 +2124,232 @@ fn list_providers() -> anyhow::Result<Vec<ProviderInfo>> {
                     .get("HostingGroup")
                     .map(variant_to_string)
                     .unwrap_or_default(),
+                hosting_model: String::new(),
+                hosting_specification: r
+                    .get("HostingSpecification")
+                    .map(variant_to_u32)
+                    .unwrap_or(0),
+                user: prop(&r, "User", "user")
+                    .map(variant_to_string)
+                    .unwrap_or_default(),
             }
         })
         .collect();
     providers.sort_by(|a, b| a.provider.to_lowercase().cmp(&b.provider.to_lowercase()));
-    Ok(providers)
+
+    let mut unreadable = Vec::new();
+    add_hosting_models(&mut providers, &mut unreadable, cancel);
+    let hosts = provider_hosts(&providers, unreadable, cancel);
+    Ok((providers, hosts))
+}
+
+/// Fill in each provider's `HostingModel` from its registration.
+///
+/// One `__Win32Provider` query per distinct namespace, not per provider: five
+/// of the eight providers on this machine live in `root\CIMV2`, so the
+/// per-provider form would pay for that namespace five times.
+///
+/// Failures are recorded and skipped. A namespace whose `__Win32Provider` is
+/// unreadable is common — `root\SECURITY` refuses an ordinary token — and the
+/// providers hosted there are still worth listing without the string.
+fn add_hosting_models(
+    providers: &mut [ProviderInfo],
+    unreadable: &mut Vec<String>,
+    cancel: &CancelToken,
+) {
+    let mut namespaces: Vec<String> = providers
+        .iter()
+        .map(|p| p.namespace.clone())
+        .filter(|n| !n.is_empty())
+        .collect();
+    namespaces.sort_by_key(|n| n.to_lowercase());
+    namespaces.dedup_by_key(|n| n.to_lowercase());
+
+    let started = Instant::now();
+    // `(namespace, provider name)` both lowercased: WMI matches class and
+    // property names case-insensitively, and `Msft_Providers` and
+    // `__Win32Provider` do not agree on the case of a provider's own name.
+    let mut models: HashMap<(String, String), String> = HashMap::new();
+    for ns in namespaces {
+        if cancel.is_raised() {
+            unreadable.push("hosting models: cancelled".into());
+            break;
+        }
+        let Some(left) = PROVIDER_ENRICH_BUDGET.checked_sub(started.elapsed()) else {
+            unreadable.push(format!(
+                "hosting models: budget of {} s spent before {ns}",
+                PROVIDER_ENRICH_BUDGET.as_secs()
+            ));
+            break;
+        };
+        match q_maps_within(
+            &ns,
+            "SELECT Name, HostingModel FROM __Win32Provider",
+            left,
+            cancel,
+        ) {
+            Ok(rows) => {
+                for r in rows {
+                    let name = r.get("Name").map(variant_to_string).unwrap_or_default();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    models.insert(
+                        (ns.to_lowercase(), name.to_lowercase()),
+                        r.get("HostingModel")
+                            .map(variant_to_string)
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            Err(e) => unreadable.push(format!("{ns}: __Win32Provider: {e}")),
+        }
+    }
+
+    for p in providers.iter_mut() {
+        if let Some(model) = models.get(&(p.namespace.to_lowercase(), p.provider.to_lowercase())) {
+            p.hosting_model.clone_from(model);
+        }
+    }
+}
+
+/// Live load of every process hosting a provider, plus the quota it runs
+/// against.
+///
+/// The join is `IDProcess`, and nothing else, for two measured reasons.
+///
+/// **One name, many hosts.** `Win32_Process` calls every live host on this
+/// machine `WmiPrvSE.exe`; the perf class calls them `WmiPrvSE`, `WmiPrvSE#1`,
+/// `WmiPrvSE#2`, `WmiPrvSE#3`. Joining on the `Win32_Process` name folds three
+/// distinct processes into one row and attributes one host's leak to a sibling.
+///
+/// **And the perf name is a slot, not an identity.** Measured across samples
+/// minutes apart on this machine: `WmiPrvSE#3` was PID 43468, that host exited,
+/// and `WmiPrvSE#3` came back as PID 37048. The suffix is reused. Anything that
+/// remembered "`WmiPrvSE#3` is the one leaking" would later be reading a
+/// different process and calling it the same one.
+///
+/// The filter is by PID rather than the plan's `WHERE Name LIKE 'WmiPrvSE%'`
+/// for the same reason it must not join by name: measured here, two of eight
+/// providers are hosted in the WMI service itself (`svchost#13`, PID 2788), and
+/// the name filter reports nothing at all for them.
+fn provider_hosts(
+    providers: &[ProviderInfo],
+    mut unreadable: Vec<String>,
+    cancel: &CancelToken,
+) -> ProviderHosts {
+    let pids = host_pids(providers);
+    let mut hosts = ProviderHosts::default();
+
+    match q_maps_within(ROOT_NAMESPACE, QUOTA_WQL, HELPER_QUERY_BUDGET, cancel) {
+        Ok(rows) => match rows.first() {
+            Some(r) => hosts.quota = Some(to_quota(r)),
+            // The class exists on every Windows install; an empty result means
+            // the singleton is genuinely absent, which is not the same as a
+            // quota of zero and must not be rendered as one.
+            None => unreadable.push(format!(
+                "{ROOT_NAMESPACE}: __ProviderHostQuotaConfiguration: no instance"
+            )),
+        },
+        Err(e) => unreadable.push(format!(
+            "{ROOT_NAMESPACE}: __ProviderHostQuotaConfiguration: {e}"
+        )),
+    }
+
+    // Needed to turn `PercentProcessorTime` into a share of the machine; a
+    // failure costs the percentage, not the row.
+    match q_maps_within(
+        CIMV2,
+        "SELECT NumberOfLogicalProcessors FROM Win32_ComputerSystem",
+        HELPER_QUERY_BUDGET,
+        cancel,
+    ) {
+        Ok(rows) => {
+            hosts.logical_cpus = rows
+                .first()
+                .and_then(|r| r.get("NumberOfLogicalProcessors"))
+                .map(variant_to_u32)
+                .unwrap_or(0);
+        }
+        Err(e) => unreadable.push(format!("{CIMV2}: Win32_ComputerSystem: {e}")),
+    }
+
+    if !pids.is_empty() {
+        match q_maps_within(CIMV2, &perf_wql(&pids), HELPER_QUERY_BUDGET, cancel) {
+            Ok(rows) => {
+                hosts.stats = rows
+                    .iter()
+                    .map(to_host_stats)
+                    // The `WHERE` is an optimisation, not the filter: above
+                    // `PERF_PID_FILTER_CAP` there is no `WHERE` at all, and a
+                    // provider is always free to return more than it was asked
+                    // for.
+                    .filter(|h| pids.binary_search(&h.pid).is_ok())
+                    .collect();
+                hosts.stats.sort_by_key(|h| h.pid);
+            }
+            Err(e) => unreadable.push(format!(
+                "{CIMV2}: Win32_PerfFormattedData_PerfProc_Process: {e}"
+            )),
+        }
+    }
+
+    hosts.unreadable = unreadable;
+    hosts
+}
+
+/// The quota singleton. `MemoryAllHosts`/`ProcessLimitAllHosts` are read
+/// alongside the three §5.13 asks for because they are properties of the same
+/// object already in hand, and they answer the other half of the question:
+/// whether the *machine* is out of provider-host budget rather than one host.
+const QUOTA_WQL: &str = "SELECT MemoryPerHost, HandlesPerHost, ThreadsPerHost, MemoryAllHosts, \
+                         ProcessLimitAllHosts FROM __ProviderHostQuotaConfiguration";
+
+fn to_quota(r: &HashMap<String, Variant>) -> HostQuota {
+    HostQuota {
+        memory_per_host: r.get("MemoryPerHost").map(variant_to_u64).unwrap_or(0),
+        handles_per_host: r.get("HandlesPerHost").map(variant_to_u32).unwrap_or(0),
+        threads_per_host: r.get("ThreadsPerHost").map(variant_to_u32).unwrap_or(0),
+        memory_all_hosts: r.get("MemoryAllHosts").map(variant_to_u64).unwrap_or(0),
+        process_limit_all_hosts: r
+            .get("ProcessLimitAllHosts")
+            .map(variant_to_u32)
+            .unwrap_or(0),
+    }
+}
+
+fn to_host_stats(r: &HashMap<String, Variant>) -> HostStats {
+    HostStats {
+        pid: r.get("IDProcess").map(variant_to_u32).unwrap_or(0),
+        instance: r.get("Name").map(variant_to_string).unwrap_or_default(),
+        cpu_percent: r
+            .get("PercentProcessorTime")
+            .map(variant_to_u64)
+            .unwrap_or(0),
+        private_bytes: r.get("PrivateBytes").map(variant_to_u64).unwrap_or(0),
+        working_set_private: r.get("WorkingSetPrivate").map(variant_to_u64).unwrap_or(0),
+        handle_count: r.get("HandleCount").map(variant_to_u32).unwrap_or(0),
+        thread_count: r.get("ThreadCount").map(variant_to_u32).unwrap_or(0),
+    }
+}
+
+/// The perf query for a specific set of host PIDs.
+///
+/// WQL has no `IN`, so a PID set is an `OR` chain. Past
+/// [`PERF_PID_FILTER_CAP`] the chain is dropped entirely and the caller filters
+/// what comes back — the perf provider builds every counter instance regardless
+/// of the `WHERE`, so the clause only ever saved marshalling, and a
+/// several-hundred-term predicate is a worse thing to send than a few hundred
+/// rows are to receive.
+fn perf_wql(pids: &[u32]) -> String {
+    const SELECT: &str = "SELECT Name, IDProcess, PercentProcessorTime, PrivateBytes, \
+                          WorkingSetPrivate, HandleCount, ThreadCount \
+                          FROM Win32_PerfFormattedData_PerfProc_Process";
+    if pids.is_empty() || pids.len() > PERF_PID_FILTER_CAP {
+        return SELECT.to_string();
+    }
+    let terms: Vec<String> = pids.iter().map(|p| format!("IDProcess={p}")).collect();
+    format!("{SELECT} WHERE {}", terms.join(" OR "))
 }
 
 #[cfg(test)]
@@ -1738,12 +2447,167 @@ mod tests {
         assert!(rows.iter().all(|r| r.note == "role not resolved"));
     }
 
+    /// The predicate is per-PID. A `Name LIKE 'WmiPrvSE%'` filter would be
+    /// shorter and would miss the two providers this machine hosts inside the
+    /// WMI service, whose counter instance is `svchost#13`.
+    #[test]
+    fn the_perf_filter_names_pids_and_never_process_names() {
+        let wql = perf_wql(&[2788, 10772]);
+        assert!(
+            wql.contains("WHERE IDProcess=2788 OR IDProcess=10772"),
+            "{wql}"
+        );
+        assert!(!wql.contains("Name="), "{wql}");
+        assert!(!wql.to_lowercase().contains("like"), "{wql}");
+        // The projection is what `to_host_stats` reads; a missing column is a
+        // silent zero, not an error.
+        for col in [
+            "IDProcess",
+            "PercentProcessorTime",
+            "PrivateBytes",
+            "WorkingSetPrivate",
+            "HandleCount",
+            "ThreadCount",
+        ] {
+            assert!(wql.contains(col), "{col} missing from {wql}");
+        }
+    }
+
+    /// Past the cap the `OR` chain is dropped rather than grown, and the caller
+    /// filters instead. Empty likewise: no PIDs must not produce `WHERE `.
+    #[test]
+    fn an_oversized_pid_set_drops_the_predicate() {
+        let many: Vec<u32> = (1..=(PERF_PID_FILTER_CAP as u32 + 1)).collect();
+        assert!(!perf_wql(&many).contains("WHERE"));
+        assert!(!perf_wql(&[]).contains("WHERE"));
+        let at_cap: Vec<u32> = (1..=PERF_PID_FILTER_CAP as u32).collect();
+        assert!(perf_wql(&at_cap).contains("WHERE"));
+    }
+
+    /// `Msft_Providers` declares `provider` in lower case and `User` in upper,
+    /// and WMI is free to hand back either — the lookup has to accept both or
+    /// a real column reads as empty.
+    #[test]
+    fn a_property_is_found_under_either_case() {
+        let r = row(&[("User", Variant::String("HOST\\root".into()))]);
+        assert_eq!(
+            prop(&r, "User", "user").map(variant_to_string),
+            Some("HOST\\root".to_string())
+        );
+        let lower = row(&[("user", Variant::String("HOST\\root".into()))]);
+        assert_eq!(
+            prop(&lower, "User", "user").map(variant_to_string),
+            Some("HOST\\root".to_string())
+        );
+        assert!(prop(&row(&[]), "User", "user").is_none());
+    }
+
     #[test]
     fn notes_join_without_stray_separators() {
         assert_eq!(join_notes("", ""), "");
         assert_eq!(join_notes("a", ""), "a");
         assert_eq!(join_notes("", "b"), "b");
         assert_eq!(join_notes("a", "b"), "a; b");
+    }
+
+    fn row(pairs: &[(&str, Variant)]) -> HashMap<String, Variant> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn one_process() -> HashMap<u32, String> {
+        HashMap::from([(4321, "svchost.exe".to_string())])
+    }
+
+    /// The join is on `OwningProcess`, and the ports arrive as widened
+    /// `uint16`s. Both are easy to get subtly wrong and neither would show up
+    /// as an error -- a mis-narrowed port is just a different port.
+    #[test]
+    fn a_tcp_row_joins_its_process_by_pid() {
+        let c = to_connection(
+            &row(&[
+                ("LocalAddress", Variant::String("10.0.0.5".into())),
+                ("LocalPort", Variant::UI4(49_800)),
+                ("RemoteAddress", Variant::String("140.82.121.6".into())),
+                ("RemotePort", Variant::UI4(443)),
+                ("State", Variant::UI4(5)),
+                ("OwningProcess", Variant::UI4(4321)),
+            ]),
+            Protocol::Tcp,
+            &one_process(),
+        );
+        assert_eq!(c.pid, 4321);
+        assert_eq!(c.process, "svchost.exe");
+        assert_eq!(c.local_port, 49_800);
+        assert_eq!(c.remote_port, 443);
+        assert_eq!(c.state, "Established");
+        assert!(c.is_external());
+    }
+
+    /// UDP is connectionless. Carrying `0.0.0.0:0` and a state name over from
+    /// the TCP shape would put endpoints in the table that do not exist.
+    #[test]
+    fn a_udp_row_has_no_peer_and_no_state() {
+        let c = to_connection(
+            &row(&[
+                ("LocalAddress", Variant::String("0.0.0.0".into())),
+                ("LocalPort", Variant::UI4(5353)),
+                // A provider is free to return these; UDP still has no peer.
+                ("RemoteAddress", Variant::String("1.2.3.4".into())),
+                ("RemotePort", Variant::UI4(9)),
+                ("State", Variant::UI4(5)),
+                ("OwningProcess", Variant::UI4(4321)),
+            ]),
+            Protocol::Udp,
+            &one_process(),
+        );
+        assert_eq!(c.local_port, 5353);
+        assert!(c.remote_addr.is_empty());
+        assert_eq!(c.remote_port, 0);
+        assert!(c.state.is_empty());
+        assert_eq!(c.process, "svchost.exe");
+        assert!(!c.is_external());
+    }
+
+    /// A PID the process table does not contain leaves the name **blank**.
+    ///
+    /// This is the shape the credential bug had: the endpoints came from the
+    /// remote host and the process table from this one, so nearly every PID
+    /// missed and the column emptied. Blank has to stay blank -- inventing a
+    /// name for an unmatched PID would turn a visible gap into an invisible
+    /// lie, and the row itself must survive, because the connection whose
+    /// owner cannot be read is the interesting one.
+    #[test]
+    fn an_unknown_pid_leaves_the_process_name_empty_and_keeps_the_row() {
+        let c = to_connection(
+            &row(&[
+                ("LocalAddress", Variant::String("10.0.0.5".into())),
+                ("LocalPort", Variant::UI4(445)),
+                ("OwningProcess", Variant::UI4(999)),
+                ("State", Variant::UI4(2)),
+            ]),
+            Protocol::Tcp,
+            &one_process(),
+        );
+        assert_eq!(c.pid, 999);
+        assert_eq!(c.process, "");
+        assert_eq!(c.state, "Listen");
+        assert_eq!(c.local_port, 445);
+    }
+
+    /// An endpoint row with no `OwningProcess` at all still becomes a row.
+    #[test]
+    fn a_row_without_an_owning_process_still_lists_the_endpoint() {
+        let c = to_connection(
+            &row(&[("LocalAddress", Variant::String("::".into()))]),
+            Protocol::Udp,
+            &one_process(),
+        );
+        assert_eq!(c.pid, 0);
+        assert_eq!(c.process, "");
+        assert_eq!(c.local_addr, "::");
     }
 
     #[test]
@@ -1763,5 +2627,38 @@ mod tests {
         }
         let b_col = table.columns.iter().position(|c| c == "B").unwrap();
         assert!(table.rows.iter().any(|r| r[b_col].is_empty()));
+    }
+
+    #[test]
+    fn single_class_is_pulled_from_the_from_clause() {
+        assert_eq!(
+            single_class_from_wql("SELECT * FROM Win32_Service"),
+            Some("Win32_Service".to_string())
+        );
+        // Case-insensitive keyword, a WHERE clause, and extra whitespace.
+        assert_eq!(
+            single_class_from_wql("select Name  from   Win32_Service where State='Running'"),
+            Some("Win32_Service".to_string())
+        );
+        // A trailing separator with no space is trimmed to the identifier.
+        assert_eq!(
+            single_class_from_wql("SELECT * FROM Win32_Service;"),
+            Some("Win32_Service".to_string())
+        );
+    }
+
+    #[test]
+    fn queries_with_no_single_instance_class_yield_no_key() {
+        // No FROM at all.
+        assert_eq!(
+            single_class_from_wql("ASSOCIATORS OF {Win32_Service.Name='Spooler'}"),
+            None
+        );
+        // The reflection pseudo-class is not an instance class.
+        assert_eq!(single_class_from_wql("SELECT * FROM meta_class"), None);
+        // A quoted object path after FROM is not a bare class identifier.
+        assert_eq!(single_class_from_wql("SELECT * FROM \"root\\cimv2\""), None);
+        // FROM with nothing after it.
+        assert_eq!(single_class_from_wql("SELECT * FROM"), None);
     }
 }

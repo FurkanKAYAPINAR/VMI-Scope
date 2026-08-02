@@ -11,7 +11,7 @@ use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Wmi as w;
 use windows::Win32::System::Wmi::{IWbemClassObject, IWbemQualifierSet};
-use wmi::{IWbemClassWrapper, Variant, WMIConnection};
+use wmi::{IWbemClassWrapper, Variant};
 
 use crate::schema::{
     ClassBrief, ClassKind, ClassSchema, MethodSchema, ParamSchema, PropertySchema,
@@ -323,17 +323,19 @@ pub fn assoc_class_def(obj: &IWbemClassObject) -> AssocClassDef {
 }
 
 /// Reflect a class definition into a [`ClassSchema`].
-pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchema> {
-    let wrapper = conn.get_object(class)?;
-    let obj: &IWbemClassObject = &wrapper.inner;
+///
+/// Takes the object rather than a connection: a `wmi::WMIConnection` is the one
+/// transport that cannot carry alternate credentials, so a function that
+/// demanded one could only ever run as the current user. The caller fetches the
+/// object through whichever transport its credentials require and hands it here.
+pub fn read_class_schema(obj: &IWbemClassObject, class: &str) -> Result<ClassSchema> {
+    let wrapper = IWbemClassWrapper::new(obj.clone());
     let mut schema = ClassSchema {
         class: class.to_string(),
         ..Default::default()
     };
 
-    schema.super_class = wrapper
-        .get_property("__SuperClass")
-        .ok()
+    schema.super_class = property(obj, "__SuperClass")
         .map(|v| variant_to_string(&v))
         .filter(|s| !s.is_empty());
 
@@ -342,9 +344,7 @@ pub fn read_class_schema(conn: &WMIConnection, class: &str) -> Result<ClassSchem
     // `__`-prefixed system property ever shows up in the enumeration. This is
     // the same object we already hold, so it costs no extra COM round trip.
     // A root class such as `StdRegProv` returns an empty `VT_ARRAY | VT_BSTR`.
-    schema.derivation = wrapper
-        .get_property("__Derivation")
-        .ok()
+    schema.derivation = property(obj, "__Derivation")
         .map(|v| variant_to_string_vec(&v))
         .unwrap_or_default();
 
@@ -519,10 +519,9 @@ pub fn enum_method_names(obj: &IWbemClassObject) -> Vec<String> {
 
 /// Return the MOF (Managed Object Format) text of a class or instance.
 ///
-/// `object_path` is a class name (`Win32_Process`) or an instance path
-/// (`Win32_Process.Handle="1234"`). Uses `IWbemClassObject::GetObjectText`.
-pub fn class_mof(conn: &WMIConnection, object_path: &str) -> Result<String> {
-    let wrapper = conn.get_object(object_path)?;
-    let text = unsafe { wrapper.inner.GetObjectText(0)? };
+/// The object is already in this process — WMI marshals class objects by value
+/// — so `GetObjectText` is a local render, not a round trip.
+pub fn object_mof(obj: &IWbemClassObject) -> Result<String> {
+    let text = unsafe { obj.GetObjectText(0)? };
     Ok(text.to_string())
 }

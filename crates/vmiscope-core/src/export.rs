@@ -261,6 +261,7 @@ mod tests {
                     bound: false,
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -271,7 +272,10 @@ mod tests {
                 namespace: "root\\CIMV2".into(),
                 host_pid: 4212,
                 host_process: "wmiprvse.exe".into(),
-                hosting_group: "LocalSystemHost".into(),
+                hosting_group: "DefaultNetworkServiceHost".into(),
+                hosting_model: "NetworkServiceHost".into(),
+                hosting_specification: 12,
+                user: String::new(),
             },
             ProviderInfo {
                 provider: "MS_NT_EVENTLOG_PROVIDER".into(),
@@ -279,6 +283,9 @@ mod tests {
                 host_pid: 0,
                 host_process: String::new(),
                 hosting_group: String::new(),
+                hosting_model: String::new(),
+                hosting_specification: 0,
+                user: String::new(),
             },
         ]
     }
@@ -310,6 +317,7 @@ mod tests {
                 reasons: vec!["bad".into()],
                 bound: true,
             }],
+            ..Default::default()
         };
         let html = subscriptions_to_html(&report);
         assert!(html.contains("T1546.003"));
@@ -450,6 +458,7 @@ mod tests {
         // comparison: equal JSON means every field survived the round trip.
         let again = subscriptions_to_json(&SubscriptionReport {
             subscriptions: back,
+            ..Default::default()
         });
         assert_eq!(again, json);
     }
@@ -491,6 +500,30 @@ mod tests {
         assert!(back[1].host_process.is_empty());
         // `ProviderInfo` has no `PartialEq` either — same trick as above.
         assert_eq!(providers_to_json(&back), json);
+    }
+
+    /// A baseline written before task 5.11 widened `ProviderInfo` has none of
+    /// the new keys. It must still load, or every saved baseline on disk turns
+    /// into a parse error the day the struct grows — which is the failure mode
+    /// `#[serde(default)]` on the new fields exists to prevent.
+    #[test]
+    fn a_pre_5_11_provider_baseline_still_loads() {
+        let old = r#"[
+          {
+            "provider": "CIMWin32",
+            "namespace": "root\\CIMV2",
+            "host_pid": 4212,
+            "host_process": "wmiprvse.exe",
+            "hosting_group": "DefaultNetworkServiceHost"
+          }
+        ]"#;
+        let back = providers_from_json(old).expect("an old baseline parses");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].provider, "CIMWin32");
+        // Absent, not invented.
+        assert!(back[0].hosting_model.is_empty());
+        assert!(back[0].user.is_empty());
+        assert_eq!(back[0].hosting_specification, 0);
     }
 
     #[test]

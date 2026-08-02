@@ -12,6 +12,7 @@
 //! batch — [`BATCH_TIMEOUT_MS`] — rather than the lifetime of the query.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::CO_E_NOTINITIALIZED;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoSetProxyBlanket, CLSCTX_INPROC_SERVER, EOAC_NONE, RPC_C_AUTHN_LEVEL,
-    RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
+    RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
 use windows::Win32::System::Wmi::{
@@ -329,7 +330,7 @@ pub(crate) fn count(
 /// (no rewind buffer), and `RETURN_IMMEDIATELY` makes the call semi-synchronous
 /// so [`drain`] gets control back between batches instead of after the provider
 /// has finished.
-const ENUM_FLAGS: i32 = WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0;
+pub(crate) const ENUM_FLAGS: i32 = WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0;
 
 /// `WBEM_FLAG_DEEP` (0) or `WBEM_FLAG_SHALLOW` (1).
 ///
@@ -337,7 +338,7 @@ const ENUM_FLAGS: i32 = WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.
 /// `CreateInstanceEnum` take `WBEM_GENERIC_FLAG_TYPE`, so the `|` has to happen
 /// on the raw `i32` and be re-wrapped. Note that *deep is zero*: forgetting the
 /// flag entirely gives a deep enumeration, not an error.
-const fn depth(deep: bool) -> i32 {
+pub(crate) const fn depth(deep: bool) -> i32 {
     if deep {
         WBEM_FLAG_DEEP.0
     } else {
@@ -360,6 +361,27 @@ pub(crate) struct DirectConn {
 impl DirectConn {
     /// Bind `namespace` on `host` (or the local machine when `host` is `None`).
     pub(crate) fn open(host: Option<&str>, namespace: &str) -> anyhow::Result<Self> {
+        Self::open_with(host, namespace, crate::host::Impersonation::Impersonate)
+    }
+
+    /// [`DirectConn::open`] at an explicit impersonation level.
+    ///
+    /// The plan expected this to be impossible — the SSO path was supposed to
+    /// go through the `wmi` crate, which exposes no such setting. It has not
+    /// since this type replaced it, and the level does reach WMI here: measured
+    /// at `Identify`, a query is refused outright while a schema reflection
+    /// still succeeds. See [`crate::host::Impersonation`] and
+    /// `examples/impersonation.rs`.
+    ///
+    /// Note the asymmetry with the credentialed transport: enumerators produced
+    /// here are deliberately *not* re-blanketed (see [`DirectConn::exec_enum`]),
+    /// so the level applies to the service proxy alone. In practice that is
+    /// where the call is refused anyway.
+    pub(crate) fn open_with(
+        host: Option<&str>,
+        namespace: &str,
+        imp: crate::host::Impersonation,
+    ) -> anyhow::Result<Self> {
         let resource = match host {
             Some(h) => format!(r"\\{h}\{namespace}"),
             None => namespace.to_string(),
@@ -385,7 +407,7 @@ impl DirectConn {
                 &windows::core::BSTR::new(),
                 None::<&IWbemContext>,
             )?;
-            set_blanket(&svc, auth)?;
+            set_blanket(&svc, auth, imp)?;
             Ok(Self { svc })
         }
     }
@@ -509,16 +531,107 @@ impl DirectConn {
             )
         }
     }
+
+    /// The raw service proxy, for `ExecMethod`.
+    pub(crate) fn services(&self) -> &IWbemServices {
+        &self.svc
+    }
 }
 
-unsafe fn set_blanket(svc: &IWbemServices, auth: RPC_C_AUTHN_LEVEL) -> anyhow::Result<()> {
+/// One namespace bound on whichever transport the caller's credentials require.
+///
+/// Every WMI operation in this crate goes through this type, and that is the
+/// point of it. Before Phase 5 the two transports were reached through two
+/// different shapes — a `DirectConn` for some paths, a closure holding a
+/// `RemoteConn` for others, and the `wmi` crate's `WMIConnection` for the rest —
+/// and the third of those was the bug: a path that took it ran as the *current*
+/// user no matter what credentials were configured, silently. Collapsing them
+/// into one enum means a new operation cannot pick the wrong one, because there
+/// is nothing else to pick.
+pub(crate) enum Bound {
+    /// Local or current-user SSO.
+    Direct(DirectConn),
+    /// Alternate credentials over raw DCOM.
+    ///
+    /// `Rc`, not a borrow: connections are cached per namespace and a recursive
+    /// walk binds a second namespace while the first is still in hand. Holding
+    /// the cache's `RefCell` borrow across the operation made that nesting a
+    /// panic, which is why the whole class of recursive requests used to refuse
+    /// to run under alternate credentials at all.
+    Remote(Rc<crate::remote::RemoteConn>),
+}
+
+impl Bound {
+    pub(crate) fn exec_enum(&self, wql: &str) -> anyhow::Result<IEnumWbemClassObject> {
+        match self {
+            Bound::Direct(c) => c.exec_enum(wql),
+            Bound::Remote(r) => r.exec_enum(wql),
+        }
+    }
+
+    pub(crate) fn class_enum(
+        &self,
+        superclass: Option<&str>,
+        deep: bool,
+    ) -> anyhow::Result<IEnumWbemClassObject> {
+        match self {
+            Bound::Direct(c) => c.class_enum(superclass, deep),
+            Bound::Remote(r) => r.class_enum(superclass, deep),
+        }
+    }
+
+    pub(crate) fn instance_enum(
+        &self,
+        class: &str,
+        deep: bool,
+    ) -> anyhow::Result<IEnumWbemClassObject> {
+        match self {
+            Bound::Direct(c) => c.instance_enum(class, deep),
+            Bound::Remote(r) => r.instance_enum(class, deep),
+        }
+    }
+
+    pub(crate) fn get_object(&self, path: &str) -> anyhow::Result<IWbemClassObject> {
+        match self {
+            Bound::Direct(c) => c.get_object(path),
+            Bound::Remote(r) => r.get_object(path),
+        }
+    }
+
+    pub(crate) fn services(&self) -> &IWbemServices {
+        match self {
+            Bound::Direct(c) => c.services(),
+            Bound::Remote(r) => r.services(),
+        }
+    }
+
+    /// Run a query and keep the objects, so system properties (`__CLASS`,
+    /// `__PATH`, `__DERIVATION`) stay readable — the enumeration flags hide
+    /// them, but a `Get` by name on an object in hand does not.
+    pub(crate) fn exec_objects(
+        &self,
+        wql: &str,
+        max_rows: Option<usize>,
+        deadline: Option<Duration>,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<(Vec<IWbemClassObject>, Completion)> {
+        let en = self.exec_enum(wql)?;
+        drain(&en, max_rows, deadline, cancel, |o| Ok(o.clone()))
+    }
+}
+
+unsafe fn set_blanket(
+    svc: &IWbemServices,
+    auth: RPC_C_AUTHN_LEVEL,
+    imp: crate::host::Impersonation,
+) -> anyhow::Result<()> {
     CoSetProxyBlanket(
         svc,
         RPC_C_AUTHN_WINNT,
         RPC_C_AUTHZ_NONE,
         None,
         auth,
-        RPC_C_IMP_LEVEL_IMPERSONATE,
+        imp.level(),
         None,
         EOAC_NONE,
     )?;

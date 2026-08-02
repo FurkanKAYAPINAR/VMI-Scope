@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-02
+
+### Added
+- **Every destination now has a view.** The Explorer is three columns and five
+  sub-tabs; Query, Saved, Process, Events, Machines and Compare are real.
+- **Multi-host**: a worker per target, responses stamped with the host that
+  produced them, real connect and probe timings, and OS/build/UUID from a probe
+  that used to be thrown away.
+- **Compare** diffs two machines on the class's own key columns.
+- **Provider host stats against the WMI host quota** -- the form in which those
+  numbers actually mean something.
+- A licences panel, a keyboard map, and an empty/loading/error state for every
+  view.
+
+### Fixed
+- **Seven paths could answer as the current user while the caller believed it
+  was talking to a remote host under other credentials.** One of them executed
+  a method. There is now exactly one way to reach WMI from the worker, and the
+  transport that cannot carry a credential is no longer reachable from any
+  request path. Measured before and after with a leak test: 7 answered, then 0
+  of 15.
+- **The persistence scan reported "nothing found" when it could not look.**
+  Every error was swallowed and an empty report returned `Ok` -- in the view
+  whose entire purpose is telling those two apart.
+- JSON exports reordered the analyst's columns and silently dropped cells from
+  ragged rows; the CSV was not rectangular. Both now go through one path.
+- A saved query restored its text but not its namespace, so a query saved under
+  `root\subscription` ran against `root\CIMV2`.
+- The config file was rewritten on every query run.
+
 ### Added
 - **Every Settings control is now wired, or says why it is not.** Default
   namespace, impersonation level, operation timeout, row limit, byte
@@ -283,7 +313,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Script generation** — PowerShell and VBScript for the current query.
 - Background WMI worker thread so the UI never blocks.
 
-[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/FurkanKAYAPINAR/VMI-Scope/compare/v0.5.0...v0.6.0

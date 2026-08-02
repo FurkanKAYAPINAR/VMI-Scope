@@ -12,7 +12,7 @@ use crate::views::explorer::ClassChip;
 use crate::widgets::button::btn_secondary;
 use crate::widgets::chip::{kind_badge, Kind};
 use crate::widgets::field::filter_box;
-use crate::widgets::loading::spinner;
+use crate::widgets::loading::{empty_state, spinner};
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -33,8 +33,21 @@ impl VmiScopeApp {
         ui.spacing_mut().text_edit_width = ui.available_width();
         filter_box(ui, &mut self.class_filter, "filter classes");
 
+        // Settings -> Results -> Show system classes. `root\CIMV2` carries
+        // several hundred `__`-prefixed system classes (`__EventFilter`,
+        // `__NAMESPACE`, `__Win32Provider`, the whole `__` meta-model) and for
+        // most browsing they are noise between the classes someone came to
+        // read. Hiding them is a *list* filter, never a data one: the System
+        // chip still reaches every one of them with the setting off, so nothing
+        // becomes unreachable -- which is the line between decluttering and
+        // concealing evidence in a security tool.
+        let hide_system = !self.config.show_system_classes && self.class_chip != ClassChip::System;
+
         // Facet chips, each with a live count over the whole class list (not the
         // text filter, so the counts stay a stable overview of the namespace).
+        // The System count is deliberately over everything, so it reads as
+        // "and there are 412 more over here" rather than agreeing with a list
+        // that is hiding them.
         let mut chip_counts = [0usize; ClassChip::ALL.len()];
         for c in &self.classes {
             for (i, chip) in ClassChip::ALL.iter().enumerate() {
@@ -64,10 +77,19 @@ impl VmiScopeApp {
             .classes
             .iter()
             .filter(|c| chip.matches(c.kind))
+            .filter(|c| !(hide_system && is_system(c)))
             .filter(|c| filter.is_empty() || c.name.to_lowercase().contains(&filter))
             .map(|c| (c.name.clone(), c.kind))
             .collect();
         let total = self.classes.len();
+        let hidden = if hide_system {
+            self.classes
+                .iter()
+                .filter(|c| chip.matches(c.kind) && is_system(c))
+                .count()
+        } else {
+            0
+        };
 
         // The one explicit way to count a whole list. Counts are expensive and
         // per-class, so nothing here fires until the user asks -- or until a
@@ -90,7 +112,40 @@ impl VmiScopeApp {
                     .text_style(TextStyle::Name("caption".into()))
                     .color(muted(35)),
             );
+            // Never silently: a list that is shorter than the namespace has to
+            // say so, and say what turns it back on. Nothing in this tool
+            // removes rows without a count beside the hole.
+            if hidden > 0 {
+                ui.label(
+                    RichText::new(format!("\u{00b7} {hidden} system hidden"))
+                        .text_style(TextStyle::Name("caption".into()))
+                        .color(muted(35)),
+                )
+                .on_hover_text(
+                    "Classes whose names begin '__'. The System chip still lists every one \
+                     of them, and Settings -> Results -> Show system classes puts them back \
+                     in this list.",
+                );
+            }
         });
+
+        // Task 7.6: the list scrolled an empty rectangle whenever the filter,
+        // the facet chip or the system-class setting excluded everything, and
+        // there was no state at all for "the namespace has not been enumerated
+        // yet". Four situations, four sentences -- and each names what to undo,
+        // because "no classes" in a namespace that has hundreds is a filter
+        // result, not a fact about WMI.
+        if filtered.is_empty() {
+            let (title, note) = class_empty_note(
+                total,
+                self.classes_loading,
+                hidden > 0,
+                !filter.is_empty(),
+                chip != ClassChip::All,
+            );
+            empty_state(ui, icons::CUBE, title, note);
+            return;
+        }
 
         let mut clicked: Option<String> = None;
         let row_h = ui.text_style_height(&egui::TextStyle::Body).max(15.0) + 6.0;
@@ -148,6 +203,65 @@ impl VmiScopeApp {
             }
         });
     }
+}
+
+/// Which "no classes" this is, and what to undo about it.
+///
+/// Ordered by which explanation is most actionable: an active filter is the
+/// likeliest cause and the easiest to reverse, so it leads even when the facet
+/// chip is also narrowing the list.
+fn class_empty_note(
+    total: usize,
+    loading: bool,
+    hiding_system: bool,
+    filtering: bool,
+    faceted: bool,
+) -> (&'static str, &'static str) {
+    if loading {
+        return ("Enumerating classes", "The namespace is being read.");
+    }
+    if total == 0 {
+        return (
+            "No classes",
+            "This namespace returned none. Some namespaces are containers for other \
+             namespaces and hold no classes of their own; others refuse the enumeration \
+             entirely, which shows as an error in the status bar.",
+        );
+    }
+    if filtering {
+        (
+            "No classes match the filter",
+            "The namespace has classes; none of their names contain what you typed.",
+        )
+    } else if faceted {
+        (
+            "No classes in this facet",
+            "The namespace has classes, but none of this kind. Pick All to see them.",
+        )
+    } else if hiding_system {
+        (
+            "Only system classes here",
+            "Every class in this namespace begins '__'. Settings -> Results -> Show system \
+             classes puts them in the list, and the System chip lists them either way.",
+        )
+    } else {
+        (
+            "No classes",
+            "Nothing matched, and no filter is set \u{2014} which should not happen. Re-select \
+             the namespace to enumerate it again.",
+        )
+    }
+}
+
+/// Is this one of WMI's system classes?
+///
+/// The name, not [`ClassKind::SYSTEM`], and the difference is measurable: the
+/// kind flag comes from the class's own qualifiers, and plenty of classes carry
+/// it without a `__` prefix while the Settings row promises exactly "names
+/// beginning `__`". The user-facing rule has to be the one the label states, or
+/// the setting hides a set nobody can predict.
+fn is_system(class: &vmiscope_core::ClassBrief) -> bool {
+    class.name.starts_with("__")
 }
 
 /// Map a class's full [`ClassKind`] onto the single-letter badge the list

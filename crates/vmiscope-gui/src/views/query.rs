@@ -37,12 +37,12 @@ use vmiscope_core::export::{query_to_csv, query_to_json};
 
 use crate::app::VmiScopeApp;
 use crate::theme::icons;
-use crate::theme::tokens::{muted, BG, DIVIDER, OK, R_MD, S2, S3, S4, S6, SURFACE, WARN};
+use crate::theme::tokens::{muted, BG, DIVIDER, OK, R_MD, S2, S3, S4, SURFACE, WARN};
 use crate::util::save_file;
 use crate::widgets::button::{accent, btn_icon, btn_primary, btn_secondary, focus_ring};
 use crate::widgets::codeview::{tint_line, Lang, Role};
 use crate::widgets::kv::kv_grid_sized;
-use crate::widgets::loading::{format_ms, spinner, SLOW_MS};
+use crate::widgets::loading::{empty_state, format_ms, spinner, SLOW_MS};
 use crate::widgets::rule::{hrule, solid_hline, HAIRLINE};
 use crate::widgets::table::{DataTable, DataTableState, TableColumn};
 
@@ -736,24 +736,11 @@ fn column_edge_left(ui: &egui::Ui) {
     );
 }
 
-/// The shared empty state: a large muted glyph, a heading, and one line saying
-/// what would fill it.
-fn empty_state(ui: &mut egui::Ui, icon: &str, title: &str, note: &str) {
-    ui.add_space(S6);
-    ui.vertical_centered(|ui| {
-        ui.label(icons::glyph(icon).size(28.0).color(muted(20)));
-        ui.add_space(S2);
-        ui.label(RichText::new(title).color(muted(55)));
-        ui.add(
-            Label::new(
-                RichText::new(note)
-                    .text_style(TextStyle::Small)
-                    .color(muted(38)),
-            )
-            .wrap(),
-        );
-    });
-}
+// The shared empty state -- a large muted glyph, a heading, and one line saying
+// what would fill it -- was defined here and is now
+// `widgets::loading::empty_state`: task 7.6's audit found two other views that
+// needed exactly this and one that had reimplemented it, so it belongs in the
+// kit rather than in whichever view happened to need it first.
 
 #[cfg(test)]
 mod tests {

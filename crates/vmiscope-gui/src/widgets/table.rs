@@ -9,7 +9,18 @@
 //!
 //! Almost everything below that looks over-careful is working around a real
 //! `egui_extras` behaviour; each one is documented where it bites.
-#![allow(dead_code)] // The views adopt this kit in the next commit (tasks 1.27-1.31).
+//!
+//! There is deliberately **no** `allow(dead_code)` here. The one this module
+//! carried through the reskin ("the views adopt this kit in the next commit")
+//! outlived its reason and then hid `sortable_header` -- a function whose own
+//! doc comment said it went away with the last hand-rolled table -- for two
+//! whole phases. Taking the allow off found nine more: a `sort_changed` output
+//! nobody read, four builder setters (`row_height`, `header_height`,
+//! `resizable`, `row_rules`) whose defaults every one of the six tables was
+//! happy with, and four `RowCtx` methods (`display_index`, `response`,
+//! `tinted_cell`, `blank`). All gone. Each is three lines to bring back the day
+//! a view needs it, and until then the compiler is what says the kit is the
+//! size of its use.
 
 use eframe::egui;
 use egui::emath::GuiRounding as _;
@@ -129,6 +140,7 @@ pub(crate) struct TableColumn {
     clip: bool,
     sortable: bool,
     numeric: bool,
+    tooltip: Option<String>,
 }
 
 impl TableColumn {
@@ -155,6 +167,7 @@ impl TableColumn {
             clip: true,
             sortable: true,
             numeric: false,
+            tooltip: None,
         }
     }
 
@@ -193,6 +206,19 @@ impl TableColumn {
     /// its own allocated rect rather than inside the cell.
     pub(crate) fn numeric(mut self, numeric: bool) -> Self {
         self.numeric = numeric;
+        self
+    }
+
+    /// A tooltip on the header cell.
+    ///
+    /// Exists for exactly one situation, and it should stay rare: a column whose
+    /// sort key is not its cell text. Persistence's Risk column sorts by
+    /// severity while the cells read `High`/`Medium`/`Low`, so an ascending
+    /// caret sits over a column running `Low, Medium, High` and looks inverted.
+    /// The header says which order it means instead of leaving the user to
+    /// infer it. A column whose key *is* its text needs nothing here.
+    pub(crate) fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(tooltip.into());
         self
     }
 
@@ -236,8 +262,6 @@ pub(crate) struct DataTableOutput {
     /// Data index of the row clicked this frame. Already written to
     /// `state.selected` when the table is selectable.
     pub(crate) clicked: Option<usize>,
-    /// Whether the header click changed the sort this frame.
-    pub(crate) sort_changed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,11 +286,7 @@ pub(crate) struct DataTableOutput {
 pub(crate) struct DataTable<'a> {
     id_salt: &'a str,
     columns: Vec<TableColumn>,
-    row_height: Option<f32>,
-    header_height: f32,
-    resizable: bool,
     selectable: bool,
-    row_rules: bool,
     sort_key: Option<Box<dyn Fn(usize, usize) -> String + 'a>>,
 }
 
@@ -277,11 +297,7 @@ impl<'a> DataTable<'a> {
         Self {
             id_salt,
             columns: Vec::new(),
-            row_height: None,
-            header_height: HEADER_H,
-            resizable: true,
             selectable: false,
-            row_rules: true,
             sort_key: None,
         }
     }
@@ -298,36 +314,10 @@ impl<'a> DataTable<'a> {
         self
     }
 
-    /// Row height in points. Defaults to `spacing.interact_size.y`, which
-    /// `theme::install` sets from `Metrics::row_h` -- so the table follows the
-    /// density switch without being told about it.
-    pub(crate) fn row_height(mut self, height: f32) -> Self {
-        self.row_height = Some(height);
-        self
-    }
-
-    /// Header height in points.
-    pub(crate) fn header_height(mut self, height: f32) -> Self {
-        self.header_height = height;
-        self
-    }
-
-    /// Whether column separators can be dragged. On by default.
-    pub(crate) fn resizable(mut self, resizable: bool) -> Self {
-        self.resizable = resizable;
-        self
-    }
-
     /// Whether clicking a row selects it (writing the data index into
     /// `DataTableState::selected`). Off by default.
     pub(crate) fn selectable(mut self, selectable: bool) -> Self {
         self.selectable = selectable;
-        self
-    }
-
-    /// Whether to paint the faded rule above each row. On by default.
-    pub(crate) fn row_rules(mut self, row_rules: bool) -> Self {
-        self.row_rules = row_rules;
         self
     }
 
@@ -371,11 +361,7 @@ impl<'a> DataTable<'a> {
         let Self {
             id_salt,
             columns,
-            row_height,
-            header_height,
-            resizable,
             selectable,
-            row_rules,
             sort_key,
         } = self;
 
@@ -386,7 +372,10 @@ impl<'a> DataTable<'a> {
             None => (0..row_count).collect(),
         };
 
-        let row_h = row_height.unwrap_or_else(|| ui.spacing().interact_size.y);
+        // From `spacing.interact_size.y`, which `theme::install` sets from
+        // `Metrics::row_h` -- so every table follows the density switch without
+        // being told about it.
+        let row_h = ui.spacing().interact_size.y;
         let base_color = ui.visuals().text_color();
         // The row's left edge, captured before the `Ui` is borrowed by the
         // builder. The body lives inside a vertical-only `ScrollArea`, so this
@@ -401,19 +390,21 @@ impl<'a> DataTable<'a> {
             // The design has no zebra striping: rows are separated by the rule
             // and the hover tint, nothing else.
             .striped(false)
-            .resizable(resizable)
+            // Every table in the app wants draggable separators; there is no
+            // setter to turn them off, because nothing has ever wanted to.
+            .resizable(true)
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .min_scrolled_height(0.0);
         for column in &columns {
-            builder = builder.column(column.to_extras(resizable));
+            builder = builder.column(column.to_extras(true));
         }
         // The trailing paint column. Unclipped, because a clipped column's clip
         // rect is exactly its own `max_rect` and everything this column draws is
         // outside it.
         builder = builder.column(Column::exact(PAINT_COL_W).clip(false).resizable(false));
 
-        let table = builder.header(header_height, |mut header| {
+        let table = builder.header(HEADER_H, |mut header| {
             for (ci, column) in columns.iter().enumerate() {
                 let sorted = sorted_dir(sort, ci);
                 let numeric = column.numeric;
@@ -429,6 +420,10 @@ impl<'a> DataTable<'a> {
                         add(ui);
                     }
                 });
+                let resp = match column.tooltip.as_deref() {
+                    Some(tip) => resp.on_hover_text(tip),
+                    None => resp,
+                };
                 if column.sortable {
                     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                     if resp.clicked() {
@@ -494,13 +489,11 @@ impl<'a> DataTable<'a> {
                     let rect = ui.max_rect();
                     let spacing = ui.spacing().item_spacing.y;
                     let x = Rangef::new(table_left, rect.right());
-                    if row_rules {
-                        // Above the row, not below it: the rule then sits on top
-                        // of both neighbours' fills, and the top-most visible
-                        // row's rule doubles as the line under the header.
-                        let y = (rect.top() - 0.5 * spacing).round_ui();
-                        faded_hline(ui.painter(), x, y, RULE_FADE, muted(RULE_TINT));
-                    }
+                    // Above the row, not below it: the rule then sits on top of
+                    // both neighbours' fills, and the top-most visible row's
+                    // rule doubles as the line under the header.
+                    let y = (rect.top() - 0.5 * spacing).round_ui();
+                    faded_hline(ui.painter(), x, y, RULE_FADE, muted(RULE_TINT));
                     if is_selected {
                         let marker = egui::Rect::from_min_max(
                             egui::pos2(x.min + MARKER_INSET, rect.top()),
@@ -521,10 +514,8 @@ impl<'a> DataTable<'a> {
         });
 
         // Applied only now: both closures borrowed the state they would change.
-        let mut sort_changed = false;
         if let Some(ci) = header_clicked {
             cycle_sort(&mut state.sort, ci);
-            sort_changed = true;
         }
         if selectable {
             if let Some(data) = clicked_row {
@@ -535,7 +526,6 @@ impl<'a> DataTable<'a> {
         DataTableOutput {
             order,
             clicked: clicked_row,
-            sort_changed,
         }
     }
 }
@@ -562,11 +552,6 @@ impl RowCtx<'_, '_, '_> {
         self.data
     }
 
-    /// Index of this row on screen, after sorting.
-    pub(crate) fn display_index(&self) -> usize {
-        self.row.index()
-    }
-
     /// Fade the whole row. Network uses this to dim a closed connection over a
     /// few seconds without removing it, so the eye can follow what left.
     ///
@@ -579,12 +564,6 @@ impl RowCtx<'_, '_, '_> {
     /// Override the row's base text colour.
     pub(crate) fn set_color(&mut self, color: Color32) {
         self.color = color;
-    }
-
-    /// Union of the responses of the cells added so far. Panics if no cell has
-    /// been added yet.
-    pub(crate) fn response(&self) -> Response {
-        self.row.response()
     }
 
     /// A text cell in the row's colour.
@@ -632,21 +611,10 @@ impl RowCtx<'_, '_, '_> {
         })
     }
 
-    /// A text cell over a tinted background (the Compare view's changed values).
-    ///
-    /// The column must be unclipped -- see [`cell_background`].
-    pub(crate) fn tinted_cell(
-        &mut self,
-        text: impl Into<egui::RichText>,
-        background: Color32,
-    ) -> Response {
-        let color = self.tinted(self.color);
-        let background = self.tinted(background);
-        self.cell(move |ui| {
-            cell_background(ui, background);
-            ui.add(egui::Label::new(text.into().color(color)));
-        })
-    }
+    // A `tinted_cell` convenience lived here for the Compare view's changed
+    // values. Compare builds those cells through `cell` and calls
+    // `cell_background` itself, because it needs the tint and the text in
+    // different colours; the wrapper was never used and is gone.
 
     /// An arbitrary cell. The column's alignment is applied around `add`.
     pub(crate) fn cell(&mut self, add: impl FnOnce(&mut egui::Ui)) -> Response {
@@ -666,11 +634,6 @@ impl RowCtx<'_, '_, '_> {
             }
         });
         resp
-    }
-
-    /// Skip a cell, leaving it blank.
-    pub(crate) fn blank(&mut self) -> Response {
-        self.cell(|_| {})
     }
 
     fn tinted(&self, color: Color32) -> Color32 {
@@ -818,20 +781,12 @@ fn header_text(ui: &egui::Ui, title: &str, sorted: Option<bool>) -> egui::Widget
     job.into()
 }
 
-/// A sortable header cell for a hand-rolled `TableBuilder`.
-///
-/// Kept for the four pre-Nocturne tables, which are reskinned onto
-/// [`DataTable`] in tasks 1.27-1.31; it goes away with the last of them. Unlike
-/// a `DataTable` header this senses its own clicks, because those tables do not
-/// set `sense` on the builder.
-///
-/// Returns true if the user clicked it.
-pub(crate) fn sortable_header(ui: &mut egui::Ui, title: &str, col: usize, sort: Sort) -> bool {
-    let text = header_text(ui, title, sorted_dir(sort, col));
-    ui.add(egui::Button::new(text).frame(false))
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-}
+// `sortable_header` -- a standalone header cell for a hand-rolled
+// `TableBuilder` -- lived here until task 1.31 moved the last of the four
+// pre-Nocturne tables onto `DataTable`. Its own doc said it went away with
+// them; it then survived two more phases only because this module carried a
+// blanket `allow(dead_code)`. Deleted with that allow, which is what would have
+// caught it.
 
 // ---------------------------------------------------------------------------
 // Numeric helpers

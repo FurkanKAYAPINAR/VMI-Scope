@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::app::{ConnStatus, VmiScopeApp, DEFAULT_NAMESPACE, ROOT_NAMESPACE};
 use crate::state::ids::PendingKind;
 
-use vmiscope_core::{Credential, MethodArg, Request};
+use vmiscope_core::{Credential, Impersonation, MethodArg, Request};
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -190,22 +190,35 @@ impl VmiScopeApp {
         });
     }
 
-    pub(crate) fn apply_host(&mut self, host: Option<String>, cred: Option<Credential>) {
+    /// Point the worker at `host` under `cred`, at `impersonation`. The reply
+    /// (`HostConnected` or a `Connect` error) is what the Machines view records
+    /// against the target it was for.
+    pub(crate) fn apply_host(
+        &mut self,
+        host: Option<String>,
+        cred: Option<Credential>,
+        impersonation: Impersonation,
+    ) {
         let id = self.alloc_id();
         self.conn_status = ConnStatus::Connecting;
         self.pending.insert(id, PendingKind::Connect);
-        // `impersonation` is a Phase-5 core addition (multi-host); this pre-Phase-5
-        // call site keeps WMI's usual Impersonate level via the field default.
         self.worker.send(Request::SetHost {
             id,
             host,
             cred,
-            impersonation: Default::default(),
+            impersonation,
         });
     }
 
-    /// Wipe host-scoped state and re-seed the tree/query for a new target.
-    pub(crate) fn reset_and_reseed(&mut self) {
+    /// Wipe host-scoped state and re-seed the tree/query for a new target,
+    /// opening the Explorer to `namespace` (blank falls back to the default).
+    ///
+    /// Seeding the namespace from the connected target is what keeps the
+    /// Machines view's per-target namespace from being decorative. The one-shot
+    /// query is only re-run when opening to the default namespace: firing the OS
+    /// query into, say, `root\subscription` -- where `Win32_OperatingSystem` does
+    /// not exist -- would raise an error that the connection did not cause.
+    pub(crate) fn reset_and_reseed(&mut self, namespace: String) {
         self.ns_children.clear();
         self.ns_expanded.clear();
         self.ns_loading.clear();
@@ -228,13 +241,21 @@ impl VmiScopeApp {
         self.search_index = None;
         self.net_conns.clear();
         self.providers = None;
+        self.provider_hosts = None;
         self.events_report = None;
         self.act_instances = None;
-        self.active_ns = DEFAULT_NAMESPACE.to_string();
+        let ns = if namespace.trim().is_empty() {
+            DEFAULT_NAMESPACE.to_string()
+        } else {
+            namespace
+        };
+        self.active_ns = ns.clone();
         self.ns_expanded.insert(ROOT_NAMESPACE.to_string());
         self.request_namespaces(ROOT_NAMESPACE.to_string());
-        self.request_classes(DEFAULT_NAMESPACE.to_string());
-        self.run_query();
+        self.request_classes(ns.clone());
+        if ns == DEFAULT_NAMESPACE {
+            self.run_query();
+        }
     }
 
     pub(crate) fn request_instances(&mut self, class: String) {
@@ -305,7 +326,9 @@ impl VmiScopeApp {
         let id = self.alloc_id();
         self.latest_query_id = id;
         self.query_loading = true;
-        self.error = None;
+        // Cleared on dispatch, not on reply: re-running is the user saying they
+        // know about the last failure. The reply clears it again anyway.
+        self.clear_error();
         self.pending.insert(id, PendingKind::Query);
         self.worker.send(Request::Query {
             id,

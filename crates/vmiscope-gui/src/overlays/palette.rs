@@ -664,33 +664,112 @@ fn footer(ui: &mut Ui, count: usize) {
 // "run the query" means rather than two that drift.
 // ---------------------------------------------------------------------------
 
-/// Open the palette, or dismiss it if it is already up.
-const PALETTE_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::K);
-/// Re-fetch whatever the active view is showing.
-const REFRESH_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::NONE, Key::F5);
-/// Run the current WQL.
-const RUN_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter);
-/// Close the frontmost overlay.
-const CLOSE_KEY: egui::KeyboardShortcut = egui::KeyboardShortcut::new(Modifiers::NONE, Key::Escape);
+/// What a global key does.
+///
+/// An enum rather than a function pointer so that [`BINDINGS`] can be a `const`
+/// the keyboard map reads at build time, and so a binding added without a
+/// handler is a non-exhaustive `match` rather than a key that does nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KeyAction {
+    TogglePalette,
+    ToggleKeyboardMap,
+    Refresh,
+    RunQuery,
+    CloseOverlay,
+}
+
+/// When a binding is allowed to fire.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scope {
+    /// Fires even while a text field has focus.
+    Always,
+    /// Stands down while a text field has focus.
+    OutsideText,
+}
+
+/// One global key binding.
+pub(crate) struct Binding {
+    pub(crate) shortcut: egui::KeyboardShortcut,
+    pub(crate) action: KeyAction,
+    pub(crate) scope: Scope,
+    /// What the keyboard map prints beside the key.
+    pub(crate) description: &'static str,
+}
+
+/// **The** table of global keys.
+///
+/// `handle_shortcuts` walks this and the keyboard map (`overlays::keymap`)
+/// renders it, so the two cannot disagree: task 7.5's whole requirement is that
+/// the map is generated from the bindings rather than typed out beside them.
+/// Adding a row here puts the key in the map and in the handler at once.
+///
+/// Order matters, and for a reason that is easy to get wrong in a way that only
+/// shows up as "the app ate my keystroke": **most specific first**.
+/// `consume_shortcut` matches modifiers with `Modifiers::matches_logically`,
+/// which ignores *extra* Shift and Alt. Ctrl and Command are matched exactly,
+/// so Ctrl+Enter can never be swallowed by a bare-Enter binding -- but the
+/// modified pairs still lead, because the moment a Shift variant of any of
+/// these is added the other order silently starts eating it.
+pub(crate) const BINDINGS: &[Binding] = &[
+    Binding {
+        shortcut: egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::K),
+        action: KeyAction::TogglePalette,
+        // The palette has to be reachable from inside any field -- that is the
+        // whole point of a palette.
+        scope: Scope::Always,
+        description: "Open the command palette (or close it)",
+    },
+    Binding {
+        shortcut: egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter),
+        action: KeyAction::RunQuery,
+        scope: Scope::OutsideText,
+        description: "Run the current WQL on the Explorer",
+    },
+    Binding {
+        shortcut: egui::KeyboardShortcut::new(Modifiers::NONE, Key::F1),
+        action: KeyAction::ToggleKeyboardMap,
+        scope: Scope::Always,
+        description: "Show this keyboard map",
+    },
+    Binding {
+        shortcut: egui::KeyboardShortcut::new(Modifiers::NONE, Key::F5),
+        action: KeyAction::Refresh,
+        // The one key every Windows user expects to mean "reload" everywhere.
+        scope: Scope::Always,
+        description: "Re-fetch whatever the active view is showing",
+    },
+    Binding {
+        shortcut: egui::KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
+        action: KeyAction::CloseOverlay,
+        scope: Scope::OutsideText,
+        description: "Close the frontmost overlay",
+    },
+];
+
+/// Keys that belong to one surface rather than to the app.
+///
+/// They are **not** `KeyboardShortcut`s and cannot be: the palette consumes
+/// them off the event queue inside its own body, before its `TextEdit` is
+/// added, because a focused single-line field claims Up, Down and Enter for
+/// itself (see this module's header). They are listed here so the keyboard map
+/// is complete, and marked as belonging to the palette so the two groups are
+/// not read as one.
+pub(crate) const MODAL_KEYS: &[(&str, &str)] = &[
+    ("Up / Down", "Move the palette selection"),
+    ("Enter", "Run the highlighted palette row"),
+    ("Esc", "Close the palette"),
+];
 
 impl VmiScopeApp {
-    /// The application's global keys.
+    /// The application's global keys, dispatched from [`BINDINGS`].
     ///
     /// Called once, before the shell, so a shortcut is decided before any view
     /// has had a chance to read the same keystroke.
     ///
-    /// Two rules run this function, and both are easy to get wrong in ways that
-    /// only show up as "the app ate my keystroke":
-    ///
-    /// * **Most specific first.** `consume_shortcut` matches modifiers with
-    ///   `Modifiers::matches_logically`, which ignores *extra* Shift and Alt.
-    ///   Ctrl and Command are matched exactly, so Ctrl+Enter can never be
-    ///   swallowed by a bare-Enter binding -- but the modified pairs are still
-    ///   checked ahead of the bare ones, because the moment a Shift variant of
-    ///   any of these is added the other order silently starts eating it.
-    /// * **A focused text field owns the keyboard.** Everything except Ctrl+K
-    ///   and F5 stands down while one has focus, or typing a WQL string with an
-    ///   Escape in it closes the app's dialogs and F5 fires mid-word.
+    /// **A focused text field owns the keyboard.** Anything scoped
+    /// [`Scope::OutsideText`] stands down while one has focus, or typing a WQL
+    /// string with an Escape in it closes the app's dialogs and F5 fires
+    /// mid-word.
     ///
     /// The focus test is [`egui::Context::text_edit_focused`] rather than a
     /// bare `memory().focused().is_some()`: egui gives keyboard focus to
@@ -698,30 +777,44 @@ impl VmiScopeApp {
     /// long as the last thing clicked was a button.
     pub(crate) fn handle_shortcuts(&mut self, ui: &Ui, now: f64) {
         let ctx = ui.ctx();
+        let typing = ctx.text_edit_focused();
 
-        // The two that fire mid-word: the palette has to be reachable from
-        // inside any field (that is the whole point of a palette), and F5 is
-        // the one key every Windows user expects to mean "reload" everywhere.
-        if ctx.input_mut(|i| i.consume_shortcut(&PALETTE_KEY)) {
-            self.palette_open = !self.palette_open;
+        for binding in BINDINGS {
+            if binding.scope == Scope::OutsideText && typing {
+                continue;
+            }
+            if !self.binding_enabled(binding.action) {
+                continue;
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&binding.shortcut)) {
+                self.fire(ui, binding.action, now);
+            }
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&REFRESH_KEY)) {
-            self.refresh_active_view(now);
-        }
+    }
 
-        if ctx.text_edit_focused() {
-            return;
+    /// Whether a binding may fire *right now*, on top of its scope.
+    ///
+    /// One case, and it earns its own hook rather than an `if` buried in the
+    /// loop: the palette is modal, so it owns Enter while it is up -- and it
+    /// takes Escape off the queue itself, inside its own body, for the same
+    /// reason. Without this, a query would run behind the open palette whenever
+    /// the pointer had taken focus off its input.
+    fn binding_enabled(&self, action: KeyAction) -> bool {
+        match action {
+            KeyAction::RunQuery => !self.palette_open,
+            _ => true,
         }
+    }
 
-        // The palette is modal, so it owns Enter while it is up -- and it takes
-        // Escape off the queue itself, inside its own body, for the same
-        // reason. Guarding here keeps a query from running behind it when the
-        // pointer has taken focus off its input.
-        if !self.palette_open && ctx.input_mut(|i| i.consume_shortcut(&RUN_KEY)) {
-            self.run_command(ui, Command::RunQuery, now);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&CLOSE_KEY)) {
-            self.close_topmost_overlay();
+    fn fire(&mut self, ui: &Ui, action: KeyAction, now: f64) {
+        match action {
+            KeyAction::TogglePalette => self.palette_open = !self.palette_open,
+            KeyAction::ToggleKeyboardMap => self.keymap_open = !self.keymap_open,
+            KeyAction::Refresh => self.refresh_active_view(now),
+            // Through `Command::RunQuery`, so there is one definition of what
+            // "run the query" means rather than two that drift.
+            KeyAction::RunQuery => self.run_command(ui, Command::RunQuery, now),
+            KeyAction::CloseOverlay => self.close_topmost_overlay(),
         }
     }
 
@@ -735,6 +828,7 @@ impl VmiScopeApp {
     fn close_topmost_overlay(&mut self) {
         for open in [
             &mut self.palette_open,
+            &mut self.keymap_open,
             &mut self.invoke_open,
             &mut self.save_query_open,
             &mut self.mof_open,
@@ -840,29 +934,80 @@ mod tests {
         assert_eq!(score("Export results", "Save as CSV", "export"), Some(0));
     }
 
-    /// The bindings, stated once. Distinct keys are what makes the check order
-    /// in `handle_shortcuts` a stylistic choice rather than a correctness one.
+    /// Two bindings on one chord means one of them never fires, and which one
+    /// depends on table order rather than on anything a reader would guess.
     #[test]
-    fn the_bindings_are_distinct_and_documented() {
+    fn no_two_bindings_share_a_chord() {
         let mut seen = std::collections::HashSet::new();
-        for binding in [PALETTE_KEY, RUN_KEY, REFRESH_KEY, CLOSE_KEY] {
-            assert!(seen.insert(binding.logical_key), "{binding:?} shares a key");
+        for binding in BINDINGS {
+            assert!(
+                seen.insert((binding.shortcut.logical_key, binding.shortcut.modifiers)),
+                "{:?} duplicates a chord",
+                binding.action
+            );
         }
-        assert_eq!(
-            PALETTE_KEY,
-            egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::K)
-        );
-        assert_eq!(
-            RUN_KEY,
-            egui::KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter)
-        );
-        assert_eq!(
-            REFRESH_KEY,
-            egui::KeyboardShortcut::new(Modifiers::NONE, Key::F5)
-        );
-        assert_eq!(
-            CLOSE_KEY,
-            egui::KeyboardShortcut::new(Modifiers::NONE, Key::Escape)
+    }
+
+    /// Every action in the table has to be reachable and every one has to be
+    /// described: an undescribed binding renders as a blank row in the keyboard
+    /// map, and an action with no binding is dead code in `fire`.
+    #[test]
+    fn every_binding_is_described_and_every_action_is_bound() {
+        for binding in BINDINGS {
+            assert!(
+                !binding.description.trim().is_empty(),
+                "{:?} has no description for the keyboard map",
+                binding.action
+            );
+        }
+        for action in [
+            KeyAction::TogglePalette,
+            KeyAction::ToggleKeyboardMap,
+            KeyAction::Refresh,
+            KeyAction::RunQuery,
+            KeyAction::CloseOverlay,
+        ] {
+            assert!(
+                BINDINGS.iter().any(|b| b.action == action),
+                "{action:?} has no key"
+            );
+        }
+    }
+
+    /// The two keys that must survive a focused text field, and the two that
+    /// must not. Getting either wrong is invisible until someone types an
+    /// Escape into a WQL string and their dialogs close.
+    #[test]
+    fn scopes_match_what_the_shell_needs() {
+        let scope = |action| {
+            BINDINGS
+                .iter()
+                .find(|b| b.action == action)
+                .map(|b| b.scope)
+                .expect("bound")
+        };
+        assert_eq!(scope(KeyAction::TogglePalette), Scope::Always);
+        assert_eq!(scope(KeyAction::Refresh), Scope::Always);
+        assert_eq!(scope(KeyAction::ToggleKeyboardMap), Scope::Always);
+        assert_eq!(scope(KeyAction::RunQuery), Scope::OutsideText);
+        assert_eq!(scope(KeyAction::CloseOverlay), Scope::OutsideText);
+    }
+
+    /// Most-specific-first. The modified chords have to be checked ahead of the
+    /// bare ones; see [`BINDINGS`].
+    #[test]
+    fn modified_chords_lead_the_table() {
+        let last_modified = BINDINGS
+            .iter()
+            .rposition(|b| b.shortcut.modifiers != Modifiers::NONE)
+            .expect("at least one modified binding");
+        let first_bare = BINDINGS
+            .iter()
+            .position(|b| b.shortcut.modifiers == Modifiers::NONE)
+            .expect("at least one bare binding");
+        assert!(
+            last_modified < first_bare,
+            "a bare chord is checked before a modified one"
         );
     }
 
@@ -871,8 +1016,22 @@ mod tests {
     /// stop working the moment the palette was open behind a focused field.
     #[test]
     fn ctrl_enter_does_not_match_the_palettes_bare_enter() {
-        assert!(!RUN_KEY.modifiers.matches_logically(Modifiers::NONE));
+        let run = BINDINGS
+            .iter()
+            .find(|b| b.action == KeyAction::RunQuery)
+            .expect("bound");
+        assert!(!run.shortcut.modifiers.matches_logically(Modifiers::NONE));
         assert!(Modifiers::NONE.matches_logically(Modifiers::NONE));
+    }
+
+    /// The palette's footer advertises three keys; the keyboard map lists the
+    /// same three. They are two renderings of `MODAL_KEYS`, not two lists.
+    #[test]
+    fn the_modal_keys_are_listed_and_described() {
+        assert_eq!(MODAL_KEYS.len(), 3);
+        for (chord, what) in MODAL_KEYS {
+            assert!(!chord.is_empty() && !what.is_empty());
+        }
     }
 
     /// Every group must be able to name and draw itself; a hit that landed in

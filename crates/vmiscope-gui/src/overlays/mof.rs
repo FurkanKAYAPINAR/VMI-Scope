@@ -31,7 +31,9 @@ impl VmiScopeApp {
                     }
                     // `code_panel` brings its own scrolling and gutter, so the
                     // window only has to decide how much room to hand it.
-                    code_panel(ui, &text, Lang::Mof);
+                    // No guide: MOF is read, not authored here, so a column
+                    // mark would be a rule about somebody else's formatting.
+                    code_panel(ui, &text, Lang::Mof, None);
                 }
             });
         self.mof_open = open;

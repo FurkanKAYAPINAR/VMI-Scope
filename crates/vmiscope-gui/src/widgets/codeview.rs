@@ -320,14 +320,19 @@ fn line_job(font: &FontId, line: &str, lang: Lang, ramp: &[Color32; 9]) -> Layou
 }
 
 /// Render `code` in a surface panel with a line-number gutter.
-pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang) {
+///
+/// `guide` is a column to mark with a hairline, or `None` for no guide. It is
+/// the Settings-level `line_width` (see [`column_guide`] for why that setting
+/// is a guide rather than a wrap).
+pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang, guide: Option<u32>) {
     let ramp = accent_ramp(ui);
     let lines: Vec<&str> = code.lines().collect();
     // Width the gutter by digit count so the code does not shift left when a
     // file crosses 100 lines.
     let digits = lines.len().max(1).to_string().len().max(2);
     let font = TextStyle::Monospace.resolve(ui.style());
-    let gutter_w = ui.fonts_mut(|f| f.glyph_width(&font, '0')) * digits as f32;
+    let glyph_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+    let gutter_w = glyph_w * digits as f32;
 
     Frame::new()
         .fill(SURFACE)
@@ -339,6 +344,9 @@ pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang) {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(S2, 1.0);
+                    if let Some(column) = guide {
+                        column_guide(ui, gutter_w + S2 + glyph_w * column as f32);
+                    }
                     for (n, line) in lines.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.allocate_ui(Vec2::new(gutter_w, 0.0), |ui| {
@@ -366,6 +374,34 @@ pub(crate) fn code_panel(ui: &mut Ui, code: &str, lang: Lang) {
                 });
         });
 }
+
+/// A hairline at a fixed column, painted behind the code.
+///
+/// This is what the `line_width` setting drives, and the reason it is a *guide*
+/// rather than a wrap is worth stating where the code is: the plan (task 7.3)
+/// asked for generated scripts to be wrapped at this column, and there is no
+/// column at which they can be. The PowerShell arm carries its query inside a
+/// here-string, the C# arm inside a verbatim string, and VBScript's inside a
+/// plain literal — a newline inserted into any of the three is *part of the
+/// string*, so a wrap does not reformat the script, it changes the query the
+/// script runs. A guide gives the setting the effect it can honestly have: it
+/// shows where the line you are looking at would be too long.
+///
+/// Painted directly rather than through `widgets::rule`, which fades its ends —
+/// a ruler that dissolves at the top and bottom of a scroll region is a smudge.
+fn column_guide(ui: &Ui, x_offset: f32) {
+    let rect = ui.max_rect();
+    let x = (rect.left() + x_offset).round();
+    if x >= rect.right() {
+        return;
+    }
+    ui.painter()
+        .vline(x, rect.y_range(), Stroke::new(HAIRLINE, muted(GUIDE_TINT)));
+}
+
+/// Strength of the column guide. Below the row rules: it is a reference mark,
+/// not content, and it must never compete with the code sitting over it.
+const GUIDE_TINT: u8 = 7;
 
 #[cfg(test)]
 mod tests {

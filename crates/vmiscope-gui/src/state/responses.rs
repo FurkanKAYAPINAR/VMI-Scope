@@ -1,7 +1,7 @@
 //! Draining the background worker: one pass per frame turns replies into state
 //! and clears the spinner the request was holding.
 
-use crate::app::{ConnStatus, TrackedConn, VmiScopeApp};
+use crate::app::{ConnStatus, TrackedConn, VmiScopeApp, DEFAULT_NAMESPACE};
 use crate::state::ids::PendingKind;
 use crate::views::network::NET_FADE_SECS;
 
@@ -14,6 +14,14 @@ impl VmiScopeApp {
 
     pub(crate) fn handle_responses(&mut self, now: f64) {
         for resp in self.worker.poll() {
+            // Any reply that is not an error means the worker is answering, so
+            // whatever is in the status bar is no longer the present tense.
+            // Before this, only a successful *query* cleared it -- so an error
+            // from any other operation sat there for the rest of the session
+            // while everything around it worked. See `state::errors`.
+            if !matches!(resp, Response::Error { .. }) {
+                self.clear_error();
+            }
             match resp {
                 Response::ChildNamespaces {
                     id,
@@ -65,7 +73,8 @@ impl VmiScopeApp {
                         self.selected_row = None;
                         self.result_sort = None;
                         self.query_loading = false;
-                        self.error = None;
+                        // (The banner was already cleared above, for every
+                        // successful reply rather than only for this one.)
                     }
                 }
                 Response::Network { id, snapshot, .. } => {
@@ -104,10 +113,19 @@ impl VmiScopeApp {
                     self.events_loading = false;
                     self.events_report = Some(report);
                 }
-                Response::Providers { id, providers, .. } => {
+                Response::Providers {
+                    id,
+                    providers,
+                    hosts,
+                    ..
+                } => {
                     self.pending.remove(&id);
                     self.providers_loading = false;
                     self.providers = Some(providers);
+                    // The per-host load and the quota it runs against (task 5.15).
+                    // Kept apart from the provider rows because several providers
+                    // share one host process.
+                    self.provider_hosts = Some(hosts);
                 }
                 Response::Schema {
                     id, class, schema, ..
@@ -150,13 +168,26 @@ impl VmiScopeApp {
                     self.search_loading = false;
                     self.search_index = Some(index);
                 }
-                Response::HostConnected { id, host, .. } => {
+                Response::HostConnected {
+                    id,
+                    host,
+                    connect_ms,
+                    probe_ms,
+                    info,
+                } => {
                     self.pending.remove(&id);
                     self.conn_status = match &host {
                         Some(h) => ConnStatus::Remote(h.clone()),
                         None => ConnStatus::Local,
                     };
-                    self.reset_and_reseed();
+                    // Record the bind/probe timings and OS on the target this
+                    // connect was for, before the reseed reads the namespace it
+                    // asked to open to.
+                    self.machines_note_connected(connect_ms, probe_ms, &info);
+                    let ns = self
+                        .machines_take_pending_namespace()
+                        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+                    self.reset_and_reseed(ns);
                 }
                 Response::NamespaceStats {
                     id,
@@ -252,6 +283,7 @@ impl VmiScopeApp {
                         }
                         Some(PendingKind::Connect) => {
                             self.conn_status = ConnStatus::Failed(message.clone());
+                            self.machines_note_connect_failed(&message);
                         }
                         None => {}
                     }

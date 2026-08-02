@@ -6,7 +6,9 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod app;
+mod bench;
 mod config;
+mod io;
 mod overlays;
 mod shell;
 mod state;
@@ -31,8 +33,14 @@ use app::VmiScopeApp;
 /// strips, or the window ends up with two of everything.
 const DECORATED_FLAG: &str = "--decorated";
 
+// `--bench` is declared in `bench::FLAG`, next to the harness it turns on.
+
 fn main() -> eframe::Result<()> {
-    let decorated = std::env::args().any(|arg| arg == DECORATED_FLAG);
+    let args: Vec<String> = std::env::args().collect();
+    let decorated = args.iter().any(|arg| arg == DECORATED_FLAG);
+    // `--bench` drives the real views over synthetic data for a fixed number of
+    // frames, prints what it measured, and exits. See `bench`.
+    let bench = args.iter().any(|arg| arg == bench::FLAG);
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -50,6 +58,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "VMI-Scope",
         native_options,
-        Box::new(move |cc| Ok(Box::new(VmiScopeApp::new(cc, decorated)))),
+        Box::new(move |cc| Ok(Box::new(VmiScopeApp::new(cc, decorated, bench)))),
     )
 }

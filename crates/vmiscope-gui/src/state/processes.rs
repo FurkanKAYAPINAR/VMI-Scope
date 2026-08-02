@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use vmiscope_core::{Enrichment, ProcEvent, ProcKind};
+use vmiscope_core::{filetime_to_unix_secs, Enrichment, ProcEvent, ProcKind};
 
 /// How long an ended row takes to reach [`DIM_FLOOR`].
 pub(crate) const FADE_SECS: f64 = 6.0;
@@ -33,6 +33,92 @@ pub(crate) const DIM_FLOOR: f32 = 0.35;
 /// Default row cap. Roughly a day of ordinary desktop churn.
 pub(crate) const DEFAULT_MAX_ROWS: usize = 5_000;
 
+/// A broken-down instant, **in UTC**.
+///
+/// Named for its timezone rather than left implicit, because there is no honest
+/// way to produce a local one here. Converting UTC to the machine's local time
+/// needs the current DST rule for the current zone, and `std` carries neither a
+/// zone database nor an API for the platform's. Everything downstream therefore
+/// labels this `UTC` on screen; a timestamp that silently means something other
+/// than what it is labelled is worse than one an operator has to offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Utc {
+    pub(crate) year: i64,
+    pub(crate) month: u32,
+    pub(crate) day: u32,
+    pub(crate) hour: u32,
+    pub(crate) minute: u32,
+    pub(crate) second: u32,
+}
+
+impl Utc {
+    /// `HH:MM:SS` -- the time column, which has room for nothing more.
+    pub(crate) fn hms(self) -> String {
+        format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS UTC` -- the tooltip, where the date matters.
+    pub(crate) fn full(self) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+/// Break a Windows `FILETIME` down into a UTC calendar instant.
+///
+/// `ticks` is 100 ns since 1601-01-01 UTC, which is what
+/// `ProcEvent::time_created` carries on both paths: the trace classes deliver
+/// it directly, and the polled fallback derives it from the instance's
+/// `CreationDate`, which `vmiscope_core::cim_datetime_to_filetime` has already
+/// normalised out of its local offset. So this is UTC in, UTC out, with no zone
+/// arithmetic anywhere in between.
+///
+/// `None` for anything at or before the Unix epoch: `ProcEvent` uses `0` for
+/// "the provider gave us no creation time at all", and a process that started in
+/// 1601 is not a thing that happens. That distinction is the point -- rendering
+/// an unknown time as `1601-01-01` would be a fabricated fact on a screen whose
+/// whole job is to say when something ran.
+pub(crate) fn utc_from_filetime(ticks: u64) -> Option<Utc> {
+    let unix = filetime_to_unix_secs(ticks);
+    if unix <= 0.0 {
+        return None;
+    }
+    let secs = unix as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    Some(Utc {
+        year,
+        month,
+        day,
+        hour: (rem / 3600) as u32,
+        minute: ((rem % 3600) / 60) as u32,
+        second: (rem % 60) as u32,
+    })
+}
+
+/// The proleptic-Gregorian date `days` after 1970-01-01.
+///
+/// Howard Hinnant's era-based `civil_from_days`, the exact inverse of the
+/// `days_from_civil` the core already uses for the other direction. Written out
+/// rather than taken as a dependency for the same reason it is there: this is
+/// one conversion, and a calendar crate would be a supply-chain entry for two
+/// dozen lines of integer arithmetic.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// One process, alive or not.
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedProc {
@@ -45,6 +131,16 @@ pub(crate) struct TrackedProc {
     pub(crate) command_line: Enrichment,
     /// App time when the start event arrived.
     pub(crate) started_at: f64,
+    /// The event's own `TIME_CREATED`, a FILETIME. `0` when the provider gave
+    /// none.
+    ///
+    /// This is the row's only link to a wall clock, and it exists because
+    /// `started_at` cannot be one: the frame clock starts at zero when the
+    /// window opens, so `T+04:12` answers "how long ago" and nothing else. The
+    /// question this view is for -- "what ran at 03:14?" -- needs the other
+    /// axis. Core consumes the same field for the pid-reuse guard and used to
+    /// drop it here; the log now keys on it *and* carries it.
+    pub(crate) created_filetime: u64,
     /// App time when the stop event arrived, if it has.
     pub(crate) ended_at: Option<f64>,
     pub(crate) exit_status: Option<u32>,
@@ -56,6 +152,28 @@ pub(crate) struct TrackedProc {
 impl TrackedProc {
     pub(crate) fn is_alive(&self) -> bool {
         self.ended_at.is_none()
+    }
+
+    /// When this process started, on the wall clock, in UTC. `None` when the
+    /// event carried no creation time -- see [`utc_from_filetime`].
+    pub(crate) fn started_utc(&self) -> Option<Utc> {
+        utc_from_filetime(self.created_filetime)
+    }
+
+    /// When it ended, on the same clock.
+    ///
+    /// Derived rather than carried: the stop event's own `TIME_CREATED` is the
+    /// stop instant, but it is not kept -- `stop()` matches on pid, so the row
+    /// never sees that event again. Adding the measured lifetime to the start is
+    /// exact to the resolution of the frame clock the two app-times came from,
+    /// which is the same resolution the Duration column already reports.
+    pub(crate) fn ended_utc(&self) -> Option<Utc> {
+        let ended = self.ended_at?;
+        let elapsed = (ended - self.started_at).max(0.0);
+        let ticks = self
+            .created_filetime
+            .checked_add((elapsed * 10_000_000.0) as u64)?;
+        utc_from_filetime(ticks)
     }
 
     /// How long it ran, in seconds, or how long it has been running.
@@ -161,6 +279,7 @@ impl ProcessLog {
             user: String::new(),
             command_line: Enrichment::Pending,
             started_at: now,
+            created_filetime: event.time_created,
             ended_at: None,
             exit_status: None,
             seq,
@@ -190,15 +309,38 @@ impl ProcessLog {
 
     /// Attach owner and command line once the enrichment lands. Works after the
     /// row has ended -- the detail is often slower than the exit.
-    pub(crate) fn attach(&mut self, seq: u64, user: String, enrichment: Enrichment) {
-        if let Some(&at) = self.by_seq.get(&seq) {
-            if let Some(row) = self.rows.get_mut(at) {
-                if !user.is_empty() {
-                    row.user = user;
-                }
-                row.command_line = enrichment;
-            }
+    ///
+    /// Returns whether it found a row. The caller has nothing to do either way;
+    /// the bool exists so [`the_seq_index_holds_starts_only`] can pin the
+    /// invariant below rather than leaving it as something that happens to be
+    /// true.
+    ///
+    /// # The invariant
+    ///
+    /// **`by_seq` maps the seq of a *start* event only.** [`Self::start`] is the
+    /// one place that writes it, so a `Details` message carrying a stop event's
+    /// seq matches nothing and is dropped in silence.
+    ///
+    /// That is correct today and it is worth writing down, because it is
+    /// correct for a reason that lives in another crate: the monitor only
+    /// queues enrichment for a start (`procmon.rs` sends `DetailsJob` from the
+    /// start arm), and a stop is a process that is gone by definition, which is
+    /// exactly what `Enrichment::Skipped` says on those rows. If the monitor
+    /// ever enriched a stop, the detail would vanish here with no error and no
+    /// log line -- so this is the sentence that has to be re-read when it does,
+    /// and the fix would be to index the stop's seq onto the row it closed.
+    pub(crate) fn attach(&mut self, seq: u64, user: String, enrichment: Enrichment) -> bool {
+        let Some(&at) = self.by_seq.get(&seq) else {
+            return false;
+        };
+        let Some(row) = self.rows.get_mut(at) else {
+            return false;
+        };
+        if !user.is_empty() {
+            row.user = user;
         }
+        row.command_line = enrichment;
+        true
     }
 
     /// Forget every ended row. The one way history leaves, and the user has to
@@ -431,6 +573,144 @@ mod tests {
         log.apply(1, &ev(ProcKind::Start, 3, 77), 0.0);
         log.apply(2, &ev(ProcKind::Start, 3, 77), 0.1);
         assert_eq!(log.len(), 1);
+    }
+
+    /// The whole of bug 5: a row has to be able to say *when*, not only "how
+    /// long ago the window opened". `time_created` is a real FILETIME and it
+    /// used to be consumed by the key and thrown away.
+    #[test]
+    fn a_row_carries_the_events_wall_clock() {
+        // 2024-06-17 12:00:00 UTC as a FILETIME (100 ns since 1601), built from
+        // its Unix seconds (1_718_625_600) rather than written out, so the
+        // expectation below is not just a transcription of the same number.
+        const JUN_17_2024: u64 = 116_444_736_000_000_000 + 1_718_625_600 * 10_000_000;
+        let mut log = ProcessLog::new();
+        log.apply(1, &ev(ProcKind::Start, 100, JUN_17_2024), 0.0);
+
+        let row = &log.rows()[0];
+        assert_eq!(
+            row.created_filetime, JUN_17_2024,
+            "the FILETIME was dropped"
+        );
+        let started = row.started_utc().expect("a real creation time converts");
+        assert_eq!(
+            (started.year, started.month, started.day),
+            (2024, 6, 17),
+            "{started:?}"
+        );
+        assert_eq!(started.hms(), "12:00:00");
+        assert_eq!(started.full(), "2024-06-17 12:00:00 UTC");
+
+        // The end is the start plus the measured lifetime, on the same clock.
+        log.apply(2, &ev(ProcKind::Stop, 100, 0), 90.0);
+        let ended = log.rows()[0].ended_utc().expect("an ended row has an end");
+        assert_eq!(ended.hms(), "12:01:30");
+    }
+
+    /// A provider that reported no creation time must yield *nothing*, not
+    /// 1601-01-01. This view exists to say when something ran; a fabricated
+    /// date is the one wrong answer it must never give.
+    #[test]
+    fn an_absent_creation_time_is_not_a_date_in_1601() {
+        let mut log = ProcessLog::new();
+        log.apply(1, &ev(ProcKind::Start, 7, 0), 0.0);
+        assert_eq!(log.rows()[0].created_filetime, 0);
+        assert!(log.rows()[0].started_utc().is_none());
+        assert!(log.rows()[0].ended_utc().is_none(), "still running anyway");
+
+        log.apply(2, &ev(ProcKind::Stop, 7, 0), 5.0);
+        assert!(
+            log.rows()[0].ended_utc().is_none(),
+            "an end derived from an unknown start is still unknown"
+        );
+
+        // Anything at or before the Unix epoch is the same non-answer.
+        assert!(utc_from_filetime(0).is_none());
+        assert!(utc_from_filetime(116_444_736_000_000_000).is_none());
+    }
+
+    /// The calendar arithmetic, on the dates that break naive versions: a leap
+    /// day, a century that is not a leap year, a century that is, and the two
+    /// ends of a year.
+    #[test]
+    fn the_calendar_handles_leap_years_and_year_ends() {
+        // FILETIME for a given UTC date, computed forwards so the test does not
+        // just restate the implementation's own arithmetic.
+        let ft = |unix_secs: u64| 116_444_736_000_000_000 + unix_secs * 10_000_000;
+        let ymd = |unix_secs: u64| {
+            let u = utc_from_filetime(ft(unix_secs)).expect("after the epoch");
+            (u.year, u.month, u.day, u.hour, u.minute, u.second)
+        };
+
+        assert_eq!(ymd(1), (1970, 1, 1, 0, 0, 1), "the first second");
+        // 2000-02-29: a leap day in a century that IS divisible by 400.
+        assert_eq!(ymd(951_782_400), (2000, 2, 29, 0, 0, 0));
+        // 2100 is not a leap year (divisible by 100, not by 400), so
+        // 2100-03-01 immediately follows 02-28. A `y % 4 == 0` leap rule puts
+        // this one day out, which is exactly the bug the era-based form avoids.
+        assert_eq!(ymd(4_107_456_000), (2100, 2, 28, 0, 0, 0));
+        assert_eq!(ymd(4_107_542_400), (2100, 3, 1, 0, 0, 0));
+        // The last second of a year, and the first of the next.
+        assert_eq!(ymd(1_735_689_599), (2024, 12, 31, 23, 59, 59));
+        assert_eq!(ymd(1_735_689_600), (2025, 1, 1, 0, 0, 0));
+    }
+
+    /// Bug 6, pinned rather than assumed: `by_seq` is written by `start` alone,
+    /// so a `Details` message keyed by a stop event's seq matches nothing.
+    ///
+    /// This is the *current, correct* behaviour -- the monitor only enriches
+    /// starts. The test exists so that if that ever changes, the silence has a
+    /// failing assertion in front of it instead of a missing command line
+    /// nobody can explain.
+    #[test]
+    fn the_seq_index_holds_starts_only() {
+        let mut log = ProcessLog::new();
+        log.apply(10, &ev(ProcKind::Start, 42, 500), 0.0);
+        log.apply(11, &ev(ProcKind::Stop, 42, 600), 1.0);
+
+        let found = Enrichment::Found(vmiscope_core::ProcInfo {
+            command_line: "cmd /c whoami".into(),
+            executable_path: String::new(),
+        });
+
+        assert!(
+            log.attach(10, "CORP\\a".into(), found.clone()),
+            "the START seq must land"
+        );
+        assert!(
+            !log.attach(11, "CORP\\b".into(), found),
+            "the STOP seq indexes nothing -- if this starts passing, read \
+             ProcessLog::attach's invariant"
+        );
+
+        // And the start's detail survived the stop's failed attempt.
+        assert_eq!(log.rows()[0].user, "CORP\\a");
+    }
+
+    /// Eviction rebuilds `by_seq`, and a rebuild that lost the mapping would
+    /// silently stop attaching detail to every surviving row.
+    #[test]
+    fn the_seq_index_survives_an_eviction() {
+        let mut log = ProcessLog::new();
+        log.max_rows = 3;
+        for pid in 1..=6u32 {
+            log.apply(
+                u64::from(pid),
+                &ev(ProcKind::Start, pid, u64::from(pid)),
+                0.0,
+            );
+            log.apply(100 + u64::from(pid), &ev(ProcKind::Stop, pid, 0), 0.1);
+        }
+        assert!(
+            log.dropped > 0,
+            "nothing was evicted, so this proves nothing"
+        );
+
+        let survivor = log.rows().last().expect("rows").seq;
+        assert!(
+            log.attach(survivor, "CORP\\c".into(), Enrichment::Unavailable),
+            "a surviving row lost its seq mapping"
+        );
     }
 
     /// A non-zero exit is worth flagging; zero and "still running" are not.

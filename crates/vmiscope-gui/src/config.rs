@@ -202,6 +202,113 @@ impl ByteFormat {
 }
 
 // ---------------------------------------------------------------------------
+// Connection targets
+// ---------------------------------------------------------------------------
+
+/// The transport a target is reached over.
+///
+/// One variant, and that is the honest state of this tool: the core binds WMI
+/// with DCOM through `IWbemLocator` on both the local and the alternate-credential
+/// path, and there is no WSMan/WinRM anywhere in it. The enum exists so the
+/// persisted shape can *name* the transport rather than imply one, and so the
+/// Machines view's segmented control has a value to bind "DCOM" to while "WinRM"
+/// stays a disabled label with a tooltip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum Transport {
+    #[default]
+    Dcom,
+}
+
+impl Transport {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Dcom => "DCOM",
+        }
+    }
+}
+
+/// Which principal a target is reached as -- **never** the secret it is reached
+/// with.
+///
+/// This is the whole of task 5.18's "passwords are never persisted": a target
+/// records *who* it authenticates as (the current user, or an alternate
+/// `DOMAIN\user`) so the list can show a Credential column and pre-fill the
+/// form, and it stops exactly there. The password lives only in the running
+/// form's masked field and, once a connection is made, in the worker thread's
+/// memory -- never on disk. The test [`a_target_never_serializes_a_password`]
+/// pins that this type has nowhere for one to hide.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum CredRef {
+    /// Kerberos/NTLM single sign-on as the interactive user.
+    #[default]
+    CurrentUser,
+    /// Alternate credentials: a user, domain-qualified where one was given.
+    Alt {
+        user: String,
+        domain: Option<String>,
+    },
+}
+
+impl CredRef {
+    /// A one-line label for the targets table's Credential column, and half of a
+    /// target's identity.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::CurrentUser => "current user".to_string(),
+            Self::Alt { user, domain } => match domain {
+                Some(d) if !d.is_empty() => format!("{d}\\{user}"),
+                _ => user.clone(),
+            },
+        }
+    }
+}
+
+/// A saved connection target for the Machines view.
+///
+/// Persisted so the view opens to the hosts a user actually works with.
+/// Everything here is either identity or the *last measured* fact about the
+/// target -- pointedly not a live one: `last_seen` is a timestamp whose age the
+/// Status column shows, because a green dot cached from yesterday is a lie about
+/// now. There is no password field, by [`CredRef`]'s construction.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct Target {
+    /// The host name (`\\` stripped). Empty is the local machine, which the view
+    /// shows synthetically and never persists here.
+    pub(crate) name: String,
+    /// The namespace this target opens to.
+    pub(crate) namespace: String,
+    pub(crate) transport: Transport,
+    pub(crate) cred_ref: CredRef,
+    /// The last DCOM bind time measured for this target, in ms. `None` until it
+    /// has been connected or tested.
+    #[serde(default)]
+    pub(crate) last_rtt_ms: Option<u64>,
+    /// The last OS build read from this target. Empty until probed.
+    #[serde(default)]
+    pub(crate) last_os: String,
+    /// Unix seconds of the last successful probe. `None` until probed; its age
+    /// is what the Status column shows, so a cached result never reads as live.
+    #[serde(default)]
+    pub(crate) last_seen: Option<u64>,
+}
+
+impl Target {
+    /// The identity two targets are the same by: host and principal, lowercased.
+    ///
+    /// Not the namespace -- the same host reached as the same user is one target
+    /// whichever namespace you happen to browse -- and not the password, which
+    /// is not here to key on. Mirrors [`vmiscope_core::HostRef`]'s reasoning that
+    /// SSO and alternate-credential connections to one host are two targets.
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.name.to_lowercase(),
+            self.cred_ref.label().to_lowercase()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // History
 // ---------------------------------------------------------------------------
 
@@ -357,11 +464,31 @@ pub(crate) struct Config {
 
     // --- Code generation ---
     pub(crate) default_lang: CodeLang,
+    /// Column the Code sub-tab draws its guide at.
+    ///
+    /// Named `line_width` because that is what task 2.24 persisted and what an
+    /// existing `config.json` carries; what it *does* changed with task 7.3, and
+    /// the Settings row says so. The plan asked for generated scripts to be
+    /// wrapped at this column, which turned out not to be implementable without
+    /// changing what the scripts mean — the PowerShell arm carries its query in
+    /// a here-string, the C# arm in a verbatim literal, and a newline inside
+    /// either is part of the string. See the Settings row and `docs/REDESIGN.md`.
     pub(crate) line_width: u32,
+    /// Emit a block that authenticates as somebody else in generated scripts
+    /// (task 7.3). Off by default: the common case is running the script as
+    /// yourself, and a credential prompt in a script nobody asked for one in is
+    /// noise.
+    #[serde(default)]
+    pub(crate) include_credentials: bool,
 
     // --- History and library ---
     pub(crate) history: Vec<HistoryEntry>,
     pub(crate) saved: Vec<SavedQuery>,
+
+    // --- Connection targets ---
+    /// Saved connection targets for the Machines view (task 5.18). Never carries
+    /// a password — see [`CredRef`].
+    pub(crate) targets: Vec<Target>,
 
     /// Write cooldown. Not persisted — it is a fact about this process, not
     /// about the file.
@@ -388,8 +515,10 @@ impl Default for Config {
             show_provider_stats: false,
             default_lang: CodeLang::default(),
             line_width: DEFAULT_LINE_WIDTH,
+            include_credentials: false,
             history: Vec::new(),
             saved: Vec::new(),
+            targets: Vec::new(),
             save_clock: Cell::new(SaveClock::default()),
         }
     }
@@ -475,15 +604,26 @@ impl Config {
     /// For a change the user just made deliberately — a Settings toggle, a saved
     /// query. Anything that happens as a side effect of ordinary use should go
     /// through [`Config::save_debounced`] instead.
+    ///
+    /// "Now" means the *serialisation* is now and the **write is queued** on the
+    /// IO thread (task 7.8). Serialising is arithmetic over a few kilobytes;
+    /// the write is a syscall against `%APPDATA%`, which on a roaming or
+    /// folder-redirected profile is a network path and has no bound at all. The
+    /// ordering that matters is preserved either way: the IO thread runs one job
+    /// at a time in the order they were queued, so two saves in one frame land
+    /// in the order they were made and the last one wins, exactly as an inline
+    /// write would.
+    ///
+    /// A failed write now reaches the error log instead of a `let _`.
     pub(crate) fn save(&self) {
-        if let Some(p) = config_path() {
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(s) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, s);
+        if let Some(path) = config_path() {
+            if let Ok(json) = serde_json::to_string_pretty(self) {
+                crate::io::write(path, json);
             }
         }
+        // Stamped when the write is *queued*, not when it lands. That is the
+        // right instant for a cooldown whose job is to collapse a burst of
+        // changes: the burst is what is being measured, not the disk.
         self.save_clock.set(SaveClock {
             dirty: false,
             last_write: Some(Instant::now()),
@@ -703,6 +843,55 @@ impl Config {
         self.sort_saved();
         self.save();
         (added, replaced)
+    }
+
+    // -- connection targets ------------------------------------------------
+
+    /// Insert or replace a target by identity, then debounce a write.
+    ///
+    /// The local machine (empty host) is never stored: the Machines view always
+    /// shows a synthetic "this machine" row, so persisting one would duplicate
+    /// it and, worse, would let a credential-less local entry masquerade as a
+    /// configured target.
+    pub(crate) fn upsert_target(&mut self, target: Target) {
+        if target.name.trim().is_empty() {
+            return;
+        }
+        let key = target.key();
+        self.targets.retain(|t| t.key() != key);
+        self.targets.push(target);
+        self.save_debounced();
+    }
+
+    /// Attach a successful probe's measurements to the target with `key`.
+    ///
+    /// Returns whether a saved target matched -- the synthetic local row never
+    /// does, and neither does a target the user connected to once without ever
+    /// saving, which is a real state rather than a bug.
+    pub(crate) fn note_target_probe(&mut self, key: &str, rtt_ms: u64, os: &str, at: u64) -> bool {
+        if let Some(t) = self.targets.iter_mut().find(|t| t.key() == key) {
+            t.last_rtt_ms = Some(rtt_ms);
+            t.last_os = os.to_string();
+            t.last_seen = Some(at);
+            self.save_debounced();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove the target with `key`.
+    pub(crate) fn forget_target(&mut self, key: &str) {
+        let before = self.targets.len();
+        self.targets.retain(|t| t.key() != key);
+        if self.targets.len() != before {
+            self.save();
+        }
+    }
+
+    /// The saved target with `key`, if any.
+    pub(crate) fn target(&self, key: &str) -> Option<&Target> {
+        self.targets.iter().find(|t| t.key() == key)
     }
 }
 
@@ -1106,5 +1295,93 @@ mod tests {
             Due::In(left) => assert_eq!(left, SAVE_DEBOUNCE - Duration::from_millis(500)),
             other => panic!("expected a wait, got {other:?}"),
         }
+    }
+
+    // -- connection targets ------------------------------------------------
+
+    /// Task 5.18's whole point: the persisted shape has nowhere for a password.
+    /// The alternate-credential target keeps who it authenticates as and drops
+    /// the secret, so a `config.json` shared or backed up cannot leak one.
+    #[test]
+    fn a_target_never_serializes_a_password() {
+        let mut cfg = Config::default();
+        cfg.upsert_target(Target {
+            name: "SRV1".into(),
+            namespace: "root\\CIMV2".into(),
+            transport: Transport::Dcom,
+            cred_ref: CredRef::Alt {
+                user: "admin".into(),
+                domain: Some("CORP".into()),
+            },
+            last_rtt_ms: Some(42),
+            last_os: "26200".into(),
+            last_seen: Some(1_750_000_000),
+        });
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !json.to_lowercase().contains("password"),
+            "config.json grew a password field:\n{json}"
+        );
+        // The principal it *does* keep survives a round trip.
+        assert!(json.contains("CORP"));
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.targets, cfg.targets);
+    }
+
+    /// A target is identified by host and principal, not by namespace, and the
+    /// local machine is synthetic so it is never stored.
+    #[test]
+    fn targets_upsert_by_host_and_principal_and_skip_local() {
+        let mut cfg = Config::default();
+
+        // The local machine has an empty host: the view draws it itself.
+        cfg.upsert_target(Target {
+            name: "  ".into(),
+            ..Default::default()
+        });
+        assert!(cfg.targets.is_empty(), "the local machine was persisted");
+
+        let base = Target {
+            name: "SRV1".into(),
+            namespace: "root\\CIMV2".into(),
+            cred_ref: CredRef::CurrentUser,
+            ..Default::default()
+        };
+        cfg.upsert_target(base.clone());
+        // Same host, same principal, different namespace -> one target, updated.
+        cfg.upsert_target(Target {
+            namespace: "root\\subscription".into(),
+            ..base.clone()
+        });
+        assert_eq!(cfg.targets.len(), 1);
+        assert_eq!(cfg.targets[0].namespace, "root\\subscription");
+
+        // The same host reached as an alternate user is a different target.
+        cfg.upsert_target(Target {
+            cred_ref: CredRef::Alt {
+                user: "admin".into(),
+                domain: Some("CORP".into()),
+            },
+            ..base.clone()
+        });
+        assert_eq!(cfg.targets.len(), 2);
+
+        // A probe lands on the matching target; the local key matches nothing.
+        let k0 = cfg.targets[0].key();
+        assert!(cfg.note_target_probe(&k0, 55, "26200", 1_750_000_000));
+        assert_eq!(cfg.target(&k0).unwrap().last_rtt_ms, Some(55));
+        assert!(!cfg.note_target_probe("|current user", 9, "0", 0));
+
+        cfg.forget_target(&k0);
+        assert_eq!(cfg.targets.len(), 1);
+        assert!(cfg.target(&k0).is_none());
+    }
+
+    /// A v1 file predates targets entirely; it must load with an empty list
+    /// rather than failing to parse.
+    #[test]
+    fn an_old_config_loads_with_no_targets() {
+        let cfg: Config = serde_json::from_str(V1).unwrap();
+        assert!(cfg.targets.is_empty());
     }
 }

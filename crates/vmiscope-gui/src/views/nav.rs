@@ -125,8 +125,13 @@ impl View {
 
     /// Views that are not built yet, so the rail can show them as coming
     /// without pretending they work. Removed as each one lands.
+    ///
+    /// Compare was the last one, so nothing is a placeholder now. The predicate
+    /// stays because the rail's dimming and its "(not built yet)" tooltip are
+    /// still wired to it: a destination added ahead of its view has somewhere to
+    /// say so.
     pub(crate) fn is_placeholder(self) -> bool {
-        matches!(self, Self::Compare | Self::Machines)
+        false
     }
 }
 

@@ -6,8 +6,10 @@ use crate::theme::tokens::{BAD, R_MD};
 use crate::widgets::button::focus_ring;
 use crate::widgets::rule::HAIRLINE;
 
+pub(crate) mod closing;
 pub(crate) mod errorlog;
 pub(crate) mod invoke;
+pub(crate) mod keymap;
 pub(crate) mod mof;
 pub(crate) mod palette;
 pub(crate) mod save_query;

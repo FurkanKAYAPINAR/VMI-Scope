@@ -16,7 +16,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    Button, Color32, Frame, Rect, Response, RichText, Stroke, StrokeKind, Ui, Vec2, WidgetText,
+    self, Button, Color32, Frame, Rect, Response, RichText, Stroke, StrokeKind, Ui, Vec2,
+    WidgetText,
 };
 
 use crate::theme::icons;
@@ -92,18 +93,64 @@ fn ramp_of(accent: Color32) -> &'static [Color32; 9] {
 ///
 /// egui's `Widgets` has no `focused` slot -- `Response::widget_state` folds
 /// focus into `Active` -- so a keyboard-focused control is indistinguishable
-/// from a pressed one and, at rest, from an unfocused one. There is no hook to
-/// install this globally either, so it has to be called explicitly. Every
-/// helper in this file calls it on its own response; views must call it after
-/// any interactive widget they assemble by hand.
+/// from a pressed one and, at rest, from an unfocused one.
+///
+/// **This is no longer the mechanism.** [`paint_focus_ring`] runs once a frame
+/// over whatever holds focus, which covers the widgets this kit does not own --
+/// `ui.checkbox`, `ui.selectable_label`, `CollapsingHeader`, a bare `TextEdit`
+/// -- and cannot be forgotten by a new call site the way a per-widget call can.
+/// This one is kept because two view modules outside this pass's ownership call
+/// it directly, and because painting the same stroke twice over the same rect
+/// with an opaque colour is idempotent.
 pub(crate) fn focus_ring(ui: &Ui, response: &Response) {
     if !response.has_focus() {
         return;
     }
-    ui.painter().rect_stroke(
-        response.rect.expand(FOCUS_OFFSET),
+    ring(ui.painter(), response.rect, accent(ui));
+}
+
+/// Paint the focus ring for whatever holds keyboard focus this frame.
+///
+/// Call once, at the end of the frame, after everything has been drawn --
+/// `Context::read_response` can only answer for a widget that already exists.
+///
+/// This is the answer to the focus-ring audit (task 7.7). The audit found the
+/// gap the per-widget approach always had: every raw egui widget a view reaches
+/// for is a control the kit never sees. There were eleven -- two `ui.checkbox`
+/// in Process, one in Network, one in the Explorer search, and eight
+/// `ui.selectable_label` across the class list, the sub-tab strip, the tree and
+/// the Saved library -- none of which had a ring, and none of which would have
+/// shown up as anything but "keyboard traversal goes invisible here".
+///
+/// Reading `Memory::focused` instead makes the property structural: a control
+/// that can take focus gets a ring, whether or not anybody remembered.
+pub(crate) fn paint_focus_ring(ui: &Ui) {
+    let ctx = ui.ctx();
+    let Some(id) = ctx.memory(|m| m.focused()) else {
+        return;
+    };
+    let Some(response) = ctx.read_response(id) else {
+        // Focus is held by a widget that was not drawn this frame -- a control
+        // in a collapsed section, or one behind a view switch. Nothing to ring.
+        return;
+    };
+    if !response.rect.is_positive() {
+        return;
+    }
+    // A foreground layer, so the ring is never buried under a panel fill or a
+    // modal's scrim the way an in-place stroke can be.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("vs_focus_ring"),
+    ));
+    ring(&painter, response.rect, accent(ui));
+}
+
+fn ring(painter: &egui::Painter, rect: Rect, color: Color32) {
+    painter.rect_stroke(
+        rect.expand(FOCUS_OFFSET),
         R_SM,
-        Stroke::new(FOCUS_W, accent(ui)),
+        Stroke::new(FOCUS_W, color),
         StrokeKind::Outside,
     );
 }
@@ -287,8 +334,24 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
                 w.active.weak_bg_fill = TEXT.gamma_multiply(PRESS_TEXT);
             }
 
+            // The options have to *read* left to right whatever direction the
+            // surrounding layout runs in. Found by capture: every segmented
+            // control in Settings sits inside `labelled_row`'s right-to-left
+            // value column, `ui.horizontal` inherits the parent's main
+            // direction, and so `On | Off` rendered as `Off | On` and
+            // Identify / Impersonate / Delegate -- an ascending scale of what
+            // you give away -- ran backwards.
+            //
+            // The fix is to reverse the *placement* order rather than to force
+            // the layout: forcing `left_to_right` also makes the child claim
+            // the whole remaining width, and the group's border then stretches
+            // across the panel instead of hugging its options.
+            let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
             ui.horizontal(|ui| {
-                for (index, &(value, label)) in options.iter().enumerate() {
+                let count = options.len();
+                for step in 0..count {
+                    let index = if rtl { count - 1 - step } else { step };
+                    let (value, label) = options[index];
                     let selected = value == *current;
                     let color = if selected { a } else { TEXT };
                     let response = ui.add(Button::new(RichText::new(label).color(color)));
@@ -304,11 +367,19 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
                             StrokeKind::Inside,
                         );
                     }
-                    if index > 0 {
+                    // A seam sits *between* two options, so it goes on the edge
+                    // facing the one placed before it -- which is the right edge
+                    // when placement runs right to left.
+                    if step > 0 {
+                        let x = if rtl {
+                            response.rect.right()
+                        } else {
+                            response.rect.left()
+                        };
                         // In-control separators stay solid; see widgets::rule.
                         let seam = Rect::from_min_max(
-                            response.rect.left_top(),
-                            response.rect.left_bottom() + Vec2::new(HAIRLINE, 0.0),
+                            egui::pos2(x, response.rect.top()),
+                            egui::pos2(x + HAIRLINE, response.rect.bottom()),
                         );
                         rule::solid_vline(ui.painter(), seam, DIVIDER);
                     }

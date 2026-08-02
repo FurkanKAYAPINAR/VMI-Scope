@@ -23,19 +23,18 @@ impl VmiScopeApp {
     // UI: persistence (WMI event-subscription hunter)
     // ------------------------------------------------------------------
 
+    /// Ask for a baseline snapshot. Returns at once; the parse happens in
+    /// `drain_io` when the file arrives. See `crate::io` for why the dialog is
+    /// no longer opened on this thread.
     pub(crate) fn load_baseline_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        {
-            match std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|t| {
-                    vmiscope_core::export::subscriptions_from_json(&t).map_err(|e| e.to_string())
-                }) {
-                Ok(subs) => self.events_baseline = Some(subs),
-                Err(e) => self.push_error(format!("Load baseline: {e}")),
-            }
+        crate::io::pick(crate::io::PickFor::PersistenceBaseline, "JSON", &["json"]);
+    }
+
+    /// A picked baseline file, parsed.
+    pub(crate) fn apply_baseline_file(&mut self, text: &str) {
+        match vmiscope_core::export::subscriptions_from_json(text) {
+            Ok(subs) => self.events_baseline = Some(subs),
+            Err(e) => self.push_error(format!("Load baseline: {e}")),
         }
     }
 
@@ -177,7 +176,9 @@ impl VmiScopeApp {
             } else {
                 DataTable::new("events-table")
                     .columns([
-                        TableColumn::initial("Risk", 64.0).at_least(48.0),
+                        TableColumn::initial("Risk", 64.0)
+                            .at_least(48.0)
+                            .tooltip(crate::util::RISK_SORT_NOTE),
                         TableColumn::initial("Consumer type", 168.0).at_least(48.0),
                         TableColumn::initial("Consumer", 150.0).at_least(48.0),
                         TableColumn::initial("Filter", 150.0).at_least(48.0),

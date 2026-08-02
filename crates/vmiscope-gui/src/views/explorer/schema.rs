@@ -161,7 +161,8 @@ impl VmiScopeApp {
                     ui.ctx().copy_text(mof.clone());
                 }
             });
-            code_panel(ui, mof, Lang::Mof);
+            // No guide -- the MOF is the provider's text, not ours.
+            code_panel(ui, mof, Lang::Mof, None);
         } else if !self.mof_loading {
             ui.label(RichText::new("MOF unavailable.").color(muted(45)));
         }

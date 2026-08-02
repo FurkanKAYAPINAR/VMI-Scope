@@ -13,38 +13,22 @@ use eframe::egui;
 use crate::config::Config;
 use crate::shell;
 use crate::state::ids::PendingKind;
-use crate::theme::icons;
-use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, S2, S6, SURFACE};
+use crate::views::compare::CompareView;
+use crate::views::events::{EventLog, EventsView};
 use crate::views::nav::View;
 use crate::views::network::NET_REFRESH_SECS;
 use crate::views::process::ProcessView;
 use crate::views::saved::SavedView;
-use crate::widgets::button::{btn_primary, focus_ring};
-use crate::widgets::card::card;
-use crate::widgets::chip::dot_chip;
-use crate::widgets::field::mono_input;
-use crate::widgets::loading::spinner;
-use crate::widgets::rule::vrule;
 
 use vmiscope_core::{
-    AssocInfo, ClassBrief, ClassSchema, Completion, Connection, Credential, EventMonitor,
-    MethodOutcome, MethodTarget, MonitorMsg, NamespaceStats, ProviderInfo, QueryResult,
-    SearchIndex, Subscription, SubscriptionReport, Tally, WmiWorker, DEFAULT_EVENT_QUERY,
+    AssocInfo, ClassBrief, ClassSchema, Completion, Connection, EventMonitor, MethodOutcome,
+    MethodTarget, NamespaceStats, ProviderHosts, ProviderInfo, QueryResult, SearchIndex,
+    Subscription, SubscriptionReport, Tally, WmiWorker, DEFAULT_EVENT_QUERY,
 };
 
 pub(crate) const ROOT_NAMESPACE: &str = "root";
 pub(crate) const DEFAULT_NAMESPACE: &str = "root\\CIMV2";
 const DEFAULT_QUERY: &str = "SELECT * FROM Win32_OperatingSystem";
-
-/// Widths of the connection bar's fields. The kit's inputs fill whatever they
-/// are handed, and a host box the width of the window would swamp the row.
-const HOST_W: f32 = 160.0;
-const CRED_W: f32 = 90.0;
-const DOMAIN_W: f32 = 80.0;
-
-/// The temporary connect card's maximum width inside the Machines placeholder.
-/// Full-bleed, the row's fields would spread across the whole window.
-const CONNECT_CARD_W: f32 = 640.0;
 
 /// A connection tracked across snapshots so it can fade out after it closes.
 pub(crate) struct TrackedConn {
@@ -106,6 +90,22 @@ pub struct VmiScopeApp {
     pub(crate) palette_query: String,
     /// Index of the highlighted palette row.
     pub(crate) palette_sel: usize,
+    /// The keyboard map's open flag (F1, or the status bar's `F1 keys` button).
+    /// See `overlays::keymap`, which generates the map from the same binding
+    /// table `handle_shortcuts` dispatches from.
+    pub(crate) keymap_open: bool,
+    /// The `--bench` harness, when it was asked for. `None` in every normal
+    /// run, and the only thing that reads it is one call at the top of `ui`.
+    pub(crate) bench: Option<crate::bench::Bench>,
+    /// Settings → About → Licences is expanded. Collapsed by default: it is
+    /// several thousand words of licence text, and it has to be *reachable*
+    /// rather than unavoidable.
+    pub(crate) licences_open: bool,
+    /// The close gate is asking. See `overlays::closing`.
+    pub(crate) closing_open: bool,
+    /// The user answered "close anyway", so the next close request goes
+    /// through. Without it the gate would refuse its own `Close` command.
+    pub(crate) closing_confirmed: bool,
     /// Persisted query history + saved queries.
     pub(crate) config: Config,
     /// Cached class list per namespace (avoids re-enumerating on revisit).
@@ -152,12 +152,38 @@ pub struct VmiScopeApp {
     pub(crate) providers_loading: bool,
     pub(crate) providers_sort: Option<(usize, bool)>,
     pub(crate) providers_baseline: Option<Vec<ProviderInfo>>,
+    /// Live load of the provider host processes and the quota they run against
+    /// (task 5.15). Arrives with the provider list and is dropped on a host
+    /// switch, because it is a fact about one machine's processes.
+    pub(crate) provider_hosts: Option<ProviderHosts>,
+
+    // --- compare tab ---
+    /// The Compare view's own state, including the per-host workers it runs A
+    /// and B on. Those are deliberately not `worker` above: that one serves a
+    /// single target, and pointing it at two machines in turn is a reconnect per
+    /// side and a race over which host answered.
+    pub(crate) compare: CompareView,
+
+    // --- machines tab ---
+    /// The Machines view's own state: saved-target probes, the connection form's
+    /// namespace and impersonation, and its table sort. The host and credentials
+    /// it edits are the `conn_*` fields above, which the shell and the invoke
+    /// overlay also read.
+    pub(crate) machines: crate::views::machines::MachinesView,
 
     // --- events tab (live monitor) ---
+    //
+    // The subscription and its log stay here rather than moving into
+    // `EventsView` with the rest, because two other modules read them: the
+    // status bar counts the log, and the Explorer's "Watch" action writes the
+    // query. `EventsView` holds what belongs to that view alone.
     pub(crate) monitor: Option<EventMonitor>,
     pub(crate) monitor_wql: String,
     pub(crate) monitor_error: Option<String>,
-    pub(crate) events_log: Vec<Vec<(String, String)>>,
+    /// A capped ring, newest first. It replaced a `Vec` that was front-inserted
+    /// and truncated to 500 on every event -- see `views::events`.
+    pub(crate) events_log: EventLog,
+    pub(crate) events: EventsView,
 
     // --- namespace tree ---
     /// namespace path -> its loaded child paths (absent = not loaded yet).
@@ -265,16 +291,43 @@ pub struct VmiScopeApp {
     pub(crate) error: Option<String>,
     pub(crate) error_log: Vec<String>,
     pub(crate) error_log_open: bool,
+    /// A transient status line and the app time it expires at. See
+    /// `state::errors`.
+    pub(crate) notice: Option<(String, f64)>,
 }
 
 impl VmiScopeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, decorated: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, decorated_flag: bool, bench: bool) -> Self {
         // Fonts first: `set_fonts` rebuilds the atlas, and installing the style
         // against the old font set would size text against the wrong metrics.
         crate::theme::fonts::install(&cc.egui_ctx);
         // Load config before installing the style so a persisted accent/density
         // lands on the first frame instead of flashing the default and swapping.
         let config = Config::load();
+
+        // `--decorated` forces OS chrome; without it, the Settings choice
+        // applies. The flag can only ever turn decoration ON, which is what
+        // makes it an escape hatch: someone whose custom chrome is unusable can
+        // always get a real title bar back from the command line, and no saved
+        // preference can take it away again.
+        //
+        // `main` sizes the window before the config exists, so a saved
+        // preference for OS chrome arrives one frame late and is applied by the
+        // viewport command below rather than by the builder.
+        let decorated = decorated_flag || config.decorated;
+        if decorated && !decorated_flag {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        }
+
+        // The namespace the Explorer opens to, from Settings. It used to be the
+        // `DEFAULT_NAMESPACE` constant unconditionally, which left the setting
+        // reading back a value it had no way of applying.
+        let boot_ns = if config.default_namespace.trim().is_empty() {
+            DEFAULT_NAMESPACE.to_string()
+        } else {
+            config.default_namespace.clone()
+        };
         crate::theme::install(
             &cc.egui_ctx,
             crate::theme::Theme {
@@ -318,6 +371,11 @@ impl VmiScopeApp {
             palette_shown: false,
             palette_query: String::new(),
             palette_sel: 0,
+            keymap_open: false,
+            bench: bench.then(crate::bench::Bench::new),
+            licences_open: false,
+            closing_open: false,
+            closing_confirmed: false,
             config,
             class_cache: HashMap::new(),
             conn_host: String::new(),
@@ -343,14 +401,18 @@ impl VmiScopeApp {
             providers_loading: false,
             providers_sort: None,
             providers_baseline: None,
+            provider_hosts: None,
+            compare: CompareView::default(),
+            machines: crate::views::machines::MachinesView::default(),
             monitor: None,
             monitor_wql: DEFAULT_EVENT_QUERY.to_string(),
             monitor_error: None,
-            events_log: Vec::new(),
+            events_log: EventLog::default(),
+            events: EventsView::default(),
             ns_children: HashMap::new(),
             ns_expanded: HashSet::new(),
             ns_loading: HashSet::new(),
-            active_ns: DEFAULT_NAMESPACE.to_string(),
+            active_ns: boot_ns.clone(),
             classes: Vec::new(),
             classes_ns: String::new(),
             classes_loading: false,
@@ -408,14 +470,29 @@ impl VmiScopeApp {
             error: None,
             error_log: Vec::new(),
             error_log_open: false,
+            notice: None,
         };
 
-        // Load the root's children, expand it, focus CIMV2, and run a query so
-        // the window has real content the moment it opens.
-        app.ns_expanded.insert(ROOT_NAMESPACE.to_string());
-        app.request_namespaces(ROOT_NAMESPACE.to_string());
-        app.request_classes(DEFAULT_NAMESPACE.to_string());
-        app.run_query();
+        // Load the root's children, expand it, focus the configured namespace,
+        // and run a query so the window has real content the moment it opens.
+        //
+        // The opening query only fires for the default namespace, for the same
+        // reason `reset_and_reseed` restricts it: `SELECT * FROM
+        // Win32_OperatingSystem` does not exist in `root\subscription`, and
+        // greeting someone who configured that namespace with an error their
+        // own setting caused would be the worst possible first frame.
+        //
+        // Skipped entirely under `--bench`: a real namespace enumeration and a
+        // real query landing partway through a timed run would be measured as
+        // frame cost, and the harness installs its own data anyway.
+        if app.bench.is_none() {
+            app.ns_expanded.insert(ROOT_NAMESPACE.to_string());
+            app.request_namespaces(ROOT_NAMESPACE.to_string());
+            app.request_classes(boot_ns.clone());
+            if boot_ns == DEFAULT_NAMESPACE {
+                app.run_query();
+            }
+        }
         app
     }
 
@@ -436,155 +513,36 @@ impl VmiScopeApp {
             View::Network => self.request_network(now),
             View::Persistence => self.request_events(),
             View::Providers => self.request_providers(),
+            // Both sides again, but only when there is something to re-run:
+            // Compare's refresh is two queries against two machines, and firing
+            // it at a view that has never been run would be a surprise.
+            View::Compare => self.compare_refresh(),
             // Saved has nothing to re-fetch: the library is a file, not a WMI
             // query, and it is written by this process alone.
-            View::Events
-            | View::Process
-            | View::Saved
-            | View::Compare
-            | View::Machines
-            | View::Settings => {}
+            View::Events | View::Process | View::Saved | View::Machines | View::Settings => {}
         }
     }
 
-    /// The empty state a destination shows before it is built.
-    ///
-    /// The rail deliberately lists every planned destination, so every one of
-    /// them has to land somewhere that says what it will be rather than on a
-    /// blank pane that reads as a rendering failure.
-    fn ui_placeholder(&self, ui: &mut egui::Ui, view: View) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(S6);
-            ui.label(icons::glyph(view.icon()).size(34.0).color(muted(20)));
-            ui.add_space(S2);
-            ui.heading(view.title());
-            ui.label(egui::RichText::new(view.hint()).color(muted(55)));
-            ui.add_space(S2);
-            ui.label(
-                egui::RichText::new("Not built yet \u{2014} this destination is on the roadmap.")
-                    .text_style(egui::TextStyle::Small)
-                    .color(muted(38)),
-            );
-        });
-    }
+    // `ui_placeholder` -- the "not built yet" empty state every unbuilt
+    // destination fell through to -- went away with Compare, the last of them.
+    // Every one of the eleven now has a view, so the fall-through arm it served
+    // is gone from `ui_view` too.
 
-    // ------------------------------------------------------------------
-    // UI: connection bar (remote host, current user / SSO)
-    //
-    // Moved out of the top bar by task 2.26. Its logic is untouched; only its
-    // home changed. It now lives inside the Machines placeholder, which is
-    // where the real connection manager lands in Phase 5 and where the title
-    // bar's machine chip already navigates -- so someone looking for "point
-    // this at another box" arrives at it from the thing that shows the box.
-    // ------------------------------------------------------------------
-
-    fn ui_connection_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Host:");
-            let resp = ui
-                .scope(|ui| {
-                    ui.set_max_width(HOST_W);
-                    mono_input(
-                        ui,
-                        &mut self.conn_host,
-                        "local (blank) or remote hostname / IP",
-                    )
-                })
-                .inner;
-            // No icon in the tooltip: `on_hover_text` takes a plain string, so
-            // there is nowhere to name the icon family and the glyph would
-            // render in whatever font answered its codepoint.
-            ui.checkbox(&mut self.conn_use_creds, "alt creds")
-                .on_hover_text(
-                    "Alternate credentials for a remote host (raw DCOM).\nExperimental — \
-                 unverified against a live remote host. Browse/query/network/providers only.",
-                );
-            if self.conn_use_creds {
-                ui.scope(|ui| {
-                    ui.set_max_width(CRED_W);
-                    mono_input(ui, &mut self.conn_user, "user");
-                });
-                // Hand-rolled rather than `mono_input`: the kit's field has no
-                // password mode, and a masked field is the one place where the
-                // difference matters. Everything else about it is the kit's.
-                ui.scope(|ui| {
-                    ui.set_max_width(CRED_W);
-                    let pass = ui.add(
-                        egui::TextEdit::singleline(&mut self.conn_pass)
-                            .password(true)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text(egui::RichText::new("password").color(muted(38)))
-                            .background_color(SURFACE),
-                    );
-                    focus_ring(ui, &pass);
-                });
-                ui.scope(|ui| {
-                    ui.set_max_width(DOMAIN_W);
-                    mono_input(ui, &mut self.conn_domain, "domain");
-                });
-            }
-            let go = btn_primary(ui, icons::labelled(ui, icons::PLUGS_CONNECTED, "Connect"))
-                .clicked()
-                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            if go {
-                let h = self.conn_host.trim().trim_start_matches('\\').to_string();
-                let host = if h.is_empty() { None } else { Some(h) };
-                let cred = if self.conn_use_creds && !self.conn_user.trim().is_empty() {
-                    let d = self.conn_domain.trim();
-                    Some(Credential {
-                        user: self.conn_user.trim().to_string(),
-                        password: self.conn_pass.clone(),
-                        domain: if d.is_empty() {
-                            None
-                        } else {
-                            Some(d.to_string())
-                        },
-                    })
-                } else {
-                    None
-                };
-                self.apply_host(host, cred);
-            }
-            vrule(ui, DIVIDER);
-            match &self.conn_status {
-                // The dot was already the shape here, drawn as a text glyph;
-                // `dot_chip` is the same thing with the design's metrics. Local
-                // is neutral rather than OK: it is the resting state, not an
-                // achievement.
-                ConnStatus::Local => {
-                    dot_chip(ui, NEUTRAL[4], "local machine");
-                }
-                ConnStatus::Connecting => {
-                    spinner(ui, "connecting\u{2026}");
-                }
-                ConnStatus::Remote(h) => {
-                    let mode = if self.conn_use_creds {
-                        "alt creds"
-                    } else {
-                        "current user"
-                    };
-                    dot_chip(ui, OK, &format!("{h} ({mode})"));
-                }
-                ConnStatus::Failed(e) => {
-                    ui.label(icons::labelled_styled(
-                        ui,
-                        icons::X,
-                        e.lines().next().unwrap_or("failed"),
-                        egui::TextStyle::Body,
-                        BAD,
-                    ));
-                }
-            }
-        });
-    }
+    // The connection bar that used to live here -- the host box, the alt-cred
+    // fields and the status dot -- was replaced by the Machines view
+    // (`views::machines`, task 5.16). Its state (`conn_host`, `conn_use_creds`,
+    // `conn_user`, `conn_pass`, `conn_domain`) stays on the app, because the
+    // shell's machine chip and the method-invocation overlay read it; the
+    // Machines view edits those same fields rather than keeping a second copy.
 
     // The status bar moved wholesale into `shell::statusbar` with task 2.15;
     // its error / namespace / query line and the `Log (n)` toggle live there.
 
     /// The per-view content, added inside the shell's central panel.
     ///
-    /// Every one of the eleven destinations is dispatched here. The six with no
-    /// view yet get the empty state rather than falling through to a blank
+    /// Every one of the eleven destinations is dispatched here, and every one of
+    /// them now has a view -- so the match is exhaustive by name and a
+    /// destination added without one is a compile error rather than a blank
     /// pane.
     fn ui_view(&mut self, ui: &mut egui::Ui, now: f64) {
         match self.view {
@@ -624,15 +582,20 @@ impl VmiScopeApp {
                 });
             }
             View::Events => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_events(ui);
-                });
+                // Owns its own panels (the 300px subscription column and the
+                // raw-event reveal), so it takes the `Ui` rather than a central
+                // panel -- same shape as Query.
+                self.ui_events(ui, now);
             }
             View::Machines => {
+                // Owns its own panels (the 290px New-connection rail beside the
+                // targets table), so it takes the `Ui` rather than a central
+                // panel -- same shape as Query and Events.
+                self.ui_machines(ui);
+            }
+            View::Compare => {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_placeholder(ui, View::Machines);
-                    ui.add_space(S6);
-                    self.ui_connect_card(ui);
+                    self.ui_compare(ui);
                 });
             }
             View::Settings => {
@@ -640,55 +603,41 @@ impl VmiScopeApp {
                     self.ui_settings(ui);
                 });
             }
-            other => {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.ui_placeholder(ui, other);
-                });
-            }
         }
-    }
-
-    /// The temporary home of the connection bar. See the note above
-    /// `ui_connection_bar`.
-    fn ui_connect_card(&mut self, ui: &mut egui::Ui) {
-        let width = CONNECT_CARD_W.min(ui.available_width());
-        ui.vertical_centered(|ui| {
-            ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-                ui.set_width(width);
-                card(ui, |ui| {
-                    ui.label(icons::labelled(
-                        ui,
-                        icons::PLUGS_CONNECTED,
-                        "Connect to a host",
-                    ));
-                    ui.add_space(S2);
-                    self.ui_connection_bar(ui);
-                });
-            });
-        });
     }
 }
 
 impl eframe::App for VmiScopeApp {
     // eframe 0.35 hands the app the root `Ui` directly and attaches panels to it
     // via `show(ui, ..)` (instead of the older `update(ctx, ..)` model).
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let now = ui.input(|i| i.time);
+
+        // `--bench` only. Before the shell, so the synthetic data is in place
+        // for the frame it is about to time. A no-op in every normal run.
+        self.bench_frame(ui.ctx(), frame);
+
+        // A close request is answerable only in the frame it arrives, so
+        // nothing may return before this. See `overlays::closing`.
+        self.handle_close_request(ui.ctx());
+
         self.handle_responses(now);
 
-        // Drain the live event monitor (if running).
-        if self.monitor.is_some() {
-            let msgs = self.monitor.as_ref().unwrap().poll();
-            for msg in msgs {
-                match msg {
-                    MonitorMsg::Event(pairs) => {
-                        self.events_log.insert(0, pairs);
-                        self.events_log.truncate(500);
-                    }
-                    MonitorMsg::Error(e) => self.monitor_error = Some(e),
-                }
-            }
-        }
+        // Whatever the IO thread finished: a picked baseline, a failed write.
+        // See `crate::io` -- file dialogs no longer stop the frame loop, so
+        // their answers arrive here rather than inline in a view.
+        self.drain_io(now);
+
+        // Drain the live event monitor (if running). It stamps arrival times and
+        // samples the channel's depth, so it lives with the view that reports
+        // both; see `views::events`.
+        self.drain_events(now);
+
+        // Drain the Compare view's per-host workers. Every frame, not only while
+        // that view is on screen: a comparison the user walked away from has to
+        // land, or returning to it would show a spinner over a query that
+        // finished minutes ago.
+        self.compare_poll(ui.ctx());
 
         // Drain the process monitor. Unlike the event log above, this one is
         // filled whatever view is on screen: the question it answers is "what
@@ -751,10 +700,23 @@ impl eframe::App for VmiScopeApp {
         self.ui_invoke_modal(ui.ctx());
         self.ui_save_query_window(ui.ctx());
         self.ui_error_log_window(ui.ctx());
+        self.ui_keymap_window(ui.ctx());
 
         // The palette is last, and a `Modal` rather than a `Window`: it is the
         // frontmost thing in the app and it dims what it covers.
         self.ui_palette(ui, now);
+
+        // Except this, which is later still: it is a question about whether the
+        // window continues to exist, and it must sit over everything including
+        // the palette.
+        self.ui_closing_modal(ui.ctx());
+
+        // The focus ring, once, over whatever holds focus -- after everything,
+        // because it reads the frame's own responses back. egui has no focused
+        // widget state of its own, and asking every call site to remember is
+        // what left eleven raw controls without one. See
+        // `widgets::button::paint_focus_ring`.
+        crate::widgets::button::paint_focus_ring(ui);
 
         // Coalesced config write (task 4.7). `push_history` used to serialize and
         // write the whole file on every query run; it now only marks the config

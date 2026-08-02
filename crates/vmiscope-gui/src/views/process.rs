@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::app::VmiScopeApp;
-use crate::state::processes::{ProcessLog, TrackedProc};
+use crate::state::processes::{ProcessLog, TrackedProc, Utc};
 use crate::theme::icons;
 use crate::theme::tokens::{muted, BAD, DIVIDER, NEUTRAL, OK, S1, WARN};
 use crate::util::save_file;
@@ -61,13 +61,18 @@ const NOTE: u8 = 45;
 const BANNER_BODY: u8 = 70;
 const BANNER_NOTE: u8 = 55;
 
-/// What the time column measures.
+/// What the time column shows when the event carried no creation time.
 ///
-/// The app's own clock, because that is the only clock the row model keeps:
-/// `ProcEvent::time_created` is a real FILETIME, but it is consumed by the
-/// pid-reuse guard in core and never reaches [`TrackedProc`], so a wall-clock
-/// stamp is not available to this view.
-const TIME_HINT: &str = "elapsed since VMI-Scope started";
+/// The column is a wall clock now -- `ProcEvent::time_created` reaches the row
+/// (see [`TrackedProc::created_filetime`]) instead of being consumed by the
+/// pid-reuse guard and dropped. It is **UTC**, and says so, because turning UTC
+/// into local time needs a zone database `std` does not carry; a stamp labelled
+/// as local that is actually UTC would be worse than one an operator offsets in
+/// their head. The `T+` form remains as the fallback for a row with no wall
+/// clock at all, and is labelled differently so the two can never be confused.
+const TIME_HINT_UNKNOWN: &str = "The provider reported no creation time for this event, so this \
+                                 is elapsed time since VMI-Scope started \u{2014} not a wall \
+                                 clock.";
 
 /// Which lifecycle states the table shows.
 ///
@@ -198,7 +203,15 @@ impl VmiScopeApp {
                     seq,
                     user,
                     enrichment,
-                } => self.proc.log.attach(seq, user, enrichment),
+                } => {
+                    // The bool is discarded on purpose: a `Details` that matches
+                    // no row is a real, expected state (the row was evicted, or
+                    // -- see `ProcessLog::attach` -- the seq belonged to a stop
+                    // event), and none of them is something a user can act on.
+                    // It exists so the invariant is testable, not so it is
+                    // handled here.
+                    let _ = self.proc.log.attach(seq, user, enrichment);
+                }
                 ProcMsg::Error(e) => {
                     // Both places: the view shows it in context, and the status
                     // bar's log keeps it after the user has moved on.
@@ -207,6 +220,22 @@ impl VmiScopeApp {
                 }
             }
         }
+    }
+
+    /// Benchmark seam: fold a synthetic event into the log without a monitor.
+    ///
+    /// It also latches `stopped`, which is not incidental -- `ui_process` starts
+    /// a real WMI subscription the first time the view is drawn, and a
+    /// benchmark that silently opened one would be measuring the frame cost of
+    /// a live provider as well as its own rows. See `crate::bench`.
+    pub(crate) fn proc_bench_apply(&mut self, seq: u64, event: &vmiscope_core::ProcEvent, at: f64) {
+        self.proc.stopped = true;
+        self.proc.log.apply(seq, event, at);
+    }
+
+    /// Benchmark seam: attach enrichment to a seeded row.
+    pub(crate) fn proc_bench_attach(&mut self, seq: u64, user: String, enrichment: Enrichment) {
+        let _ = self.proc.log.attach(seq, user, enrichment);
     }
 
     // ------------------------------------------------------------------
@@ -289,7 +318,11 @@ impl VmiScopeApp {
                 // The sign is a glance-level start/stop marker; it duplicates
                 // the lifecycle filter, so it is not a sort target.
                 TableColumn::exact("", 24.0).sortable(false),
-                TableColumn::initial("Time", 78.0).at_least(56.0),
+                TableColumn::initial("Time", 78.0).at_least(56.0).tooltip(
+                    "Start time in UTC. A row whose provider reported no creation time \
+                         falls back to T+ elapsed since VMI-Scope started, dimmed, and those \
+                         rows sort together ahead of the dated ones.",
+                ),
                 TableColumn::initial("PID", 62.0)
                     .at_least(48.0)
                     .numeric(true),
@@ -328,7 +361,22 @@ impl VmiScopeApp {
                 } else {
                     ProcKind::Stop.sign()
                 });
-                row.text(stamp(t.started_at)).on_hover_text(TIME_HINT);
+                match t.started_utc() {
+                    Some(utc) => {
+                        // The date lives in the tooltip: the column has room for
+                        // HH:MM:SS and "what ran at 03:14" is answered by the
+                        // time, while "which 03:14" is answered on hover.
+                        let tip = match t.ended_utc() {
+                            Some(end) => format!("started {}\nended   {}", utc.full(), end.full()),
+                            None => format!("started {}\nstill running", utc.full()),
+                        };
+                        row.text(utc.hms()).on_hover_text(tip);
+                    }
+                    None => {
+                        row.colored(stamp(t.started_at), muted(NOTE))
+                            .on_hover_text(TIME_HINT_UNKNOWN);
+                    }
+                }
                 row.text(t.pid.to_string());
                 name_cell(row, t, depth, color.gamma_multiply(alpha));
                 if t.user.is_empty() {
@@ -704,7 +752,12 @@ fn col_value(t: &TrackedProc, col: usize, now: f64) -> String {
             ProcKind::Stop.sign()
         }
         .to_string(),
-        1 => t.started_at.to_string(),
+        // The FILETIME, not the `HH:MM:SS` the cell shows: a clock-face string
+        // sorts `23:59` above `00:01` and puts last night after this morning.
+        // A row with no creation time keys on 0, so the undated rows land
+        // together at the ascending end rather than scattering through the
+        // dated ones -- which is what the header tooltip promises.
+        1 => t.created_filetime.to_string(),
         2 => t.pid.to_string(),
         3 => t.name.clone(),
         4 => t.user.clone(),
@@ -816,7 +869,7 @@ fn csv_field(s: &str) -> String {
 /// table draws.
 fn to_csv(rows: &[(&TrackedProc, usize)], order: &[usize], now: f64) -> String {
     let mut out = String::from(
-        "state,started_t_plus_secs,pid,process,user,session_id,parent_pid,\
+        "state,started_utc,ended_utc,started_t_plus_secs,pid,process,user,session_id,parent_pid,\
          duration_secs,exit_status,command_line,command_line_state\n",
     );
     for &i in order {
@@ -827,6 +880,11 @@ fn to_csv(rows: &[(&TrackedProc, usize)], order: &[usize], now: f64) -> String {
         };
         let cells = [
             if t.is_alive() { "running" } else { "ended" }.to_string(),
+            // Empty rather than a fabricated 1601 date when the provider
+            // reported no creation time; `started_t_plus_secs` still places the
+            // row in the session, which is all that is known about it.
+            t.started_utc().map(Utc::full).unwrap_or_default(),
+            t.ended_utc().map(Utc::full).unwrap_or_default(),
             format!("{:.3}", t.started_at),
             t.pid.to_string(),
             t.name.clone(),
@@ -858,6 +916,11 @@ fn to_csv(rows: &[(&TrackedProc, usize)], order: &[usize], now: f64) -> String {
 #[derive(serde::Serialize)]
 struct ExportRow<'a> {
     state: &'a str,
+    /// The wall clock, UTC, or `null` when the event carried none. `null`
+    /// rather than an epoch date for the same reason `user` is nullable: the
+    /// absence is the fact.
+    started_utc: Option<String>,
+    ended_utc: Option<String>,
     started_t_plus_secs: f64,
     pid: u32,
     process: &'a str,
@@ -881,6 +944,8 @@ fn to_json(rows: &[(&TrackedProc, usize)], order: &[usize], now: f64) -> String 
             };
             ExportRow {
                 state: if t.is_alive() { "running" } else { "ended" },
+                started_utc: t.started_utc().map(Utc::full),
+                ended_utc: t.ended_utc().map(Utc::full),
                 started_t_plus_secs: t.started_at,
                 pid: t.pid,
                 process: &t.name,

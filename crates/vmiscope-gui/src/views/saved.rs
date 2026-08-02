@@ -402,29 +402,28 @@ impl VmiScopeApp {
         self.run_query();
     }
 
-    /// Merge a library file in. Reports what happened, including "nothing".
+    /// Ask for a library file. Returns at once; see `crate::io`.
     fn import_library(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let note = match std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| crate::config::Config::library_from_json(&text))
-        {
+        crate::io::pick(crate::io::PickFor::SavedLibrary, "JSON", &["json"]);
+    }
+
+    /// Merge a picked library file in. Reports what happened, including
+    /// "nothing". Called from `drain_io`.
+    ///
+    /// The path is no longer part of the note: the read happened on the IO
+    /// thread and the view is told the contents, not where they came from. That
+    /// is a small loss and the honest one -- a note naming a file this code
+    /// never opened would be a guess.
+    pub(crate) fn apply_library_file(&mut self, text: &str) {
+        let note = match crate::config::Config::library_from_json(text) {
             Ok(incoming) => {
                 let found = incoming.len();
                 let (added, replaced) = self.config.merge_library(incoming);
-                format!(
-                    "Imported {found} from {}: {added} added, {replaced} replaced.",
-                    path.display()
-                )
+                format!("Imported {found}: {added} added, {replaced} replaced.")
             }
             Err(e) => {
                 self.push_error(format!("Import library: {e}"));
-                format!("Could not read {}.", path.display())
+                "The file could not be read as a query library.".to_string()
             }
         };
         self.saved_view.last_import = Some(note);

@@ -1,13 +1,21 @@
-//! Waiting states: spinners, skeletons and elapsed-time badges.
+//! Waiting and nothing-here states: spinners, skeletons, elapsed-time badges
+//! and the empty state.
 //!
 //! Thirteen places used a bare `ui.spinner()`, which draws in egui's own colour
 //! and says nothing about what is being waited on. These say what, and how long.
+//!
+//! [`empty_state`] is here for the same reason: the state-audit (task 7.6) found
+//! two views drawing a bare table header over nothing, and two more that had a
+//! good empty state written out by hand where a third copy was about to be. No
+//! view may show a blank rectangle, and the way to keep that true is for the
+//! thing that says "nothing here" to be one widget.
 
 #![allow(dead_code)] // The views adopt the kit in the next commit.
 
 use eframe::egui::{CornerRadius, Label, Response, RichText, Spinner, TextStyle, Ui};
 
-use crate::theme::tokens::{muted, NEUTRAL, WARN};
+use crate::theme::icons;
+use crate::theme::tokens::{muted, NEUTRAL, S2, S6, WARN};
 use crate::widgets::button::accent;
 
 /// Anything slower than this is worth flagging in an elapsed badge.
@@ -62,6 +70,29 @@ pub(crate) fn elapsed_badge(ui: &mut Ui, ms: u64) -> Response {
         )
         .wrap(),
     )
+}
+
+/// The design's empty state: a dim icon over a title and one line of what to do.
+///
+/// `note` carries the weight. "No results" is a dead end; "No results. The
+/// query ran and matched nothing" and "No rows match the filter" are two
+/// different facts and lead to two different next actions, and a view that
+/// cannot tell them apart should be fixed rather than made vague.
+pub(crate) fn empty_state(ui: &mut Ui, icon: &str, title: &str, note: &str) {
+    ui.add_space(S6);
+    ui.vertical_centered(|ui| {
+        ui.label(icons::glyph(icon).size(28.0).color(muted(20)));
+        ui.add_space(S2);
+        ui.label(RichText::new(title).color(muted(55)));
+        ui.add(
+            Label::new(
+                RichText::new(note)
+                    .text_style(TextStyle::Small)
+                    .color(muted(38)),
+            )
+            .wrap(),
+        );
+    });
 }
 
 /// A one-line note about a result that is not whole, or nothing when it is.

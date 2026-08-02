@@ -362,6 +362,84 @@ WorkingSetSize > 40000000`, `root\CIMV2`) reported `elapsed_ms` of **65, 100, 54
 1 row. Nothing about a hard-coded figure in a status strip would survive contact
 with this; the mock's "412 ms" is a mock.
 
+### A delivered event carries no `__CLASS`, and no class for its `TargetInstance`
+
+`docs/REDESIGN.md` 4.11 has the Events view parsing an event's kind out of its
+`__CLASS`. That property never reaches the GUI. `wmi::IWbemClassWrapper::
+list_properties` calls `GetNames` with `WBEM_FLAG_ALWAYS | WBEM_FLAG_NONSYSTEM_
+ONLY`, so every `__`-prefixed system property is filtered out before
+`monitor::flatten_event` iterates — and `MonitorMsg::Event`, a flat
+`Vec<(String, String)>`, is the whole of what the view receives.
+
+Measured, on a live `__InstanceCreationEvent WITHIN 2 … Win32_Process`
+subscription, the delivered key set is exactly:
+
+```
+["SECURITY_DESCRIPTOR", "TIME_CREATED", "TargetInstance.Caption",
+ "TargetInstance.Name", "TargetInstance.ParentProcessId",
+ "TargetInstance.ProcessId"]
+```
+
+The *target* class is missing for a second, independent reason: `flatten_event`
+drills one level into the embedded object and copies six named scalars, none of
+which is a class name. So neither the event's class nor its subject's class is
+recoverable per event without changing `vmiscope-core`.
+
+Both are therefore derived from the subscription's own query and stamped onto
+each row as it arrives. The one discriminator that *does* survive is
+`PreviousInstance`: only a modification carries it, which is enough to narrow a
+subscription to the `__InstanceOperationEvent` superclass one third of the way
+and no further.
+
+Related, and visible in the same key set: `SECURITY_DESCRIPTOR` arrives as the
+literal string `{}` rather than being dropped, so anything summarising an event
+has to exclude it by name.
+
+### `WITHIN` is a delivery batch interval, not just a polling hint
+
+An intrinsic subscription does not trickle. Measured by changing only the
+`WITHIN` value: at `WITHIN 2` events arrived stamped `09:12:09.831` and
+`09:12:11.915` — two batches two seconds apart; at `WITHIN 9`, seven events
+covering nine seconds of process churn all arrived on the single stamp
+`09:25:18.185`. At `WITHIN 1` on
+`Win32_PerfFormattedData_PerfProc_Process`, ~260 events land on one frame and
+then nothing for a second.
+
+Two consequences for any UI over this. A "delivery rate" is only meaningful
+over a window several times the interval — instantaneously it is either zero or
+enormous. And a per-row arrival animation keyed on "this row is new" fires on
+every visible row at once, which is not what a mock built from a trickle
+predicts.
+
+### `__PATH` names the machine; `__RELPATH` does not
+
+Both come back only when a query asks for the identity columns
+(`Request::Query{include_system: true}`), and the difference between them is the
+whole basis of a host-to-host diff. Read off this machine:
+
+    __PATH     \\DESKTOP-6SAB9EN\root\CIMV2:Win32_Service.Name="ADPSvc"
+    __RELPATH  Win32_Service.Name="ADPSvc"
+
+So `__RELPATH` is a usable cross-host key, and `__PATH` is the opposite: it
+differs between any two hosts by construction, on every row, forever. A compare
+that did not ignore it would report every row as changed and be right about
+nothing. It is in the Compare view's default ignore list for that reason, and
+`__RELPATH` is its key fallback for the other half of the same reason.
+
+### Two reads of the same machine, a fraction of a second apart, are not equal
+
+`SELECT * FROM Win32_Process` twice in a row, keyed on `Handle`: 365 rows, 347
+identical, **18 changed** and **2 gone** (a `docker.exe` and a `conhost.exe`
+that exited between the two enumerations). The 18 moved on `PageFaults`,
+`VirtualSize` and `PeakVirtualSize` only.
+
+That is what a snapshot diff is up against, and it is why the ignore list is a
+feature rather than a convenience: without one, "compare two machines" answers
+"everything changed" even when the two machines are one machine. `Win32_Service`
+on the same pair of reads is 309 rows and **309 identical**, with three columns
+ignored (`InstallDate`, `ProcessId`, `__PATH`) — a class whose state is not a
+live counter behaves exactly as it should.
+
 ---
 
 ## egui 0.35
@@ -468,6 +546,92 @@ at every use site, so `&STEEL` in two places can be two different addresses.
 falling back to the default accent on the other two themes — which looks like a
 missing token, not like a bug.
 
+### An un-virtualised list costs ~9 µs per row per frame — the row cap is not what saves you
+
+Task 4.13 is written as though a `Vec::insert(0, ..)` + `truncate(500)` on every
+event were the thing that degrades frame time under a few hundred events a
+second. Measured, it is not, and the real cost is next door.
+
+**The ingest.** 200 000 pushes of an event-shaped row (six `(String, String)`
+pairs plus scalars), release build:
+
+| retained | front-insert + truncate | `VecDeque` push/pop | ratio |
+|---|---|---|---|
+| 500 | 0.78 µs/event | 0.41 µs/event | 1.9× |
+| 5 000 | 4.60 µs/event | 0.40 µs/event | 11.4× |
+
+At the old 500-row cap and 200 ev/s that is 156 µs *per second*. The
+front-insert was never the frame-time problem; it is what makes a **deeper** log
+unaffordable, because its cost is linear in the cap while the ring's is not.
+
+**The render.** Same build, same live subscription (~240–260 ev/s from
+`__InstanceModificationEvent WITHIN 1 … Win32_PerfFormattedData_PerfProc_
+Process`), timing the whole of `App::ui`:
+
+| rows held | `ScrollArea::show` (all rows) | `show_rows` (virtualised) |
+|---|---|---|
+| < 1 000 | 2.7 ms mean | — |
+| 1 000 | 12.8 ms | — |
+| 2 000 | 22.9 ms | — |
+| 3 000 | 32.2 ms | — |
+| 4 000 | 40.5 ms | — |
+| 5 000 | **46.3 ms mean, p99 54.5 ms** | **p50 0.63 ms, p99 1.34 ms** |
+
+Linear in the retained rows at roughly 9 µs each, and three times over a 16.7 ms
+budget by 5 000 rows — about 21 fps, with the drain falling behind as well.
+Virtualisation is what buys the headroom; the ring is what makes keeping 5 000
+rows cost nothing to maintain. Both were needed, for different reasons than the
+plan gives.
+
+### `animate_bool` cannot express "born this frame", and cannot loop
+
+Two animations in the Events view are driven from `input().time` and a per-item
+birth stamp instead, and neither could have been built on egui's animation API:
+
+- `Ui::animate_bool` returns the **target** value on the first frame it sees a
+  given `Id` (`AnimationManager` inserts the value it was asked for rather than
+  the opposite one). A row created this frame therefore starts at "already
+  finished" and never fades in. There is no "animate from" entry point.
+- It eases once between two states and holds. A heartbeat needs a cycle, and
+  nothing in `AnimationManager` restarts one, so a pulse built on it beats
+  exactly once.
+
+Both are cheap from the clock: `1 - easing::cubic_out((now - created_at) / d)`
+for the one-shot, `(1 - cos(2π · t / period)) / 2` for the loop — a cosine is
+its own ease-in-out, which is what the mock's keyframes describe.
+
+### A debug build paints "Unaligned" over anything off the 1/32-point grid
+
+`Ui::register_rect` is `#[cfg(debug_assertions)]` and, with
+`DebugOptions::show_unaligned` (which defaults to `cfg!(debug_assertions)`),
+draws an orange rule plus the word `Unaligned` along any `Ui` edge that is not a
+multiple of `emath::GUI_ROUNDING` = 1/32 pt. The density scale in this project is
+deliberately fractional (5.6 / 8.4 / 11.2), so a cursor a few `add_space` calls
+deep is essentially never on that grid.
+
+It shows up in Compare's withheld-diff states because there the banner is the
+last thing on screen. The Explorer, captured from the same binary, shows none —
+consistent with the marks being painted over rather than absent, though that was
+not separately confirmed. Two fixes were tried and neither works: snapping the
+frame's top onto the grid leaves the bottom off it (the height comes from font
+metrics), and rounding the height as well merely adds a second flagged `Ui`
+inside the first. Nothing of it reaches a release build — the function does not
+exist there — so it is documented rather than fought.
+
+### U+2260 and U+2212 are in both text faces; the glyph gate is a policy, not a coverage check
+
+`check.ps1`'s I9 rules exist because `default_fonts` is off, so a codepoint
+outside the two embedded text faces renders as a blank box. That reasoning does
+not apply to every codepoint the allow-list omits. Reading the `cmap` tables of
+`InterVariable.ttf` (2,852 mapped codepoints) and `JetBrainsMonoNL-Regular.ttf`
+(1,363): **U+2260 `≠` and U+2212 `−` are present in both**, as is every glyph the
+allow-list already permits.
+
+So the plan's `=` `≠` `−` `+` sign column would have rendered; it is the
+invariant that refuses it, and the invariant is a curated list rather than a
+measurement of the fonts. Compare ships the ASCII `=` `!=` `-` `+` instead of
+quietly widening a standing rule.
+
 ### Assorted 0.35 API notes
 
 - `SidePanel` and `TopBottomPanel` are gone; there is one `egui::Panel` with
@@ -490,7 +654,91 @@ missing token, not like a bug.
 - `RichText::strong()` recolours; it does not embolden. Weight has to come from
   a separately registered font family.
 
+### A layout is inherited, so a control laid out "horizontally" can run backwards
+
+`ui.horizontal` does not mean left to right. It inherits the parent's main
+direction, and `Layout::right_to_left` is how you right-align anything — which
+is how the Settings view aligns every control in its value column.
+
+The result, found by capture and invisible in the source: **every segmented
+control rendered its options in reverse.** `[(true, "On"), (false, "Off")]` drew
+as `Off | On`, and Identify / Impersonate / Delegate — an ascending scale of how
+much of your identity you hand a remote provider — ran down the screen from
+Delegate. Six controls, all wrong, all reading as deliberate.
+
+The fix is *not* to force `Layout::left_to_right` on the inner `Ui`. That fixes
+the order and breaks the size: a forced-direction child claims the whole
+remaining width, so the group's border stretches across the panel instead of
+hugging its options — which the second capture showed. Reversing the *placement
+order* when the inherited direction is right-to-left keeps both. The seam
+between two options then has to move to the trailing edge as well, since "the
+edge facing the option placed before this one" is the right edge when placement
+runs backwards.
+
+### egui has no focused-widget visual, but it does have `read_response`
+
+`Response::widget_state` folds focus into `Active`, so a keyboard-focused
+control is indistinguishable from a pressed one and, at rest, from an unfocused
+one. The obvious answer is a `focus_ring(ui, &response)` helper that every
+widget calls.
+
+Measured against the actual code, that answer does not hold: **eleven interactive
+controls had no ring**, all of them raw egui widgets a view reached for directly
+— three `ui.checkbox`, eight `ui.selectable_label`, plus every
+`CollapsingHeader`. A widget kit only sees the widgets that go through it, and
+no audit keeps that list at zero for long.
+
+`Context::read_response(id)` returns this frame's `Response` for any `Id`, and
+`Memory::focused()` gives the focused one. One call at the end of the frame
+paints the ring for whatever holds focus, in a foreground layer, whether or not
+the widget has ever heard of the kit. Verified by forcing focus onto Network's
+"external only" checkbox, which is stock `ui.checkbox`.
+
+### Frame *interval* cannot tell you whether a UI is fast
+
+The `--bench` harness measures two things, and only one of them is a
+measurement. Release build, this machine, 240 frames a scenario with the first
+60 discarded as warm-up:
+
+| scenario | CPU/frame mean | p50 | p95 | max | interval p50 |
+|---|---|---|---|---|---|
+| 50,000-row result table (Query) | 0.89 ms | 0.84 | 1.24 | 1.34 | 13.32 ms |
+| 1,400-class list (Explorer) | 0.58 ms | 0.56 | 0.76 | 0.86 | 13.33 ms |
+| 2,000-event stream (Process) | 1.19 ms | 1.17 | 1.50 | 1.60 | 13.34 ms |
+
+The interval column is **identical across all three** and is not about this
+code at all: it is the display period, and it would read 13.3 ms for a UI ten
+times slower. Anything of the form "holds 60 fps" that is derived from frame
+timing on a vsynced surface is measuring the monitor. `eframe::Frame::info()`'s
+`cpu_usage` — egui plus painting for the previous frame — is the number that
+answers the question, and against a 16.67 ms budget the worst of the three uses
+9%.
+
+Two things the numbers also say. Virtualisation works: 50,000 rows cost less per
+frame than 2,000 rows do in a view that computes a fade alpha, a lifetime and a
+filter match per row. And the warm-up matters — the discarded frames include the
+font atlas growing and `egui_extras` measuring its columns for the first time,
+which is the cost of arriving rather than the cost of being there.
+
 ---
+
+## Tooling traps
+
+### `serde_json::from_str` into a `Value` cannot verify written key order
+
+`Value`'s map is a `BTreeMap` here, so parsing re-sorts keys and collapses
+duplicates. A round-trip test written to prove that an exporter preserves its
+caller's column order therefore passes against the **buggy and the fixed
+exporter alike** -- it is measuring the parser, not the writer.
+
+The first cross-check test for the JSON exporter was written exactly that way
+and was worthless. It was caught only by deliberately reverting the fix and
+watching the test still pass. Verifying written order needs a line-oriented
+read of the actual bytes.
+
+This is the same shape as the icon-font bug earlier in this document: a test
+that asserts the wrong invariant is worse than no test, because it also buys
+confidence.
 
 ## Method
 
@@ -504,6 +752,16 @@ control showing other queries succeed on the same connection.
 
 **Measuring instead of asserting.** The row-cap gap, the 93% miss rate, the
 binary-size arithmetic and the ligature problem were all invisible until
-something was run and counted. Three claims in our own plan turned out to be
+something was run and counted. Several claims in our own plan turned out to be
 wrong, and they are struck through in `REDESIGN.md` rather than quietly edited,
 because a plan is only worth anything if its claims are falsifiable.
+
+**Rendering a frame and looking at it.** Distinct from running the tests, and it
+found things no assertion would have. The reversed segmented controls, the
+keyboard map's overlapping text, and an empty state that reported "every socket
+has closed" over a chip row reading "297 active" were all in code that compiled,
+passed clippy and passed its unit tests. `PrintWindow(hwnd, dc,
+PW_RENDERFULLCONTENT)` renders a live frame even on a locked workstation, where
+synthetic input cannot reach the window; reaching a specific view means
+temporarily changing the startup default, capturing, restoring the file and
+re-running the whole gate on the reverted tree.

@@ -12,7 +12,7 @@ use vmiscope_core::{ClassKind, Tally};
 
 use crate::app::{CentralView, VmiScopeApp};
 use crate::theme::icons;
-use crate::theme::tokens::{muted, BG, DIVIDER, S3, S4, S6};
+use crate::theme::tokens::{BG, DIVIDER, S3, S4};
 use crate::widgets::rule::{hrule, solid_vline, HAIRLINE};
 
 pub(crate) mod classlist;
@@ -155,20 +155,16 @@ impl VmiScopeApp {
         self.ui_detail(ui);
 
         if self.selected_class.is_none() {
-            ui.add_space(S6);
-            ui.vertical_centered(|ui| {
-                ui.label(icons::glyph(icons::CUBE).size(30.0).color(muted(20)));
-                ui.add_space(S3);
-                ui.label(egui::RichText::new("No class selected").color(muted(55)));
-                ui.label(
-                    egui::RichText::new(
-                        "Pick a class from the list to inspect its instances, \
-                         properties, methods and schema.",
-                    )
-                    .text_style(egui::TextStyle::Small)
-                    .color(muted(38)),
-                );
-            });
+            // Through the kit rather than hand-built: this was the third copy
+            // of the same centred icon-title-note block, and task 7.6 collapsed
+            // them into `widgets::loading::empty_state`.
+            crate::widgets::loading::empty_state(
+                ui,
+                icons::CUBE,
+                "No class selected",
+                "Pick a class from the list to inspect its instances, properties, methods \
+                 and schema.",
+            );
             return;
         }
 

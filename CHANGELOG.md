@@ -6,6 +6,91 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Every Settings control is now wired, or says why it is not.** Default
+  namespace, impersonation level, operation timeout, row limit, byte
+  formatting, show-system-classes, the credentials block, the code column guide
+  and the window chrome all take effect and persist. Two stay disabled and
+  both name the code that would have to change: **Authentication**, because the
+  package is fixed per transport in the core (`RPC_C_AUTHN_WINNT` on the
+  alternate-credential path, negotiated by the `wmi` crate on the SSO one) and
+  there is no second value to offer, and **Monospace font**, because one face is
+  embedded and nothing is loaded from disk at runtime by design.
+- **Settings → About → Licences**, rendering the bundled OFL and MIT texts
+  inline from `include_str!`. The obligation is to distribute the licence *with*
+  the software, so the text is compiled into the binary rather than read from a
+  file beside it.
+- **A keyboard map (F1**, or the status bar's `F1 keys` button**)**, generated
+  from the same binding table `handle_shortcuts` dispatches from, so it cannot
+  drift from what the keys do.
+- **A close gate.** Closing the window while a method invocation is in flight is
+  answered with `CancelClose` and a confirmation that says plainly that the call
+  has already been sent, cannot be cancelled, and will lose its result. Every
+  other pending operation is a read; this one is a write.
+- **A perf harness**, `vmiscope --bench`. Measured on this machine, release
+  build, 240 frames a scenario with the first 60 discarded: a 50,000-row result
+  table costs **0.89 ms/frame mean, 1.24 ms p95**; a 1,400-class list **0.58 ms
+  mean, 0.76 ms p95**; a 2,000-event process stream **1.19 ms mean, 1.50 ms
+  p95** — all against a 16.67 ms 60 fps budget. The frame *interval* sat at
+  13.3 ms throughout, which is the display period and not a measurement of this
+  code.
+- Empty states for the Network table and the Explorer class list, which drew a
+  bare header over nothing, and a status line for Saved, Machines and Settings,
+  which the status bar had been calling "not built yet" since before they were
+  built.
+
+### Changed
+- **File dialogs and config writes no longer block the frame loop.** `rfd`'s
+  dialogs do not return until the user is finished with them, which froze the
+  whole application — live pollers included — for as long as somebody browsed
+  their filesystem. Both now run on an IO thread and report back once a frame.
+  A failed write reaches the error log instead of a discarded `Result`, and a
+  completed save says where it went.
+- **The focus ring is painted once per frame** for whatever holds focus, read
+  from `Memory::focused`, instead of each widget remembering to ask. The audit
+  that prompted it found eleven raw controls — three `ui.checkbox`, eight
+  `ui.selectable_label` — with no ring at all.
+- Segmented controls no longer render their options backwards inside a
+  right-to-left value column. `On | Off` was reading as `Off | On`, and
+  Identify / Impersonate / Delegate — an ascending scale of what you give away —
+  ran the other way.
+- `cargo deny check` passes. `BSL-1.0` is allowed (Boost, permissive, and its
+  notice requirement explicitly excludes object code); RUSTSEC-2026-0192 is
+  ignored with a written reason — `ttf-parser` is *unmaintained* rather than
+  vulnerable, has no upgrade, and reaches this workspace only through winit's
+  Wayland client-side decorations, which never run on Windows.
+
+### Decided
+- **`egui_extras`'s `serde` feature stays off** (task 7.11). It switches the
+  table's column widths from `get_temp` to `get_persisted` — and that changes
+  nothing here, because `eframe`'s `persistence` feature is off (`ron` is not in
+  `Cargo.lock`), so egui's memory is never serialised to disk and the widths are
+  lost on restart either way. Making it reachable would mean turning on
+  `eframe/persistence`, which writes a second preferences file beside
+  `config.json` with its own lifecycle, no version field and no migration —
+  against a `Config` that has all three. Column widths are also keyed by
+  `id_salt`, so a persisted width would outlive the column set it was measured
+  for and silently mis-lay a table that had gained a column.
+
+### Fixed
+- The Network table sorted on text that was not on screen: a UDP row showed `*`
+  for its remote port and sorted on `""`, and a state-less row showed an em dash
+  and sorted on `""`. Cell text and sort key are now one function.
+- Under a column sort, the Network table's tie-break was `HashMap` iteration
+  order, so rows sharing a value could reshuffle between snapshots — the one
+  thing a fading row must not do.
+- A stale error could sit in the status bar for the rest of the session. Only a
+  successful *query* used to clear it; any successful reply does now, and the
+  error log still keeps the history.
+- The Process view's Time column is a **UTC wall clock**. `ProcEvent::time_created`
+  is a real FILETIME that was consumed by the core's pid-reuse guard and dropped,
+  so the column could only say "T+MM:SS since the app started" — the wrong axis
+  for "what ran at 03:14". A row with no reported creation time falls back to the
+  `T+` form, dimmed and labelled, rather than inventing a date.
+- Removed `widgets::table::sortable_header`, dead since the last hand-rolled
+  table went away and kept alive only by a module-level `allow(dead_code)`.
+  Taking that allow off found nine more unused items, all now gone.
+
 ## [0.8.0] - 2026-08-01
 
 ### Added

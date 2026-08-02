@@ -9,11 +9,9 @@ use crate::util::net_col_value;
 use crate::widgets::button::{btn_primary, btn_secondary};
 use crate::widgets::chip::{dot_chip, dot_chip_icon};
 use crate::widgets::field::filter_box;
-use crate::widgets::loading::spinner;
+use crate::widgets::loading::{empty_state, spinner};
 use crate::widgets::rule::{hrule, vrule};
 use crate::widgets::table::{DataTable, DataTableState, TableColumn};
-
-use vmiscope_core::Protocol;
 
 /// How often the Network tab re-snapshots the connection table.
 pub(crate) const NET_REFRESH_SECS: f64 = 1.5;
@@ -108,21 +106,53 @@ impl VmiScopeApp {
                     || c.state.to_lowercase().contains(&filter)
             })
             .collect();
-        if self.net_sort.is_none() {
-            // The unsorted order: grouped by process, then local port. It has to
-            // be an order of its own rather than the map's, because a fading row
-            // must keep its place for the whole of NET_FADE_SECS -- a row that
-            // jumps while it dims is worse than one that just vanishes.
-            rows.sort_by(|a, b| {
-                a.conn
-                    .process
-                    .to_lowercase()
-                    .cmp(&b.conn.process.to_lowercase())
-                    .then(a.conn.proto.as_str().cmp(b.conn.proto.as_str()))
-                    .then(a.conn.local_port.cmp(&b.conn.local_port))
-                    .then(a.conn.remote_addr.cmp(&b.conn.remote_addr))
-                    .then(a.conn.remote_port.cmp(&b.conn.remote_port))
-            });
+        // The base order: grouped by process, then protocol, then local port. It
+        // has to be an order of its own rather than the map's, because a fading
+        // row must keep its place for the whole of NET_FADE_SECS -- a row that
+        // jumps while it dims is worse than one that just vanishes.
+        //
+        // Applied UNCONDITIONALLY, which is the fix for a real defect: it used
+        // to run only when no column sort was active, so under a column sort the
+        // rows reached `DataTable` in `HashMap` iteration order. `sort_order` is
+        // stable, so ties kept that order -- and `HashMap`'s order is free to
+        // change on any insert. Every row sharing a value in the sorted column
+        // (all 40 `Listen` rows, every row of one process) could therefore
+        // reshuffle between one 1.5 s snapshot and the next, which is the one
+        // thing a fading row must not do. The column sort now rides on top of a
+        // deterministic base instead.
+        rows.sort_by(|a, b| {
+            a.conn
+                .process
+                .to_lowercase()
+                .cmp(&b.conn.process.to_lowercase())
+                .then(a.conn.proto.as_str().cmp(b.conn.proto.as_str()))
+                .then(a.conn.local_port.cmp(&b.conn.local_port))
+                .then(a.conn.remote_addr.cmp(&b.conn.remote_addr))
+                .then(a.conn.remote_port.cmp(&b.conn.remote_port))
+        });
+
+        // Task 7.6: this view had no empty state at all, and drew a header rule
+        // over an empty rectangle in three different situations that mean three
+        // different things -- before the first snapshot lands, when a machine
+        // genuinely has no sockets, and when the filters exclude everything.
+        // The third is the one that matters: a security tool showing nothing
+        // has to say whether that is the answer or the question.
+        if rows.is_empty() {
+            // From the values the filter above actually used, not from the
+            // fields they came from. Caught by capture: with a stale read the
+            // view reported "every socket has closed" over a chip row saying
+            // "297 active", because it asked a different question from the one
+            // the rows had been filtered by.
+            let (title, note) = net_empty_note(
+                self.net_conns.is_empty(),
+                self.net_inflight,
+                filter.is_empty() && !external_only,
+            );
+            empty_state(ui, icons::WIFI_SLASH, title, note);
+            // No table this frame, so `net_sort` is simply left as it is: it
+            // lives on the app precisely so it survives a frame that has
+            // nothing to sort.
+            return;
         }
 
         // The sort lives on the app so it survives a tab switch; the table gets
@@ -156,31 +186,63 @@ impl VmiScopeApp {
                 row.set_alpha(alpha);
                 row.set_color(state_color(&c.state, c.proto));
 
-                row.text(c.proto.as_str());
-                row.text(if c.state.is_empty() {
-                    "\u{2014}".to_string()
-                } else {
-                    c.state.clone()
-                });
-                row.text(c.local_addr.as_str());
-                row.text(c.local_port.to_string());
+                // Every cell goes through `net_col_value`, which is also the
+                // sort key -- so a placeholder can never again be visible in
+                // one and absent from the other. See `util::net_col_value`.
+                row.text(net_col_value(c, 0));
+                row.text(net_col_value(c, 1));
+                row.text(net_col_value(c, 2));
+                row.text(net_col_value(c, 3));
                 // One cell either way -- the external address is led by an icon,
-                // which needs its own section in the icon family.
-                if c.remote_addr.is_empty() {
-                    row.text("*");
-                } else if c.is_external() {
-                    row.icon_text(icons::GLOBE_SIMPLE, &c.remote_addr);
+                // which needs its own section in the icon family. Same string.
+                let remote = net_col_value(c, 4);
+                if c.is_external() {
+                    row.icon_text(icons::GLOBE_SIMPLE, &remote);
                 } else {
-                    row.text(c.remote_addr.as_str());
+                    row.text(remote);
                 }
-                row.text(if c.proto == Protocol::Udp {
-                    "*".to_string()
-                } else {
-                    c.remote_port.to_string()
-                });
-                row.text(c.pid.to_string());
-                row.text(c.process.as_str());
+                row.text(net_col_value(c, 5));
+                row.text(net_col_value(c, 6));
+                row.text(net_col_value(c, 7));
             });
         self.net_sort = table.sort;
+    }
+}
+
+/// Which "nothing here" this is. Three states, three sentences.
+///
+/// `unfiltered` is whether the view is showing everything it has -- a filtered
+/// empty table is a statement about the filter, and reporting it as "no
+/// connections" would be the view lying about the machine.
+fn net_empty_note(
+    no_snapshot: bool,
+    inflight: bool,
+    unfiltered: bool,
+) -> (&'static str, &'static str) {
+    if no_snapshot {
+        if inflight {
+            (
+                "Reading the connection table",
+                "The first snapshot is on its way.",
+            )
+        } else {
+            (
+                "No connections",
+                "The snapshot came back empty. On a running machine that is unusual \u{2014} it \
+                 normally means MSFT_NetTCPConnection returned nothing, not that the machine has \
+                 no sockets.",
+            )
+        }
+    } else if unfiltered {
+        (
+            "No connections",
+            "Every socket in the last snapshot has closed and finished fading.",
+        )
+    } else {
+        (
+            "No rows match the filters",
+            "The machine has connections; none of them match. Clear the text filter or turn off \
+             'external only'.",
+        )
     }
 }

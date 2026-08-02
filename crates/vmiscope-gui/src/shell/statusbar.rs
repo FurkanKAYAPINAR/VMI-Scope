@@ -37,20 +37,26 @@ pub(crate) fn show(app: &mut VmiScopeApp, ui: &mut Ui) {
             ui.horizontal_centered(|ui| {
                 ui.add_space(PAD_X);
 
+                // Three states, in order of how much they need the space. An
+                // error owns the whole left half -- the namespace and the last
+                // query are still true, they are just not the news. A notice
+                // ("Saved ...") is the same shape but expires; it is the only
+                // confirmation an export has now that saving no longer freezes
+                // the window (`crate::io`). Otherwise, where we are.
+                let now = ui.input(|i| i.time);
                 if let Some(error) = &app.error {
-                    // An error owns the whole left half: the namespace and the
-                    // last query are still true, they are just not the news.
-                    ui.add(
-                        Label::new(icons::labelled_styled(
-                            ui,
-                            icons::WARNING,
-                            &error.replace('\n', "  \u{2014}  "),
-                            TextStyle::Small,
-                            BAD,
-                        ))
-                        .selectable(false)
-                        .truncate(),
+                    banner(
+                        ui,
+                        icons::WARNING,
+                        &error.replace('\n', "  \u{2014}  "),
+                        BAD,
                     );
+                } else if let Some(notice) = app.live_notice(now) {
+                    banner(ui, icons::CHECK_CIRCLE, notice, OK);
+                    // The bar has to be redrawn when it lapses, or the notice
+                    // would sit there until the next unrelated repaint.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(500));
                 } else {
                     connection(app, ui);
                     dim(ui, "\u{00b7}");
@@ -69,12 +75,30 @@ pub(crate) fn show(app: &mut VmiScopeApp, ui: &mut Ui) {
                         app.error_log_open = !app.error_log_open;
                     }
                     ui.add_space(S2);
-                    dim(ui, "F5 refresh");
-                    dim(ui, "\u{00b7}");
-                    dim(ui, "Ctrl K palette");
+                    // The full map, one click away. The bar used to advertise
+                    // two chords as dead text -- which is the whole of what a
+                    // user could discover about the keyboard. Both are still in
+                    // here, and so is every other binding, generated from the
+                    // table that dispatches them (`overlays::keymap`).
+                    crate::overlays::keymap::open_button(app, ui);
                 });
             });
         });
+}
+
+/// A one-line message that takes over the left half of the bar.
+fn banner(ui: &mut Ui, icon: &str, text: &str, color: egui::Color32) {
+    ui.add(
+        Label::new(icons::labelled_styled(
+            ui,
+            icon,
+            text,
+            TextStyle::Small,
+            color,
+        ))
+        .selectable(false)
+        .truncate(),
+    );
 }
 
 /// The live dot and what it is connected to.
@@ -144,9 +168,30 @@ fn context_line(app: &VmiScopeApp) -> String {
         },
         // Composed in `views::process`, which owns the state it counts.
         View::Process => app.proc_status(),
-        // The rail shows these; the status bar should agree rather than going
-        // blank and implying the view simply has nothing to say.
-        other => format!("{} \u{2014} not built yet", other.title()),
+        // Likewise `views::compare`.
+        View::Compare => app.compare_status(),
+        // The three that had no arm of their own fell through to a catch-all
+        // reading "<view> -- not built yet". That was true when the rail listed
+        // eleven destinations and eight had views; all eleven have one now, and
+        // the bar was calling three shipped views unbuilt. The match is
+        // exhaustive by name from here on, so a destination added without a
+        // status line is a compile error rather than a false statement about a
+        // view that works.
+        View::Saved => {
+            let total = app.config.saved.len();
+            let folders = app.config.folders().len();
+            match (total, folders) {
+                (0, _) => "Library empty".to_string(),
+                (n, 0) => format!("{n} saved queries"),
+                (n, f) => format!("{n} saved queries \u{00b7} {f} folders"),
+            }
+        }
+        View::Machines => match app.config.targets.len() {
+            0 => "This machine only".to_string(),
+            // Plus the synthetic local row the view always draws.
+            n => format!("{} targets \u{00b7} 1 local", n),
+        },
+        View::Settings => format!("config.json \u{00b7} v{}", app.config.version),
     }
 }
 

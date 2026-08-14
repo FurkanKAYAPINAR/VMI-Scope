@@ -20,7 +20,7 @@ anyhow.workspace = true
 # is not allowed to name. winit is therefore a direct dependency below, and
 # feature unification turns those defaults back on -- they are the Linux
 # windowing backends, so leaving them off would build here and break there.
-eframe = { version = "0.35.0", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
     "wayland",
     "web_screen_reader",

@@ -21,6 +21,9 @@ serde_json = "1.0.151"
 # keeps an unresolvable SID from rendering blank.
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Rpc", "Win32_System_Threading", "Win32_System_Variant", "Win32_System_Wmi"] }
 wmi = "0.18.4"
+# Wipes in-memory alternate credentials (Credential.password + PinnedAuth
+# UTF-16 buffers) on drop so cleartext secrets do not linger in freed heap.
+zeroize = "1"
 
 [[example]]
 name = "probe"

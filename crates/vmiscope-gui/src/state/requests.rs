@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::app::{ConnStatus, VmiScopeApp, DEFAULT_NAMESPACE, ROOT_NAMESPACE};
 use crate::state::ids::PendingKind;
 
-use vmiscope_core::{Credential, Impersonation, MethodArg, Request};
+use vmiscope_core::{Credential, Impersonation, MethodArg, ParamKind, Request};
 
 impl VmiScopeApp {
     // ------------------------------------------------------------------
@@ -277,10 +277,20 @@ impl VmiScopeApp {
         is_static: bool,
         args: Vec<MethodArg>,
     ) {
-        // Audit every mutating call.
+        // Audit every mutating call. String/opaque argument *values* can carry
+        // secrets (a password passed to a method lands in `audit.log` in
+        // cleartext otherwise), so those are redacted to a length only — the
+        // parameter name and its kind are still recorded so the call remains
+        // reconstructable. Numeric/boolean values are not sensitive and stay
+        // legible, which is what makes the audit line useful.
         let args_str = args
             .iter()
-            .map(|a| format!("{}={}", a.name, a.value))
+            .map(|a| match a.kind {
+                ParamKind::Str | ParamKind::Other => {
+                    format!("{}=<redacted:{} chars>", a.name, a.value.chars().count())
+                }
+                _ => format!("{}={}", a.name, a.value),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let target = if is_static {

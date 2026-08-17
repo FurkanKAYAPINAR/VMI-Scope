@@ -37,6 +37,7 @@ use windows::Win32::System::Wmi::{
     WBEM_FLAG_NONSYSTEM_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_GENERIC_FLAG_TYPE,
 };
 use wmi::{Variant, WMIConnection};
+use zeroize::Zeroize;
 
 use crate::enumerate::{depth, CancelToken, Completion, ENUM_FLAGS};
 use crate::host::Impersonation;
@@ -57,6 +58,15 @@ impl std::fmt::Debug for Credential {
             .field("password", &"<redacted>")
             .field("domain", &self.domain)
             .finish()
+    }
+}
+
+impl Drop for Credential {
+    /// Wipe the cleartext password from the heap when the credential (or any
+    /// clone of it) is dropped, so it does not linger in freed memory for the
+    /// rest of the session. `user`/`domain` are not secret and are left alone.
+    fn drop(&mut self) {
+        self.password.zeroize();
     }
 }
 
@@ -111,6 +121,19 @@ impl PinnedAuth {
             _domain: domain,
             _password: password,
         })
+    }
+}
+
+impl Drop for PinnedAuth {
+    /// Wipe the UTF-16 credential buffers before their heap allocations are
+    /// freed. DCOM no longer touches them once the owning connection is gone, so
+    /// zeroing here (before the `Vec`s drop) leaves no cleartext secret behind.
+    /// The `COAUTHIDENTITY`'s raw pointers dangle after this, but nothing reads
+    /// `ident` past the drop.
+    fn drop(&mut self) {
+        self._user.zeroize();
+        self._domain.zeroize();
+        self._password.zeroize();
     }
 }
 

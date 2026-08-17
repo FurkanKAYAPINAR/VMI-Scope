@@ -6,9 +6,22 @@ use crate::app::ScriptLang;
 use vmiscope_core::{Connection, Protocol, ProviderInfo, Risk, Subscription};
 
 /// A dangerous-looking method name gets an extra warning in the confirm modal.
+///
+/// Advisory only — it escalates a *label*, never blocks — but the classifier is
+/// still worth getting right. It matches on the leading verb rather than any
+/// substring, because WMI method names are verb-first (`Create`, `Delete`,
+/// `ChangeStartMode`, `SetPowerState`). A raw `contains` over-matched
+/// (`GetSettings` tripped `set`, `RegRead`… `read`) and could under-match a
+/// verb buried after a prefix; anchoring at the start fixes the common false
+/// positives while still catching the real mutators.
+///
+/// A truly authoritative call would read the method's WMI qualifiers
+/// (`Static`, `Privileged`, an `Implemented`/side-effect marker), which this
+/// pure name-only helper does not have in hand; that would need the schema
+/// threaded in here and is deliberately out of scope for an advisory hint.
 pub(crate) fn is_dangerous_method(method: &str) -> bool {
-    let m = method.to_lowercase();
-    [
+    let m = method.trim().to_lowercase();
+    const DANGEROUS_VERBS: [&str; 15] = [
         "create",
         "delete",
         "terminate",
@@ -23,9 +36,14 @@ pub(crate) fn is_dangerous_method(method: &str) -> bool {
         "kill",
         "write",
         "set",
-    ]
-    .iter()
-    .any(|k| m.contains(k))
+        "remove",
+    ];
+    // Exact match, or the name begins with a dangerous verb (the WMI naming
+    // convention). `starts_with("set")` still flags `SetPowerState`/`SetGateway`
+    // without flagging `GetSettings`.
+    DANGEROUS_VERBS
+        .iter()
+        .any(|verb| m == *verb || m.starts_with(verb))
 }
 
 /// Open a native "Save as" dialog and write `contents` to the chosen path.

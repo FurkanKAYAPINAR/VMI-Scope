@@ -1488,6 +1488,16 @@ fn join_notes(a: &str, b: &str) -> String {
     }
 }
 
+/// A WQL-safe bare class identifier: non-empty, only alphanumerics and `_`.
+///
+/// Used to reject a class name *before* it is interpolated into an object path
+/// (`REFERENCES OF {…}` / `ASSOCIATORS OF {…}`), where a stray `}` would
+/// otherwise break out of the `{…}` path. Mirrors the identifier rule in
+/// [`single_class_from_wql`].
+fn is_bare_class(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
 /// Every relationship `class` takes part in, inherited ones included.
 ///
 /// Three facts about WMI shape this, all measured rather than assumed.
@@ -1521,6 +1531,13 @@ fn class_associations(
     class: &str,
     cancel: &CancelToken,
 ) -> anyhow::Result<(Vec<AssocInfo>, Completion)> {
+    // The class name is interpolated verbatim into an object path below; a
+    // non-identifier could break out of `{…}`, so reject it up front. Every
+    // `subject` in the loop is either this name or an ancestor WMI reported for
+    // it, so validating here covers the whole lineage.
+    if !is_bare_class(class) {
+        anyhow::bail!("invalid class name: {class:?}");
+    }
     let conn = bind(namespace)?;
     let started = Instant::now();
 

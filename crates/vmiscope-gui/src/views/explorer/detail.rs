@@ -155,9 +155,12 @@ impl VmiScopeApp {
         if do_watch {
             // Prime the Events view with an intrinsic creation subscription. The
             // Events view starts the monitor; this only sets its query.
+            // Escape any single-quote so a class name cannot break out of the
+            // WQL string literal (WQL escapes `'` by doubling it).
+            let class_lit = class.replace('\'', "''");
             self.monitor_wql = format!(
                 "SELECT * FROM __InstanceCreationEvent WITHIN 2 \
-                 WHERE TargetInstance ISA '{class}'"
+                 WHERE TargetInstance ISA '{class_lit}'"
             );
             self.view = View::Events;
         }
